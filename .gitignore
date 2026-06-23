@@ -1,0 +1,26 @@
+# ─── Python tooling ───────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# ─── ORFS work dir (EDA_RL_WORK) — all per-variant staging + build output ──────
+eda_rl_runs/
+# also catch a work dir created at the repo root by older defaults
+runs/
+
+# ─── Regenerable model snapshots — rebuilt by gen2/fit_surrogate.py ────────────
+*.joblib
+
+# ─── Generated reports / dashboards (rebuilt from results/*.jsonl) ─────────────
+eda_rl/reports/
+reports/
+*.optuna-journal
+
+# ─── Raw per-run campaign logs dumped at root (curated copies live in campaigns/)
+funnel_campaign_*.jsonl
+*_run[0-9]*.jsonl

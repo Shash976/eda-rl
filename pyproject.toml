@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eda-rl"
+version = "0.1.0"
+description = "Multi-fidelity RL/DSE optimizer for RTL→GDS (OpenROAD-flow-scripts) chip design-space exploration."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Shashwat Goel" }]
+keywords = ["eda", "openroad", "orfs", "design-space-exploration", "rl", "bayesian-optimization", "asic"]
+dependencies = [
+  "numpy",
+  "pandas",
+  "pyyaml",
+  "scikit-learn",
+  "joblib",
+  "optuna",
+  "plotly",
+]
+
+[project.optional-dependencies]
+dashboard = ["streamlit"]
+
+[project.scripts]
+eda-rl = "eda_rl.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["eda_rl*"]
+
+[tool.setuptools.package-data]
+eda_rl = ["**/*.yaml", "**/*.yml"]
