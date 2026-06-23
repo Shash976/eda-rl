@@ -33,23 +33,85 @@ export ORFS_DIR=/opt/OpenROAD-flow-scripts
 No ORFS? Set `PHYSICAL_MOCK=1` to drive the whole pipeline with synthetic-but-plausible
 metrics — useful for trying the tool and for CI.
 
-## Quick start
+## The walkthrough: design in → optimized GDS out
+
+Four steps. Try the whole thing with no tools installed by prefixing `PHYSICAL_MOCK=1`.
+
+### 1. Run a campaign (the optimizer)
 
 ```bash
-# Smoke test on the bundled, self-contained gcd example (no ORFS needed):
-PHYSICAL_MOCK=1 eda-rl optimize --design gcd --platform nangate45 \
-    --budget-hours 0.02 --sampler random
-
-# A real campaign once ORFS_DIR is set:
 eda-rl optimize --design gcd --platform nangate45 --budget-hours 4
 ```
 
-Results stream to `campaigns/<design>/<platform>/results_funnel_campaigns.jsonl` (one
-JSON line per evaluated config, with the terminal area/Fmax/power), and a running
-incumbent is printed. Override the output path with `--out`. Render an HTML report:
+Toggle the search however you like:
+
+| Flag | Choices / default | What it does |
+|------|-------------------|--------------|
+| `--design` | name or path to a YAML | the design to optimize |
+| `--platform` | `nangate45`, `asap7`, … | target PDK |
+| `--budget-hours` | float, `4` | wall-clock budget; the optimizer stops when spent |
+| `--max-tier` | `1`–`4`, `1` | how many ORFS knob tiers to search (1 = core axes; 4 = +macro knobs) |
+| `--sampler` | `tpe` \| `surrogate_ucb` \| `random` | how candidates are proposed |
+| `--promotion` | `fixed` \| `linucb` \| `random` | the policy that decides what advances F0→F3 |
+| `--seed` | int, `0` | reproducibility |
+| `--out` | path | where the campaign log goes |
+
+Each evaluated config is streamed to
+`campaigns/<design>/<platform>/results_funnel_campaigns.jsonl` — one JSON line carrying the
+config, the fidelity it reached, the reward, and (for full builds) the real
+`area_um2 / fmax_mhz / power_mw / timing_met` and the **path to its `6_final.gds`**.
+
+### 2. Get the graphical dashboard (report)
 
 ```bash
-eda-rl report --campaign all --open
+eda-rl report --campaign latest --open
+```
+
+Produces one self-contained HTML file (no server) with: a supervisor overview
+(summary banner, comparison table, **area-vs-Fmax Pareto**), optimization history vs
+episode and wall-clock, per-parameter reward analysis, the fidelity funnel (how many
+configs died at each gate), and Optuna parameter-importance / slice / contour plots.
+
+### 3. Harvest the best configs + their GDS (collect)
+
+```bash
+eda-rl collect --campaign latest --render --open
+```
+
+Picks the standout F3 builds — best overall score, max Fmax, min area, min power, and
+the top-N by score — and writes to `best_configs/<design>_<platform>/`:
+
+```
+best_configs/gcd_nangate45/
+├── best_configs.html          # before/after comparison page (layout thumbnails with --render)
+├── best_configs.json          # manifest: config + metrics + GDS paths
+├── BEST_OVERALL__<variant>/
+│   ├── 6_final.gds            # the optimized layout, ready to hand off
+│   └── 6_finish.rpt
+├── MAX_FMAX__<variant>/ …
+└── MIN_AREA__<variant>/ …
+```
+
+`--render` rasterizes each layout to a thumbnail with KLayout (skipped automatically if
+klayout isn't installed). The GDS files are copied from the work dir; if you've cleared
+`EDA_RL_WORK`, re-run those configs to regenerate them.
+
+### 4. (optional) Live/interactive dashboard
+
+```bash
+pip install -e '.[dashboard]'
+eda-rl dashboard --campaign latest
+```
+
+---
+
+## Quick smoke test (no ORFS)
+
+```bash
+PHYSICAL_MOCK=1 eda-rl optimize --design gcd --platform nangate45 \
+    --budget-hours 0.02 --sampler random
+PHYSICAL_MOCK=1 eda-rl report  --campaign latest --out /tmp/r.html
+PHYSICAL_MOCK=1 eda-rl collect --campaign latest --out /tmp/best
 ```
 
 ## Bring your own design
@@ -112,9 +174,11 @@ EDA_RL_DESIGN_ROOT=/path/to/voiceAI \
 | Command | Description |
 |---------|-------------|
 | `eda-rl optimize` | run an optimization campaign on a design (the main pipeline) |
+| `eda-rl report` | render the graphical HTML analysis dashboard from a campaign |
+| `eda-rl collect` | harvest the best configs: copy their GDS + reports + a comparison page |
+| `eda-rl dashboard` | launch the live/interactive Optuna dashboard (`[dashboard]` extra) |
 | `eda-rl build-table` | pre-build an offline F0–F2 evaluation table (resumable) |
 | `eda-rl benchmark` | compare promotion / candidate strategies on the table simulator |
-| `eda-rl report` | render an HTML report from a campaign log |
 
 Run `eda-rl <command> --help` for per-command options.
 
