@@ -590,6 +590,17 @@ class FunnelEnv:
 
         return self._state_vec.copy()
 
+    @property
+    def terminal_obs(self) -> dict:
+        """The deepest fidelity's observation reached this episode (F3 > F2 > F1).
+
+        For an F3 episode this carries the real physical metrics — area_um2,
+        fmax_mhz, power_mw, timing_met, and the path to 6_final.gds — so the
+        campaign log can record exactly which GDS each config produced.
+        Empty dict if nothing beyond F0 ran.
+        """
+        return dict(self._f3_obs or self._f2_obs or self._f1_obs or {})
+
     def step(self, action: str) -> tuple[np.ndarray, float, bool, dict]:
         """Execute `action` and return (obs, reward, done, info).
 

@@ -389,6 +389,10 @@ def run_campaign(
             "episode_reward": episode_reward_acc,
             "f3_reward":     f3_reward,
             "best_reward":   best_reward if best_reward != float("-inf") else None,
+            # Terminal-fidelity observation: real physical metrics + the 6_final.gds
+            # path for F3 episodes, so reporting and `eda-rl collect` can locate the
+            # actual layouts without re-deriving variant names.
+            "obs":           env.terminal_obs,
             "spent_s":       round(env.spent_s, 2),
             "episode_s":     round(time.time() - episode_t0, 3),
         }

@@ -196,11 +196,18 @@ def build_optuna_figures(rows):
     return figs
 
 
+def _f3_status_ok(r: dict) -> bool:
+    """True for a successful F3 build. The status lives top-level on older logs
+    and inside ``obs`` on the live-driver format — accept either."""
+    st = r.get("status") or (r.get("obs") or {}).get("status")
+    return st in ("ok", "mock")
+
+
 def _f3_ok_rows(rows: list[dict]) -> list[dict]:
     """Return rows with fidelity=F3 and status=ok that have obs metrics."""
     return [
         r for r in rows
-        if r.get("fidelity") == "F3" and r.get("status") == "ok"
+        if r.get("fidelity") == "F3" and _f3_status_ok(r)
         and r.get("obs", {}).get("area_um2") is not None
         and r.get("obs", {}).get("fmax_mhz") is not None
     ]
@@ -805,7 +812,7 @@ def main() -> None:
         print(f"No episodes found in {args.log} for campaign={args.campaign!r}")
         sys.exit(1)
 
-    f3_count = sum(1 for r in data.rows if r.get("fidelity") == "F3" and r.get("status") == "ok")
+    f3_count = sum(1 for r in data.rows if r.get("fidelity") == "F3" and _f3_status_ok(r))
     print(f"Loaded {len(data.rows)} episodes (campaign={data.campaign_id}, "
           f"{len(data.specs)} params, {f3_count} F3 results)")
 
@@ -813,7 +820,7 @@ def main() -> None:
     log_path = Path(args.log)
     platform = log_path.parent.name
     design   = log_path.parent.parent.name
-    title    = f"TinyMAC Accelerator · {design} · {platform} · {f3_count} Full P&R Builds"
+    title    = f"{design} · {platform} · {f3_count} Full P&R Builds"
     subtitle = (f"Multi-fidelity funnel optimizer · {len(data.rows):,} candidate evaluations"
                 f" · {len(data.specs)} search variables · campaign {data.campaign_id}")
 
@@ -826,7 +833,11 @@ def main() -> None:
         figs.append(build_comparison_table(data.rows))
         figs.append(build_pareto_figure(data.rows))
         figs.append(build_iteration_figure(data.rows))
-        figs.append(build_speedup_figure(data.rows))
+        # The speedup figure assumes the TinyMAC accelerator cycle model
+        # (AVG_CYCLES per mac_lanes); only meaningful for designs that expose a
+        # mac_lanes axis. Skip it for generic designs so the numbers stay honest.
+        if any("mac_lanes" in (r.get("config") or {}) for r in data.rows):
+            figs.append(build_speedup_figure(data.rows))
         figs.append(build_knob_tier_figure())
 
     figs.append(("section:Optimization History", None))
