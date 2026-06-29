@@ -223,7 +223,9 @@ def _pareto_front(pts: list[tuple]) -> list[tuple]:
         )
         if not dominated:
             front.append((a, f, r))
-    return sorted(front)  # ascending area
+    # Sort by (area, fmax) only — never fall through to comparing the row dict
+    # in the 3rd slot, which raises TypeError when two builds tie on area+fmax.
+    return sorted(front, key=lambda t: (t[0], t[1]))  # ascending area
 
 
 def build_pareto_figure(rows: list[dict]) -> tuple[str, object]:
@@ -407,7 +409,7 @@ def build_comparison_table(rows: list[dict]) -> tuple[str, object]:
     b_cfg = b["config"]
 
     headers = ["Config", "Lanes", "Acc_W", "Clock (ns)", "Area (µm²)",
-               "Fmax (MHz)", "WNS (ns)", "Recipe", "ΔFmax", "ΔArea"]
+               "Cells", "Fmax (MHz)", "WNS (ns)", "Recipe", "ΔFmax", "ΔArea"]
 
     def _delta(val, base, higher_better=True):
         pct = (val - base) / base * 100
@@ -416,7 +418,7 @@ def build_comparison_table(rows: list[dict]) -> tuple[str, object]:
 
     # Build rows: first the baseline, then each Pareto config
     col_config, col_lanes, col_accw, col_clk = [], [], [], []
-    col_area, col_fmax, col_wns, col_recipe = [], [], [], []
+    col_area, col_cells, col_fmax, col_wns, col_recipe = [], [], [], [], []
     col_dfmax, col_darea = [], []
     row_colors = []
 
@@ -426,6 +428,7 @@ def build_comparison_table(rows: list[dict]) -> tuple[str, object]:
     col_accw.append(b_cfg["accumulator_width"])
     col_clk.append(f"{b_cfg['clock_period_ns']:.2f}")
     col_area.append(f"{b['area_um2']}")
+    col_cells.append("—")
     col_fmax.append(f"{b['fmax_mhz']}")
     col_wns.append(f"{b['wns_ns']:.3f}")
     col_recipe.append(b_cfg["abc_recipe"])
@@ -442,6 +445,8 @@ def build_comparison_table(rows: list[dict]) -> tuple[str, object]:
         col_accw.append(cfg.get("accumulator_width", ""))
         col_clk.append(f"{cfg.get('clock_period_ns', 0):.3f}")
         col_area.append(f"{area:.0f}")
+        _nc = obs.get("cell_count")
+        col_cells.append(f"{_nc:,.0f}" if _nc is not None else "—")
         col_fmax.append(f"{fmax:.0f}")
         col_wns.append(f"{obs.get('wns_ns', 0):.3f}")
         col_recipe.append(obs.get("effective_abc_recipe") or cfg.get("abc_recipe", ""))
@@ -451,7 +456,7 @@ def build_comparison_table(rows: list[dict]) -> tuple[str, object]:
 
     # Transpose for Plotly (it wants column-major)
     all_cols = [col_config, col_lanes, col_accw, col_clk, col_area,
-                col_fmax, col_wns, col_recipe, col_dfmax, col_darea]
+                col_cells, col_fmax, col_wns, col_recipe, col_dfmax, col_darea]
 
     fig = go.Figure(go.Table(
         header=dict(

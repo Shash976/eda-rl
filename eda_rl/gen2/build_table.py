@@ -253,13 +253,14 @@ def _eval_f0(config: dict) -> tuple[dict, str]:
 
     # Cycles: use measured table if available, else analytic fit
     cyc = float(AVG_CYCLES[lanes]) if lanes in AVG_CYCLES else behavioral_cycles(lanes)
-    # Accuracy flag: acc_w < 24 causes overflow (measured 47/64 ≈ 0.734)
-    if acc_w >= 24:
-        acc = 1.0
-    elif acc_w >= 20:
-        acc = 0.92
-    else:
-        acc = 47.0 / 64.0
+    # Accuracy flag: use the LANES-dependent measured table (V13) so the F0 row
+    # agrees with FunnelEnv._f0_accuracy (audit M1) instead of a lanes-independent
+    # approximation.  Fall back to the simple acc_w rule only if funnel is absent.
+    try:
+        from eda_rl.gen2.funnel import _f0_accuracy
+        acc = _f0_accuracy(lanes, acc_w)
+    except ImportError:
+        acc = 1.0 if acc_w >= 24 else (0.92 if acc_w >= 20 else 47.0 / 64.0)
     speedup = SW_BASELINE_CYCLES / max(cyc, 1.0)
 
     obs = {

@@ -62,6 +62,73 @@ def physical_real_speedup(metrics: dict, cycles: float | None = None) -> float:
     return SW_BASELINE_LATENCY_NS / max(latency_ns, 1e-9)
 
 
+def compute_generic_reward(
+    metrics: dict,
+    weights: dict | None = None,
+    refs: dict | None = None,
+) -> dict:
+    """Design-agnostic PPA reward for designs without a TinyVAD functional model.
+
+    Pure physical objective: reward higher Fmax, penalise larger area and power,
+    gate on timing.  There is NO speedup-vs-software-baseline term and NO
+    accuracy term — those are TinyMAC-specific and meaningless for a generic
+    block like gcd (whose "speedup" would otherwise be computed from a fictitious
+    4-lane TinyMAC cycle count, see audit C1).
+
+    ``refs`` provides the per-design normalisation anchors
+    {area_ref_um2, power_ref_mw, fmax_ref_mhz}; each metric is divided by its
+    anchor so the three terms are O(1) and comparable for THIS design.  The
+    caller (FunnelEnv) auto-anchors refs from the design's first successful F3
+    build when the design YAML declares none, so no magic constants are needed.
+
+    Weights default to: +1.0·(fmax/ref) − 1.0·(area/ref) − 0.4·(power/ref),
+    with a timing-violation penalty; override via the design's ``reward:`` block.
+    """
+    w = weights or {}
+    r = refs or {}
+    w_fmax = w.get("w_fmax", 1.0)
+    w_area = w.get("w_area", -1.0)
+    w_pwr  = w.get("w_power", -0.4)
+    w_tv   = w.get("w_timing_violation", -3.0)
+
+    status = metrics.get("status", "ok")
+    if status not in ("ok", "mock", "mock-proxy"):
+        return {"reward": -100.0, "norm_fmax": 0.0, "timing_violation": True,
+                "infeasible": True, "status": status}
+
+    area_um2 = metrics.get("area_um2")
+    fmax_mhz = metrics.get("fmax_mhz")
+    if area_um2 is None or fmax_mhz is None:
+        # No usable physical measurement → infeasible (never award from no data).
+        return {"reward": -100.0, "norm_fmax": 0.0, "timing_violation": True,
+                "infeasible": True, "status": "PARSE_FAIL"}
+
+    area_ref = float(r.get("area_ref_um2") or area_um2 or 1.0)
+    fmax_ref = float(r.get("fmax_ref_mhz") or fmax_mhz or 1.0)
+    power_mw = metrics.get("power_mw")
+    power_ref = r.get("power_ref_mw")
+
+    norm_area = area_um2 / max(area_ref, 1e-9)
+    norm_fmax = fmax_mhz / max(fmax_ref, 1e-9)
+    t_viol = 0.0 if metrics.get("timing_met", True) else 1.0
+
+    reward = w_fmax * norm_fmax + w_area * norm_area + w_tv * t_viol
+    power_term = 0.0
+    norm_power = None
+    if power_mw is not None and power_ref:
+        norm_power = power_mw / max(float(power_ref), 1e-9)
+        power_term = w_pwr * norm_power
+        reward += power_term
+    return {
+        "reward":           round(reward, 4),
+        "norm_fmax":        round(norm_fmax, 4),
+        "norm_area":        round(norm_area, 4),
+        "norm_power":       round(norm_power, 4) if norm_power is not None else None,
+        "timing_violation": bool(t_viol),
+        "infeasible":       False,
+    }
+
+
 def compute_physical_reward(
     metrics: dict,
     weights: dict | None = None,
@@ -72,6 +139,10 @@ def compute_physical_reward(
     Mirrors reward.compute_reward's weighting so the two tracks are comparable.
     Returns a dict (not a bare float) so the env can log the derived speedup /
     normalised terms without recomputing them.
+
+    TinyMAC-specific: uses the behavioral cycle model, the LANES=4 area/power
+    anchors, and the accumulator-overflow accuracy term.  For designs without a
+    TinyVAD functional model, use compute_generic_reward instead (audit C1).
     """
     w = weights or {}
     w_acc    = w.get("w_accuracy",          2.0)

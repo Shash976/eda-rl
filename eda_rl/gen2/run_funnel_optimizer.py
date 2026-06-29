@@ -177,19 +177,6 @@ def _make_promotion_agent(name: str, seed: int) -> Any:
         raise ValueError(f"Unknown promotion agent: {name!r}; use fixed|linucb|random")
 
 
-# ── helper: extract F3 reward from episode info ────────────────────────────────
-
-def _extract_f3_reward(
-    episode_reward: float,
-    fidelity_reached: str,
-    episode_done: bool,
-) -> float | None:
-    """Return the terminal F3 reward, or None if the episode did not reach F3."""
-    if episode_done and fidelity_reached == "F3":
-        return float(episode_reward)
-    return None
-
-
 # ── campaign loop ─────────────────────────────────────────────────────────────
 
 def run_campaign(
@@ -320,6 +307,8 @@ def run_campaign(
         fidelity_reached = "F0"
         episode_actions: list[str] = []
         episode_step_rewards: list[float] = []
+        episode_terminal_reward: float | None = None   # pure F3 PPA reward (no shaping)
+        episode_table_miss = False
         episode_t0 = time.time()
 
         while not episode_done:
@@ -344,6 +333,14 @@ def run_campaign(
             episode_reward_acc += reward
             episode_step_rewards.append(reward)
 
+            # Capture the pure terminal PPA reward (no shaping) when F3 completes
+            # so TPE / best / the log record the real physical score, not the
+            # shaped accumulator (audit H0).
+            if info.get("terminal_reward") is not None:
+                episode_terminal_reward = float(info["terminal_reward"])
+            if info.get("table_miss"):
+                episode_table_miss = True
+
             fid = info.get("fidelity", fidelity_reached)
             if fid in _FIDELITY_ORDER:
                 if _FIDELITY_ORDER.index(fid) > _FIDELITY_ORDER.index(fidelity_reached):
@@ -360,10 +357,14 @@ def run_campaign(
             per_fidelity_counts.get(fidelity_reached, 0) + 1
         )
 
-        # F3 terminal reward
-        f3_reward: float | None = _extract_f3_reward(
-            episode_reward_acc, fidelity_reached, episode_done
+        # F3 terminal reward: use the PURE terminal PPA reward (no shaping), and
+        # only count a real F3 commit (status ok, not a table_miss) as an F3
+        # observation for TPE / the incumbent (audit H0).
+        is_real_f3 = (
+            episode_done and fidelity_reached == "F3"
+            and not episode_table_miss and episode_terminal_reward is not None
         )
+        f3_reward: float | None = episode_terminal_reward if is_real_f3 else None
         if f3_reward is not None:
             gen.update(config, f3_reward, fidelity="F3")
             n_f3 += 1
@@ -387,7 +388,8 @@ def run_campaign(
             "fidelity":      fidelity_reached,
             "step_rewards":  episode_step_rewards,
             "episode_reward": episode_reward_acc,
-            "f3_reward":     f3_reward,
+            "shaped_episode_reward": episode_reward_acc,  # incl. per-step shaping
+            "f3_reward":     f3_reward,                    # pure terminal PPA reward
             "best_reward":   best_reward if best_reward != float("-inf") else None,
             # Terminal-fidelity observation: real physical metrics + the 6_final.gds
             # path for F3 episodes, so reporting and `eda-rl collect` can locate the

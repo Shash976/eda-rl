@@ -38,6 +38,8 @@ def _obs(r: dict) -> dict:
 def _area(r: dict):  return _obs(r).get("area_um2")
 def _fmax(r: dict):  return _obs(r).get("fmax_mhz")
 def _power(r: dict): return _obs(r).get("power_mw")
+def _cells(r: dict): return _obs(r).get("cell_count")
+def _ffs(r: dict):   return _obs(r).get("ff_count")
 def _gds(r: dict):   return _obs(r).get("gds")
 def _timing(r: dict): return _obs(r).get("timing_met")
 
@@ -185,6 +187,10 @@ def _card(r: dict, img_b64: str | None) -> str:
         ("Area", f"{_area(r):,.0f} µm²"),
         ("Fmax", f"{_fmax(r):,.0f} MHz"),
     ]
+    if _cells(r) is not None:
+        rows.append(("Cells", f"{_cells(r):,.0f}"))
+    if _ffs(r) is not None:
+        rows.append(("FFs", f"{_ffs(r):,.0f}"))
     if _power(r) is not None:
         rows.append(("Power", f"{_power(r):.1f} mW"))
     rows.append(("Timing", "✅ met" if _timing(r) else "❌ not met"))

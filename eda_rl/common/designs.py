@@ -84,6 +84,10 @@ class DesignSpec:
     platforms: dict[str, dict]     # per-platform clock ranges and defaults
     has_macros: bool | None        # None = auto-detect at first F2
     functional_eval: dict | None   # {"kind": "tinyvad_sim"} or {"kind": "none"} or None
+    reward: dict | None = None     # optional reward config: weights + PPA anchors
+                                   # (area_ref_um2 / power_ref_mw / fmax_ref_mhz).
+                                   # When absent for a generic design, FunnelEnv
+                                   # auto-anchors from the first F3 build.
 
     # ── Factory ───────────────────────────────────────────────────────────────
 
@@ -158,6 +162,7 @@ class DesignSpec:
             has_macros = bool(has_macros_raw)
 
         functional_eval = raw.get("functional_eval")
+        reward = raw.get("reward")
 
         return cls(
             name=str(raw["name"]),
@@ -168,6 +173,7 @@ class DesignSpec:
             platforms=platforms,
             has_macros=has_macros,
             functional_eval=functional_eval,
+            reward=reward,
         )
 
     # ── SDC generation ────────────────────────────────────────────────────────
