@@ -93,6 +93,31 @@ _FALLBACK = "fallback"
 # Obs columns that the surrogate accepts.  Order matters for feature vector.
 _OBS_COLS = ["proxy_area_um2", "proxy_wns_ns", "ff_count", "cell_count", "logic_levels"]
 
+# Obs-key aliases (audit C2): the live FunnelEnv F2 obs and build_table rows use
+# the runner-facing keys area_um2 / wns_ns / cells, while the legacy report miner
+# (fit_surrogate) emits proxy_area_um2 / proxy_wns_ns.  Without this map the two
+# strongest proxy signals (area, WNS) were imputed as "missing" on every live
+# query, silently disabling the multi-fidelity conditioning.  First present
+# alias wins; canonical name first so explicit proxy_* values take priority.
+_OBS_ALIASES: dict[str, list[str]] = {
+    "proxy_area_um2": ["proxy_area_um2", "area_um2"],
+    "proxy_wns_ns":   ["proxy_wns_ns", "wns_ns"],
+    "ff_count":       ["ff_count"],
+    "cell_count":     ["cell_count", "cells"],
+    "logic_levels":   ["logic_levels"],
+}
+
+
+def _obs_value(obs: dict | None, col: str):
+    """Return the value for surrogate column `col` from `obs`, honouring aliases."""
+    if not obs:
+        return None
+    for key in _OBS_ALIASES.get(col, [col]):
+        v = obs.get(key)
+        if v is not None:
+            return v
+    return None
+
 # ── Feature engineering ────────────────────────────────────────────────────────
 
 
@@ -136,8 +161,9 @@ def _encode_obs(obs: dict | None, means: dict) -> list[float]:
     """
     feats: list[float] = []
     for col in _OBS_COLS:
-        if obs and col in obs and obs[col] is not None:
-            feats.append(float(obs[col]))
+        val = _obs_value(obs, col)
+        if val is not None:
+            feats.append(float(val))
             feats.append(1.0)
         else:
             feats.append(float(means.get(col, 0.0)))
@@ -257,7 +283,7 @@ class Surrogate:
                     int(r.get("acc_w", 0) or 0),
                     float(r.get("clk_ns", 0.0) or 0.0),
                 )
-                if any(r.get(c) is not None for c in _OBS_COLS):
+                if any(_obs_value(r, c) is not None for c in _OBS_COLS):
                     obs_index[key] = r
 
         n_f3 = len(f3_rows)
@@ -276,8 +302,9 @@ class Surrogate:
         obs_cols_present = {c: [] for c in _OBS_COLS}
         for r in f3_rows:
             for c in _OBS_COLS:
-                if r.get(c) is not None:
-                    obs_cols_present[c].append(float(r[c]))
+                v = _obs_value(r, c)
+                if v is not None:
+                    obs_cols_present[c].append(float(v))
         for c in _OBS_COLS:
             vals = obs_cols_present[c]
             if vals:
@@ -393,60 +420,85 @@ class Surrogate:
         self,
         x: dict,
         obs: dict | None = None,
+        reward_kind: str = "tinyvad",
+        refs: dict | None = None,
     ) -> tuple[float, float]:
         """Return (mu, sigma) of the final composite reward for config x.
 
-        The reward formula follows physical_reward.compute_physical_reward:
-          reward ≈ w_spd * norm_speedup + w_area * (area/AREA_REF) + ...
-        We propagate uncertainties in a first-order (independent-errors)
-        approximation — this is deliberately crude; use it as a UCB signal,
-        not a calibrated interval.
+        The reward proxy mirrors physical_reward so the UCB acquisition signal
+        ranks configs the same way the real objective scores them.  All constants
+        are imported from the single sources of truth (constants.py /
+        physical_reward.py) rather than re-hardcoded — previously max_speedup was
+        576 here while the funnel's actual reward used 1024 from the YAML, so the
+        UCB signal was miscalibrated against the objective it ranks (audit H2).
 
-        Weights and references mirror physical_reward.py defaults.
+        reward_kind:
+          "tinyvad" (default) — speedup/accuracy/area composite (TinyMAC).
+          "generic"           — pure PPA proxy (higher Fmax, lower area/power),
+                                 matching compute_generic_reward.  `refs` supplies
+                                 the per-design anchors {area_ref_um2,
+                                 fmax_ref_mhz, power_ref_mw}; falls back to the
+                                 predicted values (self-normalised) when absent.
         """
         preds = self.predict(x, obs)
+        mu_area, sig_area = preds["area_um2"]
+        mu_period, sig_period = preds["period_ns"]
+        mu_power, sig_power = preds["power_mw"]
+        mu_period = max(mu_period, 0.5)   # negative period predictions are unphysical
+        mu_fmax = 1000.0 / mu_period
+
+        if reward_kind == "generic":
+            r = refs or {}
+            area_ref = float(r.get("area_ref_um2") or mu_area or 1.0)
+            fmax_ref = float(r.get("fmax_ref_mhz") or mu_fmax or 1.0)
+            power_ref = r.get("power_ref_mw")
+            w_fmax, w_area, w_pwr = 1.0, -1.0, -0.4
+            mu_reward = w_fmax * (mu_fmax / max(fmax_ref, 1e-9)) \
+                + w_area * (mu_area / max(area_ref, 1e-9))
+            # ∂fmax/∂period = -1000/period² → sigma on fmax
+            sig_fmax = 1000.0 / (mu_period ** 2) * sig_period
+            var = (w_fmax / max(fmax_ref, 1e-9) * sig_fmax) ** 2 \
+                + (w_area / max(area_ref, 1e-9) * sig_area) ** 2
+            if mu_power is not None and power_ref:
+                mu_reward += w_pwr * (mu_power / max(float(power_ref), 1e-9))
+                var += (w_pwr / max(float(power_ref), 1e-9) * sig_power) ** 2
+            return (float(mu_reward), float(math.sqrt(var)))
+
+        # ── TinyVAD composite (mirrors compute_physical_reward) ───────────────
+        from eda_rl.common.constants import (
+            SW_BASELINE_CYCLES, MAX_SPEEDUP_FULL, behavioral_cycles,
+        )
+        from eda_rl.gen1.reward import SW_BASELINE_CLOCK_NS
+        from eda_rl.common.physical_reward import AREA_REF_UM2, POWER_REF_MW
 
         lanes = int(x.get("mac_lanes") or x.get("lanes") or 4)
         acc_w = int(x.get("accumulator_width") or x.get("acc_w") or 24)
 
-        # Accuracy term (analytic — no uncertainty)
-        accuracy = 0.0 if acc_w <= 16 else 1.0  # rough: A16 may overflow
+        accuracy = 0.0 if acc_w <= 16 else 1.0   # matches acc_overflows (A16 overflows)
         w_acc = 2.0
         correctness = -50.0 * (1.0 - accuracy)
 
-        # Speedup from period_ns prediction
-        from eda_rl.common.constants import SW_BASELINE_CYCLES, behavioral_cycles
-        SW_BASELINE_NS = SW_BASELINE_CYCLES * 10.0  # 100 MHz baseline
+        SW_BASELINE_NS = SW_BASELINE_CYCLES * SW_BASELINE_CLOCK_NS
         cyc = behavioral_cycles(lanes)
-        mu_period, sig_period = preds["period_ns"]
-        # Clamp period to (0, inf) — negative predictions are unphysical
-        mu_period = max(mu_period, 0.5)
         mu_latency_ns = cyc * mu_period
         mu_speedup = SW_BASELINE_NS / max(mu_latency_ns, 1.0)
-        max_spd = 576.0
+        max_spd = float(MAX_SPEEDUP_FULL)   # 1024 — matches the funnel YAML reward
         norm_spd = math.log2(max(mu_speedup, 1e-3)) / math.log2(max_spd) if max_spd > 1 else 0.0
         norm_spd = max(-1.0, min(1.0, norm_spd))
-        # sigma propagation: ∂(1/period)/∂period = -1/period²
         sig_speedup = (SW_BASELINE_NS / mu_latency_ns**2) * cyc * sig_period
         sig_norm_spd = (sig_speedup / (mu_speedup * math.log(max_spd))) if mu_speedup > 0 else 0.1
-
-        AREA_REF = 19_738.0
-        POWER_REF = 1_020.0
-        mu_area, sig_area = preds["area_um2"]
-        mu_power, sig_power = preds["power_mw"]
 
         mu_reward = (
             w_acc * accuracy
             + 3.0 * norm_spd
-            + (-0.4) * (mu_area / AREA_REF)
-            + (-0.4) * (mu_power / POWER_REF)
+            + (-0.4) * (mu_area / AREA_REF_UM2)
+            + (-0.4) * (mu_power / POWER_REF_MW)
             + correctness
         )
-        # First-order independent-errors sigma
         sig_reward = math.sqrt(
             (3.0 * sig_norm_spd) ** 2
-            + (0.4 / AREA_REF * sig_area) ** 2
-            + (0.4 / POWER_REF * sig_power) ** 2
+            + (0.4 / AREA_REF_UM2 * sig_area) ** 2
+            + (0.4 / POWER_REF_MW * sig_power) ** 2
         )
         return (float(mu_reward), float(sig_reward))
 
@@ -525,10 +577,12 @@ class Surrogate:
             key = (lanes, acc_w, clk)
             obs = obs_index.get(key)
         # Also pick up obs columns that are present directly in the row
+        # (honouring aliases so live area_um2/wns_ns feed proxy_* columns).
         row_obs: dict = {}
         for c in _OBS_COLS:
-            if flat.get(c) is not None:
-                row_obs[c] = flat[c]
+            v = _obs_value(flat, c)
+            if v is not None:
+                row_obs[c] = v
         if row_obs:
             if obs is None:
                 obs = row_obs

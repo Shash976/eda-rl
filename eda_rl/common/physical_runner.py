@@ -231,6 +231,7 @@ def _parse_metrics(work: Path, platform: str, variant: str, clk_ns: float,
                    design_name: str = DESIGN) -> dict:
     rpt  = work / "reports" / platform / design_name / variant / "6_finish.rpt"
     rlog = work / "logs"    / platform / design_name / variant / "6_report.log"
+    rjson = work / "logs"   / platform / design_name / variant / "6_report.json"
     gds  = work / "results" / platform / design_name / variant / "6_final.gds"
 
     rpt_txt, rlog_txt = _read(rpt), _read(rlog)
@@ -244,9 +245,26 @@ def _parse_metrics(work: Path, platform: str, variant: str, clk_ns: float,
         "area_um2": None, "util_pct": None, "wns_ns": None, "tns_ns": None,
         "setup_viol": None, "power_mw": None, "fmax_mhz": None,
         "period_min_ns": None, "timing_met": None,
+        "cell_count": None, "ff_count": None,
         "gds": str(gds) if gds.exists() else None,
         "report": str(rpt) if rpt.exists() else None,
     }
+
+    # Post-PnR cell counts from 6_report.json (richer than any regex): total
+    # standard cells + sequential (flip-flop) instances.  Same keys fit_surrogate
+    # mines.  Non-essential — never let a missing JSON fail the parse.
+    if rjson.exists():
+        try:
+            import json as _json
+            jd = _json.loads(rjson.read_text())
+            sc = jd.get("finish__design__instance__count__stdcell")
+            ff = jd.get("finish__design__instance__count__class:sequential_cell")
+            if sc is not None:
+                out["cell_count"] = int(sc)
+            if ff is not None:
+                out["ff_count"] = int(ff)
+        except (OSError, ValueError, TypeError):
+            pass
 
     # area + utilisation (from the report LOG): "Design area 19738 um^2 48% utilization."
     m = re.search(r"Design area\s+([\d.]+)\s+um\^2\s+([\d.]+)%", rlog_txt)
@@ -980,12 +998,17 @@ def _mock_metrics(lanes: int, acc_w: int, clk_ns: float) -> dict:
     met = clk_ns >= period_min
     wns = round(clk_ns - 3.82, 3)                           # crit path ≈ 3.82 ns
     power = round(900.0 + 30.0 * lanes, 1)                  # rough lane scaling, mW
+    cell_count = round(cell_area / 1.4)                     # ~µm²/cell at nangate45
+    ff_count = round(cell_count * 0.15)                     # plausible sequential share
     return {
         "area_um2": area, "util_pct": 47.0,
         "wns_ns": wns, "tns_ns": round(min(wns, 0.0) * 15, 2),
         "setup_viol": 0 if met else 40,
         "power_mw": power, "fmax_mhz": fmax, "period_min_ns": period_min,
         "timing_met": met,
+        # cell_count: consumed by run_physical F3 path; cells: the key the
+        # synth proxy (run_synth_sta) / FunnelEnv._run_f2 read at F2.
+        "cell_count": cell_count, "ff_count": ff_count, "cells": cell_count,
         "gds": None, "report": "mock",
     }
 

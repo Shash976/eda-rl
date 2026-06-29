@@ -15,29 +15,11 @@ Three agents implement the same interface for the FunnelEnv action space
 
 3. RandomPromotionAgent — uniform-random action selection.  Sanity check.
 
-State vector layout (22 dims, from FunnelEnv docstring / Phase 4 spec):
-    [0]   lanes normalised:  lanes / 32
-    [1]   acc_w normalised:  acc_w / 32
-    [2]   clk normalised:    (clk - 3.0) / 5.0
-    [3]   abc_recipe one-hot [0]: orfs_speed
-    [4]   abc_recipe one-hot [1]: orfs_area  (plain = [0,0])
-    [5]   F0 obs: cycles_norm  (behavioral_cycles / AVG_CYCLES[1])
-    [6]   F0 obs: accuracy flag (1.0 if acc_w >= 24 else 0.0)
-    [7]   F1 obs: exact cycles_norm  (or -1 if not run)
-    [8]   F1 obs: accuracy          (or -1 if not run)
-    [9]   F2 obs: proxy_area_norm   (area / 50000; or -1)
-    [10]  F2 obs: proxy_wns_ns      (clamped [-5, 5]; or -1)
-    [11]  F2 obs: FF count norm     (FF / 500; or -1)
-    [12]  F2 obs: cell count norm   (cells / 10000; or -1)
-    [13]  F2 obs: logic levels norm (levels / 30; or -1)
-    [14]  surrogate mu              (predicted final reward, normalised to [-1,1])
-    [15]  surrogate sigma           (prediction uncertainty)
-    [16]  incumbent best reward / 4.5  (normalised; 0 if no incumbent)
-    [17]  budget fraction remaining (1.0 at start, 0.0 at exhaustion)
-    [18]  depth one-hot: F0 (current depth is F0)
-    [19]  depth one-hot: F1
-    [20]  depth one-hot: F2
-    [21]  depth one-hot: F3
+State vector layout: see eda_rl/gen2/state_spec.py — the single source of truth
+(imported below).  The agents below read it through the IDX_* constants so they
+can never drift from what FunnelEnv._build_state actually emits (audit H3/H4).
+Key slots the gates use: [6] F0 accuracy, [8] F1 accuracy, [10] F2 wns_norm
+(= clip(wns_ns/5, -2, 2)), [18..21] depth one-hot.  The unrun convention is 0.0.
 
 FixedGateAgent mapping to cascade.py / cascade_reward.py gates:
     The cascade uses three hard thresholds (derived from search_space_full.yaml
@@ -60,8 +42,8 @@ FixedGateAgent mapping to cascade.py / cascade_reward.py gates:
         threshold of -2.5 ns (Phase 5 Exp 3) maps to -2.5/5 = -0.5.
         proxy_wns_kill_threshold is stored and checked in the NORMALISED
         units FunnelEnv produces (-0.5, not -2.5).
-        For use with benchmark_funnel.TableSimEpisode._build_state (raw WNS),
-        create FixedGateAgent(proxy_wns_kill_threshold=-2.5) explicitly.
+        For callers that feed RAW WNS (ns) in state[10] instead of FunnelEnv's
+        normalised value, create FixedGateAgent(proxy_wns_kill_threshold=-2.5).
       - else: "promote" to F3
 
     Depth F3 (full flow result available):
@@ -84,31 +66,16 @@ import numpy as np
 _ActionTuple = tuple[str, ...]
 _DEFAULT_ACTIONS: _ActionTuple = ("kill", "re-proxy", "promote", "commit")
 
-# ── state vector indices (constants shared across all agents) ─────────────────
-IDX_LANES_NORM   = 0
-IDX_ACCW_NORM    = 1
-IDX_CLK_NORM     = 2
-IDX_RECIPE_SPD   = 3   # one-hot: orfs_speed
-IDX_RECIPE_AREA  = 4   # one-hot: orfs_area
-IDX_F0_CYCLES    = 5
-IDX_F0_ACC       = 6
-IDX_F1_CYCLES    = 7
-IDX_F1_ACC       = 8
-IDX_F2_AREA      = 9
-IDX_F2_WNS       = 10
-IDX_F2_FF        = 11
-IDX_F2_CELLS     = 12
-IDX_F2_LEVELS    = 13
-IDX_SURR_MU      = 14
-IDX_SURR_SIG     = 15
-IDX_INCUMBENT    = 16
-IDX_BUDGET_FRAC  = 17
-IDX_DEPTH_F0     = 18
-IDX_DEPTH_F1     = 19
-IDX_DEPTH_F2     = 20
-IDX_DEPTH_F3     = 21
-
-STATE_DIM = 22
+# ── state vector indices — re-exported from the canonical state_spec module ───
+from eda_rl.gen2.state_spec import (  # noqa: E402,F401
+    STATE_DIM,
+    IDX_LANES_NORM, IDX_ACCW_NORM, IDX_CLK_NORM,
+    IDX_RECIPE, IDX_PLATFORM, IDX_RECIPE_SPD, IDX_RECIPE_AREA,
+    IDX_F0_CYCLES, IDX_F0_ACC, IDX_F1_CYCLES, IDX_F1_ACC,
+    IDX_F2_AREA, IDX_F2_WNS, IDX_F2_FF, IDX_F2_CELLS, IDX_F2_LEVELS,
+    IDX_SURR_MU, IDX_SURR_SIG, IDX_INCUMBENT, IDX_BUDGET_FRAC,
+    IDX_DEPTH_F0, IDX_DEPTH_F1, IDX_DEPTH_F2, IDX_DEPTH_F3,
+)
 
 
 # ── LinUCB contextual bandit ──────────────────────────────────────────────────
@@ -195,6 +162,12 @@ class PromotionAgent:
 
         Only the arm corresponding to `action` is updated (disjoint LinUCB).
         Invalid action strings are silently ignored (defensive).
+
+        Audit M6 (experiment, not a fix): the "promote" arm absorbs both the big
+        terminal F3 payoff (at depth F2→F3) and tiny per-step shaping (at F0→F1,
+        F1→F2), and rewards span ~[-100, +4] unscaled.  If the benchmark shows the
+        bandit's myopia/mixed-regime estimate loses to fixed gates, try
+        depth-conditioned arms or reward normalisation here — but measure first.
         """
         if action not in self.actions:
             return
@@ -313,8 +286,7 @@ class FixedGateAgent:
         # proxy_wns_kill_threshold is in the SAME units as state[10]:
         #   FunnelEnv: normalised by /5.0, so default is -0.5
         #              (equivalent to raw -2.5 ns).
-        #   benchmark_funnel.TableSimEpisode: raw WNS in ns; pass -2.5 explicitly
-        #              when using TableSimEpisode outside FunnelEnv.
+        #   raw-WNS callers: pass -2.5 explicitly (state[10] carries raw ns).
         self.proxy_wns_kill_threshold = float(proxy_wns_kill_threshold)
         self.accuracy_kill_threshold = float(accuracy_kill_threshold)
 
@@ -338,13 +310,20 @@ class FixedGateAgent:
             # After synth+STA proxy: gate on proxy WNS.
             # state[10] is in the SAME units as proxy_wns_kill_threshold.
             # With FunnelEnv: state[10] = clip(wns_ns/5, -2, 2) — normalised.
-            # With TableSimEpisode: state[10] = clip(wns_ns, -5, 5) — raw ns.
+            # With raw-WNS callers: state[10] carries raw ns.
             proxy_wns = _get(IDX_F2_WNS, default=0.0)
-            # Sentinel -1 (unrun F2) → promote; otherwise gate on threshold.
-            # We use a sentinel floor of -1.9 for the normalised range (-2 max)
-            # and -4.9 for the raw range.  Both are well below any real threshold.
-            sentinel_floor = -1.9 if abs(self.proxy_wns_kill_threshold) <= 2.1 else -4.9
-            if proxy_wns > sentinel_floor and proxy_wns < self.proxy_wns_kill_threshold:
+            # At depth F2 the proxy HAS run (depth one-hot guarantees it), so
+            # there is no "unrun" value to guard against — kill whenever the
+            # proxy WNS is below the calibrated threshold.  The previous code used
+            # a -1.9 (normalised) / -4.9 (raw) sentinel floor to skip "unrun"
+            # configs, but that floor also let *catastrophically* late configs
+            # escape: FunnelEnv clips state[10] to [-2, 2], so any raw WNS <= -9.5
+            # ns clipped to -2.0, fell below the -1.9 floor, and was PROMOTED to a
+            # full 7-min F3 build instead of killed (audit H1).  The unrun case is
+            # encoded as 0.0 in FunnelEnv (> threshold → promote), so dropping the
+            # floor is safe.  Keep a generous guard against the legacy raw -1
+            # "unrun" sentinel only when it sits ABOVE the kill threshold.
+            if proxy_wns < self.proxy_wns_kill_threshold:
                 return "kill"
             return "promote"
 
@@ -467,9 +446,15 @@ def _selftest() -> None:
     assert fg.proxy_wns_kill_threshold == FixedGateAgent._NORM_WNS_KILL, \
         f"default threshold should be {FixedGateAgent._NORM_WNS_KILL}, got {fg.proxy_wns_kill_threshold}"
 
-    # F0 depth, low accuracy → kill
-    s = np.zeros(dim); s[IDX_DEPTH_F0] = 1.0; s[IDX_F0_ACC] = 0.0
-    assert fg.act(s) == "kill", "F0 low acc should kill"
+    # F0 depth, real sub-threshold accuracy (e.g. tinymac acc_w=16 → 0.73) → kill.
+    # NOTE: 0.0 is the *no-data sentinel* (generic designs have no F0 accuracy);
+    # it must PROMOTE, not kill — using 0.0 here was a pre-existing test bug.
+    s = np.zeros(dim); s[IDX_DEPTH_F0] = 1.0; s[IDX_F0_ACC] = 47.0 / 64.0
+    assert fg.act(s) == "kill", "F0 measured-low acc (0.73) should kill"
+
+    # F0 depth, no-data sentinel (0.0) → promote (generic designs)
+    s[IDX_F0_ACC] = 0.0
+    assert fg.act(s) == "promote", "F0 no-data sentinel (0.0) should promote"
 
     # F0 depth, high accuracy → promote
     s[IDX_F0_ACC] = 1.0
@@ -488,7 +473,15 @@ def _selftest() -> None:
     s[IDX_F2_WNS] = 0.1
     assert fg.act(s) == "promote", "F2 normalised WNS 0.1 should promote (raw +0.5 ns)"
 
-    # Also verify with raw-WNS mode (benchmark_funnel.TableSimEpisode)
+    # H1 regression: catastrophic timing (raw WNS <= -10 ns) clips to the -2.0
+    # normalised floor — it MUST kill, not escape to a full F3 build.
+    s = np.zeros(dim); s[IDX_DEPTH_F2] = 1.0; s[IDX_F2_WNS] = -2.0   # clipped from raw <= -10 ns
+    assert fg.act(s) == "kill", "F2 clipped WNS -2.0 (raw <= -10 ns) must kill, not escape (H1)"
+    # F2 just-run, timing met (norm 0.0) must promote (not a false kill).
+    s[IDX_F2_WNS] = 0.0
+    assert fg.act(s) == "promote", "F2 WNS 0.0 (timing met) should promote"
+
+    # Also verify with raw-WNS mode (state[10] carries raw ns)
     fg_raw = FixedGateAgent(proxy_wns_kill_threshold=-2.5)  # raw ns
     s_raw = np.zeros(dim); s_raw[IDX_DEPTH_F2] = 1.0; s_raw[IDX_F2_WNS] = -3.0  # raw ns
     assert fg_raw.act(s_raw) == "kill", "F2 raw WNS -3.0 ns should kill (raw mode)"

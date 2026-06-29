@@ -100,7 +100,7 @@ from eda_rl.common.constants import (
 from eda_rl.gen1.cascade import _run_sim  # reuse the mock-aware Verilator wrapper
 from eda_rl.common.physical_runner import run_synth_sta, run_physical
 from eda_rl.common.cascade_reward import compute_cascade_reward
-from eda_rl.common.physical_reward import compute_physical_reward
+from eda_rl.common.physical_reward import compute_physical_reward, compute_generic_reward
 
 # ── Module paths ─────────────────────────────────────────────────────────────
 _OPTIMIZER_DIR = Path(__file__).resolve().parent.parent
@@ -140,7 +140,7 @@ _CLK_NORM: dict[str, tuple[float, float]] = {
     "asap7":     (0.3, 1.2),   # (clk - 0.3) / 1.2
 }
 
-_STATE_DIM = 22
+from eda_rl.gen2.state_spec import STATE_DIM as _STATE_DIM  # canonical 22-dim spec
 
 
 # ── Table helpers ──────────────────────────────────────────────────────────────
@@ -259,21 +259,17 @@ def _validate_funnel(config: dict, sim: dict, proxy: dict,
     # (b) are about axes that the active_space defines differently from the YAML
     #     (e.g. "3.0 <= clock_period_ns <= 8.0" is a tinymac constraint; gcd has
     #     clock_period_ns ∈ [0.3, 2.0] per KnobRegistry).
+    # Evaluate each constraint FIRST, then decide whether a *failure* is a real
+    # rejection or a foreign-design bound to skip (audit M5).  The previous code
+    # skipped any constraint whose text merely mentioned an active axis — so a
+    # legitimate universal bound like "3.0 <= clock_period_ns <= 8.0" was dropped
+    # for every design defining clock_period_ns.  Now: a constraint that PASSES is
+    # always honoured; a constraint that FAILS is skipped only when active_space
+    # redefines an axis it references (the config already passed the active_space
+    # membership/bounds checks above, so such a failure is a stale YAML bound).
     safe_globals: dict = {"__builtins__": {}}
+    active_axes = set(active_bounds) | set(active_choices)
     for expr in constraints:
-        # If constraint references an axis that active_space overrides, skip it.
-        # Heuristic: if any active_bounds key appears in the expr and active_space
-        # provides a different range, the YAML constraint is design-specific.
-        if active_bounds:
-            skip = False
-            for aname in active_bounds:
-                if aname in expr:
-                    # This constraint is about an axis that active_space defines;
-                    # the YAML constraint bounds may not apply to this design.
-                    skip = True
-                    break
-            if skip:
-                continue
         try:
             ok = bool(eval(expr, safe_globals, dict(config)))  # noqa: S307
         except NameError:
@@ -281,8 +277,13 @@ def _validate_funnel(config: dict, sim: dict, proxy: dict,
             continue
         except Exception as exc:  # noqa: BLE001
             return False, f"constraint error in {expr!r}: {exc}"
-        if not ok:
-            return False, f"constraint failed: {expr}"
+        if ok:
+            continue
+        # Constraint failed.  If active_space redefines an axis this constraint
+        # references, treat it as a foreign-design bound and skip; else reject.
+        if active_axes and any(aname in expr for aname in active_axes):
+            continue
+        return False, f"constraint failed: {expr}"
     return True, ""
 
 
@@ -319,6 +320,8 @@ def _build_state(
     incumbent_reward: float | None,
     budget_fraction: float,
     depth: int,                         # 0=F0, 1=F1, 2=F2, 3=F3
+    surrogate_reward_kind: str = "tinyvad",
+    surrogate_refs: dict | None = None,
 ) -> np.ndarray:
     lanes  = int(config.get("mac_lanes", 1))        # 1 = sentinel for generic designs
     acc_w  = int(config.get("accumulator_width", 24))  # 24 = default for generic designs
@@ -371,7 +374,9 @@ def _build_state(
         if f2_obs is not None:
             obs.update(f2_obs)
         try:
-            mu, sigma = surrogate.predict_reward_stats(config, obs)
+            mu, sigma = surrogate.predict_reward_stats(
+                config, obs, reward_kind=surrogate_reward_kind,
+                refs=surrogate_refs or {})
             d14 = float(mu) / 4.5
             d15 = float(sigma)
         except Exception:  # noqa: BLE001
@@ -504,12 +509,18 @@ class FunnelEnv:
         self._f2_obs: dict | None = None
         self._f3_obs: dict | None = None
         self._f3_status: str | None = None   # status of the last F3 run (ok/FAIL/table_miss)
+        self._last_terminal_reward: float | None = None  # pure F3 PPA reward (no shaping)
         self._done: bool = True        # must call reset() before step()
         self._episode_spent_s: float = 0.0   # cost accumulated in this episode
 
         # Cumulative budget tracking
         self._spent_s: float = 0.0
         self._incumbent: dict | None = None  # {"config": ..., "reward": float}
+        # Per-platform PPA reference anchors for generic (non-TinyVAD) designs.
+        # Auto-anchored from the first successful F3 build when the design YAML
+        # declares no reward block, so generic rewards need no magic constants
+        # (audit C1).  {platform: {area_ref_um2, power_ref_mw, fmax_ref_mhz}}.
+        self._generic_refs: dict[str, dict] = {}
 
         # _state_vec is always the most recently built 22-dim vector
         self._state_vec: np.ndarray = np.zeros(_STATE_DIM, dtype=np.float32)
@@ -582,6 +593,7 @@ class FunnelEnv:
         self._f2_obs = None
         self._f3_obs = None
         self._f3_status = None
+        self._last_terminal_reward = None
         self._done = False
         self._episode_spent_s = 0.0
 
@@ -638,6 +650,7 @@ class FunnelEnv:
             self._done = True
             info.update({"fidelity": "F3", "f3_obs": self._f3_obs,
                          "f3_status": self._f3_status,
+                         "terminal_reward": self._last_terminal_reward,
                          "table_miss": self._f3_status == "table_miss"})
             # Surface the effective recipe so callers can see plain→orfs_speed remapping
             if self._f3_obs:
@@ -669,6 +682,7 @@ class FunnelEnv:
         info.update({"fidelity": next_fid})
         if next_fid == "F3":
             info["f3_status"] = self._f3_status
+            info["terminal_reward"] = self._last_terminal_reward
             info["table_miss"] = self._f3_status == "table_miss"
         # Surface effective recipe when F3 completes via promote
         if next_fid == "F3" and self._f3_obs:
@@ -758,6 +772,7 @@ class FunnelEnv:
             # Terminal payoff: final composite reward using the ladder-consistent scorer
             self._f3_status = status
             terminal_reward = self._terminal_reward(obs, status)
+            self._last_terminal_reward = terminal_reward   # pure PPA reward (no shaping)
             reward += terminal_reward
             # Update incumbent ONLY on a real result. A table_miss (missing-data,
             # offline table has no F3 row) or a genuine failure must never become
@@ -869,6 +884,13 @@ class FunnelEnv:
         # Fixed flow constants from YAML
         util    = 40
         density = 0.60
+        # M3: lanes/acc_w are RTL chparams.  For designs without them (e.g. gcd,
+        # design.params == {}) the positional 4/24 are ignored downstream
+        # (run_physical emits no VERILOG_TOP_PARAMS), but we must NOT record them
+        # as if they were real config axes in the obs/corpus.  Emit None instead.
+        _has_rtl = bool(getattr(self._design_spec, "params", None))
+        obs_lanes = lanes if "mac_lanes" in self._config else (lanes if _has_rtl else None)
+        obs_acc_w = acc_w if "accumulator_width" in self._config else (acc_w if _has_rtl else None)
 
         if self._table is not None:
             key = _config_key(self._config)
@@ -921,15 +943,20 @@ class FunnelEnv:
                 "timing_met":  result.get("timing_met"),
                 "setup_viol":  result.get("setup_viol"),
                 "period_min_ns": result.get("period_min_ns"),
+                # Post-PnR netlist size from 6_report.json: total std cells +
+                # real flip-flop count (distinct, unlike the F2 synth proxy where
+                # ff_count == total cells — see state_spec.py [11]/[12]).
+                "cell_count":  result.get("cell_count"),
+                "ff_count":    result.get("ff_count"),
                 "gds":         result.get("gds"),
                 # Effective recipe used at F3 (may differ from config["abc_recipe"]
                 # because "plain" is not a valid full-flow recipe and is remapped to
                 # "orfs_speed").  Always carry this so the training corpus is honest.
                 "effective_abc_recipe": f3_recipe,
                 "plain_remapped_to_orfs_speed": plain_remapped,
-                # For reward computation
-                "lanes":    lanes,
-                "acc_w":    acc_w,
+                # For reward computation (None for designs without RTL chparams)
+                "lanes":    obs_lanes,
+                "acc_w":    obs_acc_w,
                 "clk_ns":   clk,
                 "platform": self.platform,
                 "status":   status,
@@ -961,13 +988,17 @@ class FunnelEnv:
         full_fail_penalty = float(penalties.get("full", -20.0))
 
         if status in ("ok", "mock", "mock-proxy"):
-            # Real or mock physical metrics: score normally
-            sim_cycles = None
-            if self._f1_obs is not None:
-                sim_cycles = self._f1_obs.get("avg_cycles")
-
-            scored = compute_physical_reward(obs, self._reward_cfg,
-                                             cycles=sim_cycles)
+            if self._f1_enabled():
+                # TinyVAD design: speedup/accuracy/area composite (TinyMAC anchors).
+                sim_cycles = None
+                if self._f1_obs is not None:
+                    sim_cycles = self._f1_obs.get("avg_cycles")
+                scored = compute_physical_reward(obs, self._reward_cfg,
+                                                 cycles=sim_cycles)
+            else:
+                # Generic design: pure PPA reward with per-design anchors (audit C1).
+                refs, weights = self._generic_reward_cfg(obs)
+                scored = compute_generic_reward(obs, weights=weights, refs=refs)
             return float(scored.get("reward", full_fail_penalty))
 
         if status == "table_miss":
@@ -975,6 +1006,37 @@ class FunnelEnv:
 
         # Genuine failure (FAIL / TIMEOUT / PARSE_FAIL) → monotone ladder penalty
         return full_fail_penalty
+
+    def _generic_reward_cfg(self, obs: dict) -> tuple[dict, dict]:
+        """Resolve (refs, weights) for the generic PPA reward.
+
+        Priority for the normalisation anchors:
+          1. The design YAML's ``reward:`` block (area_ref_um2 / power_ref_mw /
+             fmax_ref_mhz), if declared.
+          2. Otherwise auto-anchor from this build (the first successful F3 of the
+             platform): cache its area/power/Fmax as the references so subsequent
+             builds are scored relative to it.  Stationary after the first build.
+        Weights come from the design's ``reward:`` block when present, else the
+        compute_generic_reward defaults.
+        """
+        rcfg = getattr(self._design_spec, "reward", None) or {}
+        weights = {k: v for k, v in rcfg.items()
+                   if k in ("w_fmax", "w_area", "w_power", "w_timing_violation")}
+
+        declared = {k: rcfg[k] for k in ("area_ref_um2", "power_ref_mw", "fmax_ref_mhz")
+                    if rcfg.get(k) is not None}
+        refs = dict(self._generic_refs.get(self.platform, {}))
+        refs.update(declared)   # YAML-declared anchors always win
+        # Auto-anchor any missing ref from this build's measurement.
+        if obs.get("area_um2") is not None:
+            refs.setdefault("area_ref_um2", float(obs["area_um2"]))
+        if obs.get("fmax_mhz") is not None:
+            refs.setdefault("fmax_ref_mhz", float(obs["fmax_mhz"]))
+        if obs.get("power_mw") is not None:
+            refs.setdefault("power_ref_mw", float(obs["power_mw"]))
+        # Persist the cache so later builds reuse the first build's anchors.
+        self._generic_refs[self.platform] = refs
+        return refs, weights
 
     # ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -1012,14 +1074,23 @@ class FunnelEnv:
             obs = {}
             if self._f2_obs:
                 obs.update(self._f2_obs)
-            mu, _ = self._surrogate.predict_reward_stats(self._config, obs)
+            kind, refs = self._surrogate_reward_kind()
+            mu, _ = self._surrogate.predict_reward_stats(
+                self._config, obs, reward_kind=kind, refs=refs)
             return float(mu)
         except Exception:  # noqa: BLE001
             return 0.0
 
+    def _surrogate_reward_kind(self) -> tuple[str, dict]:
+        """Return (reward_kind, refs) for surrogate UCB, matching the F3 reward."""
+        if self._f1_enabled():
+            return "tinyvad", {}
+        return "generic", dict(self._generic_refs.get(self.platform, {}))
+
     def _update_state(self) -> None:
         """Rebuild the 22-dim state vector from current episode state."""
         assert self._config is not None
+        kind, refs = self._surrogate_reward_kind()
         self._state_vec = _build_state(
             config=self._config,
             platform=self.platform,
@@ -1031,6 +1102,8 @@ class FunnelEnv:
             incumbent_reward=self._incumbent["reward"] if self._incumbent else None,
             budget_fraction=self._budget_fraction(),
             depth=self._depth,
+            surrogate_reward_kind=kind,
+            surrogate_refs=refs,
         )
 
     def _log_row(self, fidelity: str, obs: dict, cost_s: float, status: str) -> None:
