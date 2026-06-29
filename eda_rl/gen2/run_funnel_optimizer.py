@@ -121,38 +121,25 @@ def _build_space(
     design.params axes under their canonical names (mac_lanes, accumulator_width for
     tinymac; empty for designs like gcd that have no RTL params).
 
-    Fixed knobs: axes listed under ``fixed:`` in space_yaml are removed from the
-    returned space so the CandidateGenerator never samples them.  This preserves
-    the historical 4-axis tinymac space for ``--max-tier 1`` (CORE_UTILIZATION is
-    fixed at 40 per search_space_funnel.yaml).
+    Knob fixing/exclusion/overrides are now design-authoritative: they come from
+    the design YAML's ``knobs:`` block (applied inside ``KnobRegistry.space()``),
+    so a design is fully described by its own YAML and the user never edits
+    search_space_funnel.yaml.  A design with no ``knobs:`` block optimizes every
+    knob up to ``--max-tier``.  TinyMAC reproduces its historical fixed-knob set
+    via ``knobs.fix`` in tinymac_accel.yaml.  ``space_yaml`` is retained for
+    signature compatibility but no longer governs the live knob space.
 
     Fallback: if KnobRegistry/DesignSpec are unavailable, use _fallback_space()
     (hardcoded 4-axis tinymac space).
     """
-    # Read fixed knobs from the space YAML (design-specific overrides)
-    fixed_knob_names: set = set()
-    if space_yaml is not None:
-        try:
-            import yaml as _yaml
-            from pathlib import Path as _Path
-            _p = _Path(space_yaml)
-            if _p.exists():
-                with open(_p, encoding="utf-8") as _f:
-                    _raw = _yaml.safe_load(_f)
-                fixed_knob_names = set((_raw.get("fixed") or {}).keys())
-        except Exception:
-            pass
-
     try:
         from eda_rl.common.knobs import KnobRegistry
 
         reg = KnobRegistry.load()
-        # reg.space() accepts str and normalizes via DesignSpec.load() internally.
+        # reg.space() accepts str and normalizes via DesignSpec.load() internally,
+        # and applies the design's knobs.fix/exclude/override block.
         sp = reg.space(max_tier=max_tier, design=design, platform=platform)
         if sp:
-            # Remove axes that are fixed constants in the space YAML
-            if fixed_knob_names:
-                sp = {k: v for k, v in sp.items() if k not in fixed_knob_names}
             return sp
     except (ImportError, AttributeError, Exception):
         pass
