@@ -1,0 +1,48 @@
+# designs/gcd.yaml — self-contained example design (GCD, the ORFS reference).
+#
+# Tiny pure-std-cell design (~200 cells), no RTL params, no functional hook.
+# Used as the smoke-test / proof-of-generality for the design-agnostic optimizer.
+# The RTL is vendored at designs/gcd/gcd.v (copied from the ORFS reference), so
+# this example needs no external paths.
+#
+# nangate45 reference: CORE_UTILIZATION=55, clk_period 0.46 ns (Fmax ~2.17 GHz target).
+
+name: aes
+top:  aes_cipher_top
+
+rtl_files:
+  # Vendored copy of the ORFS-shipped gcd.v; relative path resolves against this
+  # YAML's own directory, so the example is fully self-contained.
+  - /opt/OpenROAD-flow-scripts/flow/designs/src/aes/aes_cipher_top.v
+  - /opt/OpenROAD-flow-scripts/flow/designs/src/aes/aes_inv_cipher_top.v
+  - /opt/OpenROAD-flow-scripts/flow/designs/src/aes/aes_inv_sbox.v
+  - /opt/OpenROAD-flow-scripts/flow/designs/src/aes/aes_key_expand_128.v
+  - /opt/OpenROAD-flow-scripts/flow/designs/src/aes/aes_rcon.v
+  - /opt/OpenROAD-flow-scripts/flow/designs/src/aes/aes_sbox.v
+  - /opt/OpenROAD-flow-scripts/flow/designs/src/aes/timescale.v
+
+
+clock_port: clk
+
+# No RTL chparam axes (gcd has no configurable parameters).
+params: {}
+
+# nangate45: gcd is tiny, starts at sub-ns.
+#   ORFS reference uses 0.46 ns (Fmax target ~2.17 GHz).
+#   AutoTuner nangate45/gcd canonical range: [0.3, 1.0] ns.
+#   We use a wider range [0.3, 2.0] to allow relaxed exploration.
+# asap7: no asap7 SDC shipped in this ORFS install for gcd; not used.
+platforms:
+  nangate45:
+    clock_range_ns: [0.7, 2.0]
+    default_clock_ns: 1.0
+  asap7:
+    clock_range_ns: [0.3, 1.0]
+    default_clock_ns: 0.4
+# has_macros: false — gcd is a pure std-cell design.
+has_macros: false
+
+# functional_eval: none — gcd has no behavioral simulation hook.
+# F0 is legality/validate_config only; F1 is skipped (functional_eval.kind != tinyvad_sim).
+functional_eval:
+  kind: none
