@@ -461,7 +461,15 @@ def _config_mk(platform: str, variant: str, lanes: int, acc_w: int,
 
     return (
         "export DESIGN_HOME = .\n"
-        f"export DESIGN_NAME = {design_name}\n"
+        # ORFS uses DESIGN_NAME as the Verilog top module (synth.tcl:
+        # `hierarchy -check -top $::env(DESIGN_NAME)`), and DESIGN_NICKNAME for
+        # the results/logs directory name.  These differ whenever a design's
+        # top module name != its registry name (e.g. aes → aes_cipher_top), so
+        # we must emit both: nickname keeps results where _parse_metrics looks
+        # (results/<platform>/<design.name>/), DESIGN_NAME points yosys at the
+        # real top.  For name == top designs (gcd/tinymac) this is a no-op.
+        f"export DESIGN_NICKNAME = {design_name}\n"
+        f"export DESIGN_NAME = {design.top}\n"
         f"export PLATFORM    = {platform}\n"
         f"{vfile_lines}"
         f"export SDC_FILE      = $(DESIGN_HOME)/{platform}/{design_name}/constraint_{variant}.sdc\n"
