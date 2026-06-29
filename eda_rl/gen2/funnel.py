@@ -831,8 +831,41 @@ class FunnelEnv:
             return {"avg_cycles": self._f0_cycles, "accuracy": 0.0,
                     "error": str(exc)}, "FAIL"
 
+    # Axes that are NOT plain ORFS knobs: clock + recipe are handled via the
+    # dedicated clk/abc_recipe args, and the RTL chparams go through
+    # VERILOG_TOP_PARAMS (lanes/acc_w).  Everything else in the config is an
+    # ORFS knob that must be forwarded to the flow via knob_values.
+    _NON_ORFS_AXES = frozenset(
+        {"clock_period_ns", "abc_recipe", "mac_lanes", "accumulator_width"}
+    )
+
+    def _effective_orfs_knobs(self) -> dict:
+        """Return {ORFS knob name → value} for the current config.
+
+        Combines the design's fixed-knob constants (``design.knobs['fix']``, which
+        are removed from the sampled space) with the sampled config; the sampled
+        value wins.  Excludes the non-ORFS axes handled separately.  This is what
+        makes tier-2/3 knobs actually reach the ORFS flow — previously the config
+        carried them but the runner was never told.
+        """
+        assert self._config is not None
+        eff: dict = {}
+        knob_cfg = getattr(self._design_spec, "knobs", None) or {}
+        if isinstance(knob_cfg, dict):
+            eff.update(knob_cfg.get("fix") or {})
+        for k, v in self._config.items():
+            if k in self._NON_ORFS_AXES:
+                continue
+            eff[k] = v
+        return eff
+
     def _run_f2(self) -> tuple[dict, str]:
-        """F2: synth+STA proxy (run_synth_sta, mock-aware)."""
+        """F2: synth+STA proxy (run_synth_sta, mock-aware).
+
+        Note: the proxy is yosys synth + pre-layout STA — it has no floorplan,
+        placement, CTS or routing, so the tier-2/3 ORFS knobs do not affect its
+        output and are intentionally not forwarded here.  They take effect at F3.
+        """
         assert self._config is not None
         lanes  = int(self._config.get("mac_lanes", 4))
         acc_w  = int(self._config.get("accumulator_width", 24))
@@ -881,9 +914,16 @@ class FunnelEnv:
         acc_w   = int(self._config.get("accumulator_width", 24))
         clk     = float(self._config["clock_period_ns"])
         recipe  = self._config.get("abc_recipe", "plain")
-        # Fixed flow constants from YAML
-        util    = 40
-        density = 0.60
+        # Effective ORFS knob values for this build.  CORE_UTILIZATION /
+        # PLACE_DENSITY go through the dedicated util/density args (so _config_mk
+        # emits them once, not twice); every other tier-1/2/3 knob flows through
+        # knob_values below so it actually reaches the ORFS flow.  Values come
+        # from the sampled config, falling back to design-fixed constants, then
+        # to the historical defaults (40 / 0.60).
+        eff = self._effective_orfs_knobs()
+        util    = int(eff.pop("CORE_UTILIZATION", 40))
+        density = float(eff.pop("PLACE_DENSITY", 0.60))
+        knob_values = eff
         # M3: lanes/acc_w are RTL chparams.  For designs without them (e.g. gcd,
         # design.params == {}) the positional 4/24 are ignored downstream
         # (run_physical emits no VERILOG_TOP_PARAMS), but we must NOT record them
@@ -929,6 +969,8 @@ class FunnelEnv:
                 kwargs["design"] = self._design_spec
             except Exception:   # noqa: BLE001
                 pass   # design resolution failed; fall back to tinymac behaviour
+        if "knob_values" in sig.parameters and knob_values:
+            kwargs["knob_values"] = knob_values
 
         try:
             result = run_physical(lanes, acc_w, clk, self.platform,

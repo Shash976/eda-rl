@@ -256,6 +256,35 @@ class KnobRegistry:
                 entry["range"] = list(knob.range)
             space[knob.name] = entry
 
+        # 5. Per-design knob control (optional).  Lets a design be fully described
+        #    by its own YAML: pin knobs to constants (fix), drop them (exclude),
+        #    or retune their ranges/choices (override) — no need to edit the
+        #    shared search_space_funnel.yaml.  Fixed/excluded axes are removed
+        #    from the sampled space; their constant values are applied to the
+        #    build by FunnelEnv._effective_orfs_knobs().
+        knob_cfg = getattr(design, "knobs", None) or {}
+        if isinstance(knob_cfg, dict):
+            for name in set(knob_cfg.get("exclude") or []):
+                space.pop(name, None)
+            for name in (knob_cfg.get("fix") or {}):
+                space.pop(name, None)
+            for name, ov in (knob_cfg.get("override") or {}).items():
+                if name not in space or not isinstance(ov, dict):
+                    continue
+                entry = space[name]
+                if "choices" in ov:
+                    entry["type"] = "categorical"
+                    entry["choices"] = list(ov["choices"])
+                    entry.pop("range", None)
+                elif "range" in ov:
+                    entry["range"] = list(ov["range"])
+                    entry.pop("choices", None)
+                elif "low" in ov or "high" in ov:
+                    lo, hi = entry.get("range", [0.0, 1.0])
+                    entry["range"] = [ov.get("low", lo), ov.get("high", hi)]
+                if "default" in ov:
+                    entry["default"] = ov["default"]
+
         return space
 
 
