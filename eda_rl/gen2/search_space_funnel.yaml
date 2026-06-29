@@ -71,10 +71,11 @@ proxy_params:
       not the effective one — this is the canonical key convention. The effective
       recipe is carried in obs only, never in the config dict.
 
-# ── Fixed flow constants (Phase 5: measured sensitivity <1.4%, demoted) ───────
-fixed:
-  CORE_UTILIZATION: 40    # <0.3% area effect across measured range
-  PLACE_DENSITY: 0.60     # ~1.4% area effect; not worth the axis complexity
+# ── Fixed flow constants ──────────────────────────────────────────────────────
+# Knob fixing is now design-authoritative: each design pins/drops/retunes ORFS
+# knobs via its own YAML `knobs:` block (applied in KnobRegistry.space()).  The
+# old `fixed:` block here is gone — TinyMAC's Phase-5 CORE_UTILIZATION=40 /
+# PLACE_DENSITY=0.60 demotion now lives in designs/tinymac_accel.yaml `knobs.fix`.
 
 # ── Validity constraints (gate 1: validate) ──────────────────────────────────
 # Declarative boolean expressions over param names — eval'd by validate.py.
