@@ -88,6 +88,17 @@ class DesignSpec:
                                    # (area_ref_um2 / power_ref_mw / fmax_ref_mhz).
                                    # When absent for a generic design, FunnelEnv
                                    # auto-anchors from the first F3 build.
+    knobs: dict | None = None      # optional per-design control of the ORFS knob
+                                   # search space (so a design is fully described
+                                   # by its own YAML — no need to edit
+                                   # search_space_funnel.yaml). Schema:
+                                   #   knobs:
+                                   #     fix:      {KNOB: value}   # pin + drop from space
+                                   #     exclude:  [KNOB, ...]     # drop (use tool default)
+                                   #     override: {AXIS: {range: [lo,hi] | choices: [...]
+                                   #                       | low:/high:/default:}}
+                                   # Omit entirely → every knob up to --max-tier is
+                                   # optimized (nothing fixed).
 
     # ── Factory ───────────────────────────────────────────────────────────────
 
@@ -163,6 +174,7 @@ class DesignSpec:
 
         functional_eval = raw.get("functional_eval")
         reward = raw.get("reward")
+        knobs = raw.get("knobs")
 
         return cls(
             name=str(raw["name"]),
@@ -174,6 +186,7 @@ class DesignSpec:
             has_macros=has_macros,
             functional_eval=functional_eval,
             reward=reward,
+            knobs=knobs,
         )
 
     # ── SDC generation ────────────────────────────────────────────────────────

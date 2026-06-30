@@ -171,7 +171,23 @@ def variant_name(lanes: int, acc_w: int, clk_ns: float,
     # V11: use {:.4g} so 1.25 and 1.2 produce distinct tokens ("1p25" vs "1p2");
     # the old :.1f caused variant_name(4,24,1.25)==variant_name(4,24,1.2).
     clk_str = f"{float(clk_ns):.4g}".replace(".", "p")
-    name = f"L{lanes}_A{acc_w}_c{clk_str}"
+    # V14: only embed the LANES/ACC_W tokens for designs that actually have
+    # those RTL params.  The legacy tinymac path (design is None or the tinymac
+    # spec) keeps the exact old "L{lanes}_A{acc_w}" prefix so existing result
+    # dirs/caches stay reachable; generic designs (gcd, aes) without mac_lanes/
+    # accumulator_width get a clean "c{clk}" name instead of a misleading
+    # L4_A24 leak.
+    if design is None or getattr(design, "name", None) == "tinymac_accel":
+        name = f"L{lanes}_A{acc_w}_c{clk_str}"
+    else:
+        params = getattr(design, "params", None) or {}
+        pa_parts = []
+        if "mac_lanes" in params:
+            pa_parts.append(f"L{lanes}")
+        if "accumulator_width" in params:
+            pa_parts.append(f"A{acc_w}")
+        pa_parts.append(f"c{clk_str}")
+        name = "_".join(pa_parts)
     # Flow-param suffixes are appended ONLY when non-default, so configs that use
     # the original util=40/density=0.60 keep the exact old variant name and reuse
     # any GDS already built by run.sh / sweep.sh.
@@ -445,7 +461,15 @@ def _config_mk(platform: str, variant: str, lanes: int, acc_w: int,
 
     return (
         "export DESIGN_HOME = .\n"
-        f"export DESIGN_NAME = {design_name}\n"
+        # ORFS uses DESIGN_NAME as the Verilog top module (synth.tcl:
+        # `hierarchy -check -top $::env(DESIGN_NAME)`), and DESIGN_NICKNAME for
+        # the results/logs directory name.  These differ whenever a design's
+        # top module name != its registry name (e.g. aes → aes_cipher_top), so
+        # we must emit both: nickname keeps results where _parse_metrics looks
+        # (results/<platform>/<design.name>/), DESIGN_NAME points yosys at the
+        # real top.  For name == top designs (gcd/tinymac) this is a no-op.
+        f"export DESIGN_NICKNAME = {design_name}\n"
+        f"export DESIGN_NAME = {design.top}\n"
         f"export PLATFORM    = {platform}\n"
         f"{vfile_lines}"
         f"export SDC_FILE      = $(DESIGN_HOME)/{platform}/{design_name}/constraint_{variant}.sdc\n"

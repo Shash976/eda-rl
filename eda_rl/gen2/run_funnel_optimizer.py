@@ -113,6 +113,7 @@ def _build_space(
     design: str | None,
     platform: str,
     max_tier: int,
+    space_yaml: "str | Path | None" = None,
 ) -> dict:
     """Return a space dict, trying KnobRegistry+DesignSpec first then _fallback_space.
 
@@ -120,10 +121,13 @@ def _build_space(
     design.params axes under their canonical names (mac_lanes, accumulator_width for
     tinymac; empty for designs like gcd that have no RTL params).
 
-    Knob fixing is design-authoritative: pins/drops/overrides come from each
-    design's own YAML ``knobs:`` block, applied inside KnobRegistry.space() (so the
-    live optimizer and build_table agree on the sampled space). The shared
-    search_space_funnel.yaml no longer carries a ``fixed:`` block.
+    Knob fixing/exclusion/overrides are now design-authoritative: they come from
+    the design YAML's ``knobs:`` block (applied inside ``KnobRegistry.space()``),
+    so a design is fully described by its own YAML and the user never edits
+    search_space_funnel.yaml.  A design with no ``knobs:`` block optimizes every
+    knob up to ``--max-tier``.  TinyMAC reproduces its historical fixed-knob set
+    via ``knobs.fix`` in tinymac_accel.yaml.  ``space_yaml`` is retained for
+    signature compatibility but no longer governs the live knob space.
 
     Fallback: if KnobRegistry/DesignSpec are unavailable, use _fallback_space()
     (hardcoded 4-axis tinymac space).
@@ -133,7 +137,7 @@ def _build_space(
 
         reg = KnobRegistry.load()
         # reg.space() accepts str and normalizes via DesignSpec.load() internally,
-        # including the design's own knobs: fix/exclude/override block.
+        # and applies the design's knobs.fix/exclude/override block.
         sp = reg.space(max_tier=max_tier, design=design, platform=platform)
         if sp:
             return sp
@@ -203,7 +207,7 @@ def run_campaign(
         print(f"  No surrogate (UCB scoring disabled)")
 
     # ── build space ────────────────────────────────────────────────────────────
-    space = _build_space(design, platform, max_tier)
+    space = _build_space(design, platform, max_tier, space_yaml=space_yaml)
     if verbose:
         print(f"  Space: {len(space)} axes: {list(space.keys())}")
 
