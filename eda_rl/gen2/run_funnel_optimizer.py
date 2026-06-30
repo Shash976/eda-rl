@@ -113,7 +113,6 @@ def _build_space(
     design: str | None,
     platform: str,
     max_tier: int,
-    space_yaml: "str | Path | None" = None,
 ) -> dict:
     """Return a space dict, trying KnobRegistry+DesignSpec first then _fallback_space.
 
@@ -121,38 +120,22 @@ def _build_space(
     design.params axes under their canonical names (mac_lanes, accumulator_width for
     tinymac; empty for designs like gcd that have no RTL params).
 
-    Fixed knobs: axes listed under ``fixed:`` in space_yaml are removed from the
-    returned space so the CandidateGenerator never samples them.  This preserves
-    the historical 4-axis tinymac space for ``--max-tier 1`` (CORE_UTILIZATION is
-    fixed at 40 per search_space_funnel.yaml).
+    Knob fixing is design-authoritative: pins/drops/overrides come from each
+    design's own YAML ``knobs:`` block, applied inside KnobRegistry.space() (so the
+    live optimizer and build_table agree on the sampled space). The shared
+    search_space_funnel.yaml no longer carries a ``fixed:`` block.
 
     Fallback: if KnobRegistry/DesignSpec are unavailable, use _fallback_space()
     (hardcoded 4-axis tinymac space).
     """
-    # Read fixed knobs from the space YAML (design-specific overrides)
-    fixed_knob_names: set = set()
-    if space_yaml is not None:
-        try:
-            import yaml as _yaml
-            from pathlib import Path as _Path
-            _p = _Path(space_yaml)
-            if _p.exists():
-                with open(_p, encoding="utf-8") as _f:
-                    _raw = _yaml.safe_load(_f)
-                fixed_knob_names = set((_raw.get("fixed") or {}).keys())
-        except Exception:
-            pass
-
     try:
         from eda_rl.common.knobs import KnobRegistry
 
         reg = KnobRegistry.load()
-        # reg.space() accepts str and normalizes via DesignSpec.load() internally.
+        # reg.space() accepts str and normalizes via DesignSpec.load() internally,
+        # including the design's own knobs: fix/exclude/override block.
         sp = reg.space(max_tier=max_tier, design=design, platform=platform)
         if sp:
-            # Remove axes that are fixed constants in the space YAML
-            if fixed_knob_names:
-                sp = {k: v for k, v in sp.items() if k not in fixed_knob_names}
             return sp
     except (ImportError, AttributeError, Exception):
         pass
@@ -220,7 +203,7 @@ def run_campaign(
         print(f"  No surrogate (UCB scoring disabled)")
 
     # ── build space ────────────────────────────────────────────────────────────
-    space = _build_space(design, platform, max_tier, space_yaml=space_yaml)
+    space = _build_space(design, platform, max_tier)
     if verbose:
         print(f"  Space: {len(space)} axes: {list(space.keys())}")
 

@@ -48,8 +48,9 @@ nangate45 builds:
 | `ACC_W` (RTL) | ±5% area, accuracy cliff at 16 |
 | `CORE_UTILIZATION` / `PLACE_DENSITY` | **<0.3% / ~1.4%** — noise |
 
-So: utilization and density were demoted to fixed constants, the ABC recipe was
-promoted to a first-class axis, and the clock became a continuous design axis
+So: utilization and density were demoted to fixed constants (for tinymac, via
+its YAML `knobs.fix` block — see "Per-design knob control" below), the ABC recipe
+was promoted to a first-class axis, and the clock became a continuous design axis
 whose response surface is *learned*, not assumed (the old `max(clk, 3.72ns)`
 analytic cap contradicted the measurements).
 
@@ -114,7 +115,7 @@ Root-level shims (`optimizer/run_funnel_optimizer.py`, `optimizer/build_table.py
 | File | What it is |
 |---|---|
 | [`../optimizer/gen2/funnel.py`](../optimizer/gen2/funnel.py) | `FunnelEnv` — gym-style environment over the fidelity ladder. `reset(config)` runs F0 and returns a 22-dim state; `step(action)` with `kill / re-proxy / promote / commit`; terminal on kill or after F3. Accepts `design`, `max_tier`, and `active_space` params so it is design-agnostic. For designs without a `tinyvad_sim` functional-eval hook, the F1 stage is skipped (depth goes F0→F2; the two F1 state slots stay zero). Runs **live** (real tools) or in **table mode** (replays logged observations, charging recorded costs against a simulated wall-clock budget). Logs every row to `results_funnel.jsonl`. |
-| [`../optimizer/gen2/search_space_funnel.yaml`](../optimizer/gen2/search_space_funnel.yaml) | The evidence-reduced tinymac space: `mac_lanes` {1,2,4,8,16,32} × `accumulator_width` {16,24,32} × `clock_period_ns` continuous [3.0, 8.0] (0.5 ns grid for offline tabling) × `abc_recipe` {orfs_speed, orfs_area, plain} = **594 grid configs**; utilization/density fixed at 40 / 0.60. (For other designs the space is built dynamically from the YAML spec + KnobRegistry.) |
+| [`../optimizer/gen2/search_space_funnel.yaml`](../optimizer/gen2/search_space_funnel.yaml) | The evidence-reduced tinymac space: `mac_lanes` {1,2,4,8,16,32} × `accumulator_width` {16,24,32} × `clock_period_ns` continuous [3.0, 8.0] (0.5 ns grid for offline tabling) × `abc_recipe` {orfs_speed, orfs_area, plain} = **594 grid configs**; utilization/density pinned at 40 / 0.60 via tinymac's YAML `knobs.fix` block (see "Per-design knob control"). (For other designs the space is built dynamically from the YAML spec + KnobRegistry.) |
 | [`../optimizer/common/recipe.py`](../optimizer/common/recipe.py) | The ABC recipe axis. `orfs_speed`/`orfs_area` map to ORFS's own abc scripts at *both* the F2 proxy and the F3 full flow (previously the proxy synthesized with a recipe the full flow never used). `plain` (bare `abc -liberty`) is proxy-only — ORFS hard-codes its script selection — and F3 records the effective recipe when a plain config is committed. |
 | [`../optimizer/gen2/surrogate.py`](../optimizer/gen2/surrogate.py) | Per-metric quantile-GBT surrogate: `fit(rows)`, `predict(x, obs) → (μ, σ)` for area/period/power, plus `predict_reward_stats` for the composite reward. Multi-fidelity: F2 observables (proxy area, proxy WNS, FF/cell counts) enter as conditioning features with missing-indicators, so one model serves both "config only" and "config + proxy results" queries. `fit_surrogate.py` mines the existing ORFS report tree and validates by cross-validation. |
 | [`../optimizer/gen2/promotion_agent.py`](../optimizer/gen2/promotion_agent.py) | The promotion policies: `PromotionAgent` (LinUCB contextual bandit over the 22-dim state — the doc-07 analysis shows a bandit is the right starting point, with PPO as a later upgrade *only if* lookahead measurably beats myopia), `FixedGateAgent` (the first-generation hard gates expressed as a policy — the baseline to beat), `RandomPromotionAgent`. |
@@ -205,7 +206,41 @@ tinymac — a very sparse design — but dominant for denser designs like gcd).
 
 When ORFS knobs beyond tier 1 are active, variant names gain a knob-hash suffix
 (`L4_A24_c5_r3fa2b1c9_k7f2e`) so configurations differing only in ORFS knobs
-never alias in the cache.
+never alias in the cache. The `L{lanes}_A{acc_w}` tokens are only emitted for
+designs that actually declare `mac_lanes`/`accumulator_width` RTL params;
+designs without them (gcd, aes) get a plain prefix.
+
+**Tier-2+ knobs reach F3.** Floorplan/placement/route knobs (tiers 2–4) only
+change the result at the full RTL→GDS flow, so `FunnelEnv` forwards the sampled
+config — merged with any design-fixed constants — to ORFS at F3 via
+`_effective_orfs_knobs()`. The F2 proxy is deliberately left untouched: it is
+yosys synth + pre-layout STA with no floorplan/place/route, so those knobs
+cannot move it. (Before this, F3 hard-coded util=40/density=0.60 and ignored
+everything else, making any `--max-tier ≥ 2` search a no-op at F3.)
+
+### Per-design knob control
+
+Knob control is **design-authoritative**: a design's own YAML fully describes
+its search space via an optional `knobs:` block, applied centrally inside
+`KnobRegistry.space()` so the live optimizer and the offline `build_table`
+agree on the sampled space. (Previously knob fixing lived only in the shared
+`search_space_funnel.yaml` `fixed:` block and was honored by
+`run_funnel_optimizer` but *not* by `build_table`'s direct `KnobRegistry.space()`
+call.)
+
+```yaml
+knobs:
+  fix:      {CORE_UTILIZATION: 40, PLACE_DENSITY: 0.60}  # pin + drop from space
+  exclude:  [CORE_MARGIN]                                # drop, use tool default
+  override:                                              # retune range/choices/default
+    CORE_ASPECT_RATIO: {range: [0.8, 1.2]}
+```
+
+`fix`/`exclude` axes are removed from the sampled space; `fix` constants are
+re-applied to the build by `_effective_orfs_knobs()`. Omit the block entirely
+and every knob up to `--max-tier` is optimized with nothing pinned. TinyMAC
+reproduces its historical fixed set (`CORE_UTILIZATION=40`, `PLACE_DENSITY=0.60`)
+through this block in `designs/tinymac_accel.yaml`.
 
 ---
 

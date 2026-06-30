@@ -110,6 +110,24 @@ PHYSICAL_MOCK=1 python -m eda_rl.gen2.build_table --subset strategic --limit 5
   TinyMAC constants for all designs.
 - **State vector is owned by `gen2/state_spec.py`.** 22 dims, `unrun = 0.0`,
   `[3]=recipe_idx/2`, `[4]=platform flag`. Don't fork the layout.
+- **Design-authoritative knob control.** A design's optional YAML `knobs:` block
+  (`fix` / `exclude` / `override`) is the single place knobs are pinned/dropped/
+  retuned, applied centrally in `KnobRegistry.space()` so the live optimizer and
+  `build_table` agree. Don't reintroduce knob-fixing in
+  `search_space_funnel.yaml` (its `fixed:` block is dead). TinyMAC's
+  `CORE_UTILIZATION=40`/`PLACE_DENSITY=0.60` live in `tinymac_accel.yaml`.
+- **Tier-2+ knobs reach F3.** `FunnelEnv._effective_orfs_knobs()` merges
+  design-fixed constants with the sampled config (minus the four non-ORFS axes:
+  `clock_period_ns`, `abc_recipe`, `mac_lanes`, `accumulator_width`) and passes
+  them to `run_physical`. F2 stays untouched (proxy = synth+STA, no
+  floorplan/place/route). Don't re-hardcode util/density at F3.
+- **`DESIGN_NAME` vs `DESIGN_NICKNAME`.** The runner emits
+  `DESIGN_NAME = design.top` (yosys top module) and `DESIGN_NICKNAME = design.name`
+  (results/logs dir). Don't collapse them — designs whose top ≠ registry name
+  (e.g. aes, top `aes_cipher_top`) break if `DESIGN_NAME` is overloaded.
+- **Variant `L/A` tokens are conditional.** `variant_name()` only embeds
+  `L{lanes}_A{acc_w}` when `design.params` declares `mac_lanes`/`accumulator_width`
+  (the legacy tinymac/`design is None` path keeps the old prefix for cache reach).
 - **F3-only TPE tell.** Only terminal F3 rewards feed the Optuna study; kills/
   proxy results go to a skip-memo (`candidates.py`).
 - **Reward bookkeeping.** The runner uses `info["terminal_reward"]` (pure PPA),

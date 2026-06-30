@@ -50,7 +50,7 @@ Toggle the search however you like:
 | `--design` | name or path to a YAML | the design to optimize |
 | `--platform` | `nangate45`, `asap7`, … | target PDK |
 | `--budget-hours` | float, `4` | wall-clock budget; the optimizer stops when spent |
-| `--max-tier` | `1`–`4`, `1` | how many ORFS knob tiers to search (1 = core axes; 4 = +macro knobs) |
+| `--max-tier` | `1`–`4`, `1` | how many ORFS knob tiers to search (1 = core axes; 4 = +macro knobs). Tier-2+ knobs now flow all the way to the F3 full build, not just the F2 proxy |
 | `--sampler` | `tpe` \| `surrogate_ucb` \| `random` | how candidates are proposed |
 | `--promotion` | `fixed` \| `linucb` \| `random` | the policy that decides what advances F0→F3 |
 | `--seed` | int, `0` | reproducibility |
@@ -143,6 +143,19 @@ platforms:
 has_macros: false           # omit to auto-detect at first synth
 functional_eval:
   kind: none                # or 'tinyvad_sim' for a design with a behavioral hook
+
+# Optional: per-design control of the ORFS knob search space, so a design is
+# fully described by its own YAML (no need to edit search_space_funnel.yaml).
+# Omit entirely → every knob up to --max-tier is optimized, nothing pinned.
+knobs:
+  fix:                      # pin to a constant + drop from the sampled space
+    CORE_UTILIZATION: 40
+    PLACE_DENSITY: 0.60
+  exclude:                  # drop from the space, use the tool default
+    - CORE_MARGIN
+  override:                 # retune a knob's range / choices / default
+    CORE_ASPECT_RATIO:
+      range: [0.8, 1.2]
 ```
 
 Then:
