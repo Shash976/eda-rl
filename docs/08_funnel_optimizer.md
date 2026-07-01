@@ -99,45 +99,45 @@ Two honesty rules are built into the reward:
 
 ## Code layout (gen1 / gen2 / common)
 
-The optimizer is now three packages under `optimizer/`. Every documented command works unchanged — thin shims at the `optimizer/` root re-export the real modules.
+The optimizer is the `eda_rl` package, laid out as three sub-packages plus a
+shared plumbing layer. The `eda-rl` CLI (see "How to run" below) is the entry
+point; there is no separate `optimizer/` tree or compat shim layer.
 
 | Package | What lives there |
 |---|---|
-| `optimizer/gen1/` | Single-step black-box DSE: 45-config sim track, fixed-gate cascade funnel, physical track. `env.py`, `cascade.py`, `cascade_env.py`, `physical_env.py`, `reward.py`, `runner.py`, `dashboard.py`, `agents/` (random/evo/ucb/bayesian/enumerate). |
-| `optimizer/gen2/` | The funnel: `funnel.py`, `surrogate.py`, `promotion_agent.py`, `candidates.py`, `build_table.py`, `benchmark_funnel.py`, `fit_surrogate.py`, `search_space_funnel.yaml`. |
-| `optimizer/common/` | Shared plumbing: `physical_runner.py`, `physical_reward.py`, `cascade_reward.py`, `recipe.py`, `constants.py`, `validate.py`, `measure_real.py`, **`designs.py`**, **`knobs.py`**. |
-| `optimizer/designs/` | Per-design YAML specs: `tinymac_accel.yaml`, `gcd.yaml`. |
-
-Root-level shims (`optimizer/run_funnel_optimizer.py`, `optimizer/build_table.py`, etc.) call `runpy.run_path` into the real module — callers do not need to know about the package split.
+| `eda_rl/gen1/` | Single-step black-box DSE: 45-config sim track, fixed-gate cascade funnel, physical track. `env.py`, `cascade.py`, `cascade_env.py`, `physical_env.py`, `reward.py`, `runner.py`, `dashboard.py`, `agents/` (random/evo/ucb/bayesian/enumerate). |
+| `eda_rl/gen2/` | The funnel: `funnel.py`, `surrogate.py`, `promotion_agent.py`, `candidates.py`, `build_table.py`, `benchmark_funnel.py`, `fit_surrogate.py`, `search_space_funnel.yaml`. |
+| `eda_rl/common/` | Shared plumbing: `physical_runner.py`, `physical_reward.py`, `cascade_reward.py`, `recipe.py`, `constants.py`, `validate.py`, `measure_real.py`, **`designs.py`**, **`knobs.py`**. |
+| `eda_rl/designs/` | Per-design YAML specs: `tinymac_accel.yaml`, `gcd.yaml`, `aes.yaml`. |
 
 ## The modules
 
 | File | What it is |
 |---|---|
-| [`../optimizer/gen2/funnel.py`](../optimizer/gen2/funnel.py) | `FunnelEnv` — gym-style environment over the fidelity ladder. `reset(config)` runs F0 and returns a 22-dim state; `step(action)` with `kill / re-proxy / promote / commit`; terminal on kill or after F3. Accepts `design`, `max_tier`, and `active_space` params so it is design-agnostic. For designs without a `tinyvad_sim` functional-eval hook, the F1 stage is skipped (depth goes F0→F2; the two F1 state slots stay zero). Runs **live** (real tools) or in **table mode** (replays logged observations, charging recorded costs against a simulated wall-clock budget). Logs every row to `results_funnel.jsonl`. |
-| [`../optimizer/gen2/search_space_funnel.yaml`](../optimizer/gen2/search_space_funnel.yaml) | The evidence-reduced tinymac space: `mac_lanes` {1,2,4,8,16,32} × `accumulator_width` {16,24,32} × `clock_period_ns` continuous [3.0, 8.0] (0.5 ns grid for offline tabling) × `abc_recipe` {orfs_speed, orfs_area, plain} = **594 grid configs**; utilization/density pinned at 40 / 0.60 via tinymac's YAML `knobs.fix` block (see "Per-design knob control"). (For other designs the space is built dynamically from the YAML spec + KnobRegistry.) |
-| [`../optimizer/common/recipe.py`](../optimizer/common/recipe.py) | The ABC recipe axis. `orfs_speed`/`orfs_area` map to ORFS's own abc scripts at *both* the F2 proxy and the F3 full flow (previously the proxy synthesized with a recipe the full flow never used). `plain` (bare `abc -liberty`) is proxy-only — ORFS hard-codes its script selection — and F3 records the effective recipe when a plain config is committed. |
-| [`../optimizer/gen2/surrogate.py`](../optimizer/gen2/surrogate.py) | Per-metric quantile-GBT surrogate: `fit(rows)`, `predict(x, obs) → (μ, σ)` for area/period/power, plus `predict_reward_stats` for the composite reward. Multi-fidelity: F2 observables (proxy area, proxy WNS, FF/cell counts) enter as conditioning features with missing-indicators, so one model serves both "config only" and "config + proxy results" queries. `fit_surrogate.py` mines the existing ORFS report tree and validates by cross-validation. |
-| [`../optimizer/gen2/promotion_agent.py`](../optimizer/gen2/promotion_agent.py) | The promotion policies: `PromotionAgent` (LinUCB contextual bandit over the 22-dim state — the doc-07 analysis shows a bandit is the right starting point, with PPO as a later upgrade *only if* lookahead measurably beats myopia), `FixedGateAgent` (the first-generation hard gates expressed as a policy — the baseline to beat), `RandomPromotionAgent`. |
-| [`../optimizer/gen2/candidates.py`](../optimizer/gen2/candidates.py) | `CandidateGenerator` — Optuna-backed next-config proposer (see "Candidate generation" section below). |
-| [`../optimizer/gen2/build_table.py`](../optimizer/gen2/build_table.py) | Resumable offline table builder over the reduced space at F0–F2. Dedupes what physics allows (cycles depend only on lanes → one sim per lane count; the proxy is keyed by lanes/acc_w/clk/recipe). `--subset strategic` = 84-config corner+axis sweep (~1.2 h); the full 594-config table is ~7 h. Accepts `--design` and `--max-tier` for non-tinymac designs. |
-| [`../optimizer/gen2/benchmark_funnel.py`](../optimizer/gen2/benchmark_funnel.py) | The benchmark that adjudicates whether learned promotion beats fixed gates: random vs fixed-gate vs LinUCB driving the *real* `FunnelEnv` in table mode, ≥20 seeds, metric = simulated wall-clock to 95% of the table optimum (median and p95). Accepts `--candidates shuffled|tpe|surrogate_ucb`. |
-| [`../optimizer/gen2/run_funnel_optimizer.py`](../optimizer/gen2/run_funnel_optimizer.py) | Live campaign driver — see "How to run" below. Shim at `optimizer/run_funnel_optimizer.py`. |
-| [`../optimizer/common/constants.py`](../optimizer/common/constants.py) | Single source of truth for measured constants — SW baseline (11,196,638 cycles/inference), the per-lane cycle table, the `behavioral_cycles(lanes)` fit, speedup normalization caps. Everything that previously duplicated these numbers imports them from here. |
-| [`../optimizer/common/designs.py`](../optimizer/common/designs.py) | `DesignSpec` dataclass + `DesignSpec.load(name_or_path)` — see "Bring your own design" below. |
-| [`../optimizer/common/knobs.py`](../optimizer/common/knobs.py) | `KnobRegistry` with 24 ORFS variables in 4 tiers — see "The knob tiers" below. |
+| [`../eda_rl/gen2/funnel.py`](../eda_rl/gen2/funnel.py) | `FunnelEnv` — gym-style environment over the fidelity ladder. `reset(config)` runs F0 and returns a 22-dim state; `step(action)` with `kill / re-proxy / promote / commit`; terminal on kill or after F3. Accepts `design`, `max_tier`, and `active_space` params so it is design-agnostic. For designs without a `tinyvad_sim` functional-eval hook, the F1 stage is skipped (depth goes F0→F2; the two F1 state slots stay zero). Runs **live** (real tools) or in **table mode** (replays logged observations, charging recorded costs against a simulated wall-clock budget). Logs every row to `results_funnel.jsonl`. |
+| [`../eda_rl/gen2/search_space_funnel.yaml`](../eda_rl/gen2/search_space_funnel.yaml) | The evidence-reduced tinymac space: `mac_lanes` {1,2,4,8,16,32} × `accumulator_width` {16,24,32} × `clock_period_ns` continuous [3.0, 8.0] (0.5 ns grid for offline tabling) × `abc_recipe` {orfs_speed, orfs_area, plain} = **594 grid configs**; utilization/density pinned at 40 / 0.60 via tinymac's YAML `knobs.fix` block (see "Per-design knob control"). (For other designs the space is built dynamically from the YAML spec + KnobRegistry.) |
+| [`../eda_rl/common/recipe.py`](../eda_rl/common/recipe.py) | The ABC recipe axis. `orfs_speed`/`orfs_area` map to ORFS's own abc scripts at *both* the F2 proxy and the F3 full flow (previously the proxy synthesized with a recipe the full flow never used). `plain` (bare `abc -liberty`) is proxy-only — ORFS hard-codes its script selection — and F3 records the effective recipe when a plain config is committed. |
+| [`../eda_rl/gen2/surrogate.py`](../eda_rl/gen2/surrogate.py) | Per-metric quantile-GBT surrogate: `fit(rows)`, `predict(x, obs) → (μ, σ)` for area/period/power, plus `predict_reward_stats` for the composite reward. Multi-fidelity: F2 observables (proxy area, proxy WNS, FF/cell counts) enter as conditioning features with missing-indicators, so one model serves both "config only" and "config + proxy results" queries. `fit_surrogate.py` mines the existing ORFS report tree and validates by cross-validation. |
+| [`../eda_rl/gen2/promotion_agent.py`](../eda_rl/gen2/promotion_agent.py) | The promotion policies: `PromotionAgent` (LinUCB contextual bandit over the 22-dim state — the doc-07 analysis shows a bandit is the right starting point, with PPO as a later upgrade *only if* lookahead measurably beats myopia), `FixedGateAgent` (the first-generation hard gates expressed as a policy — the baseline to beat), `RandomPromotionAgent`. |
+| [`../eda_rl/gen2/candidates.py`](../eda_rl/gen2/candidates.py) | `CandidateGenerator` — Optuna-backed next-config proposer (see "Candidate generation" section below). |
+| [`../eda_rl/gen2/build_table.py`](../eda_rl/gen2/build_table.py) | Resumable offline table builder over the reduced space at F0–F2. Dedupes what physics allows (cycles depend only on lanes → one sim per lane count; the proxy is keyed by lanes/acc_w/clk/recipe). `--subset strategic` = 84-config corner+axis sweep (~1.2 h); the full 594-config table is ~7 h. Accepts `--design` and `--max-tier` for non-tinymac designs. |
+| [`../eda_rl/gen2/benchmark_funnel.py`](../eda_rl/gen2/benchmark_funnel.py) | The benchmark that adjudicates whether learned promotion beats fixed gates: random vs fixed-gate vs LinUCB driving the *real* `FunnelEnv` in table mode, ≥20 seeds, metric = simulated wall-clock to 95% of the table optimum (median and p95). Accepts `--candidates shuffled|tpe|surrogate_ucb`. |
+| [`../eda_rl/gen2/run_funnel_optimizer.py`](../eda_rl/gen2/run_funnel_optimizer.py) | Live campaign driver — see "How to run" below. Exposed as `eda-rl optimize`. |
+| [`../eda_rl/common/constants.py`](../eda_rl/common/constants.py) | Single source of truth for measured constants — SW baseline (11,196,638 cycles/inference), the per-lane cycle table, the `behavioral_cycles(lanes)` fit, speedup normalization caps. Everything that previously duplicated these numbers imports them from here. |
+| [`../eda_rl/common/designs.py`](../eda_rl/common/designs.py) | `DesignSpec` dataclass + `DesignSpec.load(name_or_path)` — see "Bring your own design" below. |
+| [`../eda_rl/common/knobs.py`](../eda_rl/common/knobs.py) | `KnobRegistry` with 24 ORFS variables in 4 tiers — see "The knob tiers" below. |
 
 ---
 
 ## Bring your own design
 
-`DesignSpec` (`optimizer/common/designs.py`) decouples the optimizer from
+`DesignSpec` (`eda_rl/common/designs.py`) decouples the optimizer from
 tinymac. A design = an RTL file list, a top module name, a clock port, optional
 RTL chparam axes, and per-platform clock ranges. Everything else (knob space,
 candidate generation, FunnelEnv, physical_runner) derives from the spec at
 runtime.
 
-A new design takes roughly 10 lines of YAML in `optimizer/designs/<name>.yaml`:
+A new design takes roughly 10 lines of YAML in `eda_rl/designs/<name>.yaml`:
 
 ```yaml
 name: my_design
@@ -155,7 +155,7 @@ functional_eval:
   kind: none                       # use tinyvad_sim for the TinyVAD evaluator
 ```
 
-`DesignSpec.load("my_design")` resolves the YAML from `optimizer/designs/`,
+`DesignSpec.load("my_design")` resolves the YAML from `eda_rl/designs/`,
 resolves RTL paths (relative to repo root), computes an 8-hex RTL content hash
 for variant-name invalidation, and generates SDC text with the correct platform
 time unit.
@@ -181,7 +181,7 @@ remain zero).
 
 ## The knob tiers
 
-`KnobRegistry` (`optimizer/common/knobs.py`) holds 24 ORFS variables in four
+`KnobRegistry` (`eda_rl/common/knobs.py`) holds 24 ORFS variables in four
 importance tiers, each with a verified emit line, range, and evidence note.
 `--max-tier N` caps the search to tiers ≤ N everywhere (build_table,
 run_funnel_optimizer). Tier-4 knobs are suppressed automatically when
@@ -265,7 +265,7 @@ activate one more knob group and trigger the `MACRO_PLACEMENT_TCL` path in ORFS.
 
 ## Candidate generation (Optuna)
 
-`CandidateGenerator` (`optimizer/gen2/candidates.py`) sits above the FunnelEnv
+`CandidateGenerator` (`eda_rl/gen2/candidates.py`) sits above the FunnelEnv
 and proposes which config to evaluate next. It wraps an Optuna study and
 optionally consults the fitted surrogate for UCB acquisition.
 
@@ -317,50 +317,47 @@ The 45-config grid optimum is unchanged: `{lanes:4, acc:24, clk:5}` (reward 3.99
 ---
 
 ```bash
-# Build the offline table (resumable; rows append to optimizer/results_funnel.jsonl)
-python3 optimizer/build_table.py --subset strategic        # 84 configs, ~1.2 h
-python3 optimizer/build_table.py                           # full 594-config grid, ~7 h
-python3 optimizer/build_table.py --dry-run                 # show the plan + cost estimate
+# Build the offline table (resumable; rows append to eda_rl/results/gen2/results_funnel.jsonl)
+eda-rl build-table --subset strategic        # 84 configs, ~1.2 h
+eda-rl build-table                           # full 594-config grid, ~7 h
+eda-rl build-table --dry-run                 # show the plan + cost estimate
 
 # Table for a different design (gcd, tier-2 knob space):
-python3 optimizer/build_table.py --design gcd --max-tier 2
+eda-rl build-table --design gcd --max-tier 2
 
 # Fit / validate the surrogate on everything built so far
-python3 optimizer/fit_surrogate.py                         # prints per-metric CV correlation
-                                                           # writes optimizer/surrogate_n45.joblib
+python -m eda_rl.gen2.fit_surrogate           # prints per-metric CV correlation
+                                               # writes eda_rl/results/gen2/surrogate_n45.joblib
 
 # Benchmark promotion policies on the table simulator
-python3 optimizer/benchmark_funnel.py --seeds 20
-python3 optimizer/benchmark_funnel.py --selftest           # synthetic table, fast
-python3 optimizer/benchmark_funnel.py --candidates tpe     # use Optuna TPE candidate ordering
-python3 optimizer/benchmark_funnel.py --candidates surrogate_ucb   # surrogate UCB ordering
+eda-rl benchmark --seeds 20
+eda-rl benchmark --selftest                   # synthetic table, fast
+eda-rl benchmark --candidates tpe             # use Optuna TPE candidate ordering
+eda-rl benchmark --candidates surrogate_ucb   # surrogate UCB ordering
 
 # Live campaign (tinymac, default 4-axis tier-1 space):
-python3 optimizer/run_funnel_optimizer.py \
+eda-rl optimize \
     --design tinymac_accel --platform nangate45 \
     --budget-hours 4 --max-tier 1 --sampler tpe --promotion fixed
 
 # Live campaign (gcd, tier-2 knob space, Optuna TPE):
-python3 optimizer/run_funnel_optimizer.py \
+eda-rl optimize \
     --design gcd --platform nangate45 \
     --budget-hours 4 --max-tier 2 --sampler tpe --promotion fixed
 
 # Table-mode campaign (replay logged observations, no real ORFS):
-python3 optimizer/run_funnel_optimizer.py \
+eda-rl optimize \
     --design tinymac_accel --platform nangate45 \
     --budget-hours 4 --sampler surrogate_ucb --promotion linucb \
-    --table optimizer/results_funnel.jsonl
+    --table eda_rl/results/gen2/results_funnel.jsonl
 
 # Self-tests (no real tools needed)
-PHYSICAL_MOCK=1 python3 optimizer/funnel.py                # FunnelEnv self-test
-PHYSICAL_MOCK=1 python3 optimizer/build_table.py --subset strategic --limit 5
-PHYSICAL_MOCK=1 python3 optimizer/run_funnel_optimizer.py \
-    --design tinymac_accel --budget-hours 0.01 --sampler tpe --promotion fixed \
-    --table optimizer/results_funnel.jsonl
+PHYSICAL_MOCK=1 python -m eda_rl.gen2.funnel                # FunnelEnv self-test
+python -m eda_rl.gen2.promotion_agent
+python -m eda_rl.gen2.candidates
+python -m eda_rl.gen2.benchmark_funnel --selftest
+PHYSICAL_MOCK=1 python -m eda_rl.gen2.build_table --subset strategic --limit 5
 ```
-
-All `optimizer/run_funnel_optimizer.py` commands also work via the gen2 path:
-`python3 optimizer/gen2/run_funnel_optimizer.py`.
 
 Live mode is just `FunnelEnv(table=None)` — same env, real tools. Sustainable
 F3 throughput on the VM is ~8 serial full flows/hour (~14/h with 2 concurrent).
@@ -381,7 +378,7 @@ F3 throughput on the VM is ~8 serial full flows/hour (~14/h with 2 concurrent).
   area / 0.865 period / 0.95 power** (power is relative-only — ORFS power is
   activity-factor fiction, 99.8% combinational).
 - **Strategic table built**: 252 rows (84 configs × F0/F1/F2), zero errors,
-  72.6 min wall-clock, in `optimizer/results_funnel.jsonl`.
+  72.6 min wall-clock, in `eda_rl/results/gen2/results_funnel.jsonl`.
 - **Benchmark, honestly reported**: on a synthetic table (20 seeds), fixed gates
   reach 95%-of-optimum in median 0.59 h @ 90% success vs random 1.09 h @ 85%;
   **cold-start LinUCB loses (50% success)**. Same finding pattern as the
@@ -407,25 +404,26 @@ F3 throughput on the VM is ~8 serial full flows/hour (~14/h with 2 concurrent).
 
 ## Campaign output path
 
-Each run of `run_funnel_optimizer.py` appends one JSONL row per episode to:
+Each run of `eda-rl optimize` appends one JSONL row per episode to:
 
 ```
-optimizer/campaigns/<design>/<platform>/results_funnel_campaigns.jsonl
+eda_rl/campaigns/<design>/<platform>/results_funnel_campaigns.jsonl
 ```
 
-e.g. `optimizer/campaigns/tinymac_accel/nangate45/results_funnel_campaigns.jsonl`.
+e.g. `eda_rl/campaigns/tinymac_accel/nangate45/results_funnel_campaigns.jsonl`.
 The path is printed at the end of every campaign (`Results → ...`). Override with
 `--out /your/path.jsonl`. A per-campaign trace is also written alongside as
 `funnel_campaign_<seed>_<ts>.jsonl`.
 
 ---
 
-## Visualizing a campaign (`optimizer/viz/`)
+## Visualizing a campaign (`eda_rl/viz/`)
 
-Every `run_funnel_optimizer.py` campaign appends one JSONL row per episode
+Every `eda-rl optimize` campaign appends one JSONL row per episode
 (`config`, `fidelity`, `f3_reward`, `episode_reward`, `best_reward`, `spent_s`).
-`optimizer/viz/` turns those logs into graphs. Needs `optuna-dashboard`
-(`pip install optuna-dashboard`); plotly/pandas are already present.
+`eda_rl/viz/` turns those logs into graphs. The live dashboard needs
+`optuna-dashboard` (`pip install -e '.[dashboard]'`); plotly/pandas are already
+present.
 
 **Static HTML report** — reward-vs-each-parameter scatters (coloured by the
 fidelity the episode died at), optimization history vs episode and vs wall-clock,
@@ -434,17 +432,17 @@ slice / parallel-coordinate / contour:
 
 ```bash
 # auto-finds the most-recently-modified results_funnel_campaigns.jsonl under campaigns/
-python3 optimizer/viz/report.py
+eda-rl report
 
 # point at a specific log
-python3 optimizer/viz/report.py \
-    --log optimizer/campaigns/tinymac_accel/nangate45/results_funnel_campaigns.jsonl --open
+eda-rl report \
+    --log eda_rl/campaigns/tinymac_accel/nangate45/results_funnel_campaigns.jsonl --open
 
-python3 optimizer/viz/report.py --campaign all   # pool every campaign in the file
+eda-rl report --campaign all   # pool every campaign in the file
 ```
 
-Writes a single self-contained `optimizer/report_<campaign_id>.html` (Plotly via
-CDN, no server). `--campaign` takes a `campaign_id`, `latest`, or `all`.
+Writes a single self-contained `report_<campaign_id>.html` under `eda_rl/reports/`
+(Plotly via CDN, no server). `--campaign` takes a `campaign_id`, `latest`, or `all`.
 
 **Live Optuna dashboard** — reconstructs an Optuna study (direction=maximize,
 value = `f3_reward` if reached else the `episode_reward` penalty) into a
@@ -453,16 +451,16 @@ log and appends new episodes; the dashboard auto-refreshes, so you watch
 history / importances update as the optimizer runs:
 
 ```bash
-LOG=optimizer/campaigns/tinymac_accel/nangate45/results_funnel_campaigns.jsonl
+LOG=eda_rl/campaigns/tinymac_accel/nangate45/results_funnel_campaigns.jsonl
 
 # follow a live run (open http://127.0.0.1:8080/ in browser)
-python3 optimizer/viz/dashboard.py --live --log $LOG
+eda-rl dashboard --live --log $LOG
 
 # one-shot snapshot of the latest campaign across all designs
-python3 optimizer/viz/dashboard.py
+eda-rl dashboard
 
 # rebuild the JournalStorage file without launching the server
-python3 optimizer/viz/dashboard.py --no-serve --log $LOG
+eda-rl dashboard --no-serve --log $LOG
 ```
 
 Objective convention: killed/aborted episodes are kept (not dropped) so the
@@ -474,5 +472,5 @@ use, so the static report and the live dashboard never disagree.
 Items now closed (were listed as gaps in earlier versions of this doc):
 - **Optuna candidate generation** — built and validated (`gen2/candidates.py`,
   three samplers: tpe/surrogate_ucb/random, F3-only tell rule). See section above.
-- **Design-agnostic input** — built (`common/designs.py`, `optimizer/designs/`
+- **Design-agnostic input** — built (`eda_rl/common/designs.py`, `eda_rl/designs/`
   YAML registry, proven on gcd as a second real design).
