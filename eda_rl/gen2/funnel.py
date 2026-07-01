@@ -100,7 +100,6 @@ from eda_rl.common.constants import (
 )
 from eda_rl.gen1.cascade import _run_sim  # reuse the mock-aware Verilator wrapper
 from eda_rl.common.physical_runner import run_synth_sta, run_physical
-from eda_rl.common.cascade_reward import compute_cascade_reward
 from eda_rl.common.physical_reward import compute_physical_reward, compute_generic_reward
 
 # ── Module paths ─────────────────────────────────────────────────────────────
@@ -502,9 +501,12 @@ class FunnelEnv:
         self._design_arg = design   # raw arg; resolved in property below
         self.__design_spec: Any = None  # cache
 
-        # Load space
+        # Load space.  `gates` (search_space_funnel.yaml's `gates:` block,
+        # e.g. proxy.max_area_um2) is loaded but not currently enforced
+        # anywhere in FunnelEnv — discarded here rather than kept as a
+        # self._gates attribute that looks load-bearing but isn't read.
         self._sim_params, self._proxy_params, self._constraints, \
-            self._gates, self._reward_cfg = _load_space(self._space_yaml)
+            _gates, self._reward_cfg = _load_space(self._space_yaml)
 
         # Runtime state (set by reset())
         self._config: dict | None = None
