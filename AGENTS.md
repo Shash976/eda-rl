@@ -35,6 +35,81 @@ Fmax wall); PPO upgrade of the promotion policy *only if* the bandit measurably
 loses to lookahead. Honest result so far: **cold-start LinUCB does not beat fixed
 gates** on the synthetic table — learning must earn its keep.
 
+### Second audit round (2026-07-01, branch `fix/gen2-audit-findings`)
+
+A follow-up audit (scope: `eda_rl/` excluding `gen1/`) found a real security
+hole and three silent-corruption bugs that lived in code paths the first
+audit didn't reach (`run_funnel_optimizer.py`, `build_table.py`,
+`candidates.py`). All 18 findings were fixed as 18 atomic commits on
+`fix/gen2-audit-findings` (not yet merged — see that branch for review/PR).
+Treat these as invariants once merged:
+
+- **Design name/top are validated.** `DesignSpec.load()` now rejects any
+  `name`/`top` that isn't `[A-Za-z_][A-Za-z0-9_]*`. Before this, a malicious
+  design YAML could path-traverse (`Path.__truediv__` on an absolute-path
+  name discards the base dir) or break out of the single-quoted `bash -c`
+  strings in `physical_runner.py`, since both sinks build paths/shell
+  commands straight from the YAML-supplied name.
+- **`build_table.py` threads `design` through F0/F1/F2.** Previously
+  `_eval_f0`/`_eval_f1`/`_eval_f2` took no `design` param, so
+  `build-table --design gcd` silently synthesized TinyMAC RTL for every row
+  (`run_synth_sta(design=None)` defaults to tinymac_accel).
+  `build_table --subset strategic --limit 5` and building the design-authoritative
+  YAML `knobs:` block both depend on `design` reaching these evaluators now.
+- **`run_funnel_optimizer.py` routes table-miss episodes to the skip-memo,
+  not `_study.tell()`.** Previously a table-miss episode kept
+  `fidelity_reached == "F3"` (deepest fidelity *attempted*, not real), so
+  `CandidateGenerator.update()` told Optuna a phantom near-zero reward as if
+  it were a genuine F3 result. Mirrors the pattern `benchmark_funnel.py`
+  already had right (`fidelity="table_miss"`).
+- **`CandidateGenerator`'s `surrogate_ucb` sampler is reward-kind aware.**
+  `_rebuild_ucb_pool` now passes `reward_kind`/`refs` (derived the same way
+  `FunnelEnv._surrogate_reward_kind()` does) into
+  `Surrogate.predict_reward_stats()`. Before, every design — TinyVAD or not —
+  got scored with the TinyVAD reward formula and TinyMAC reference constants.
+- **Doomed placer configs are rejected before the ORFS timeout, not after.**
+  `run_physical()` now runs `validate_config()`'s ABORT-RISK/ERROR checks
+  before invoking `make`, returning `status: "config_abort"` immediately
+  instead of burning up to `ORFS_TIMEOUT` seconds on a build that was always
+  going to fail. F2 (`run_synth_sta`) is untouched — it never floorplans/places,
+  so placer-abort risk doesn't apply there.
+- **`compute_generic_reward` warns when called with empty `refs`.** The
+  self-normalizing bootstrap behavior (`FunnelEnv`'s "first F3 build anchors
+  the refs") is unchanged and does not warn; only *other* callers that pass
+  no refs at all now get a `UserWarning` instead of a silent constant reward.
+- **`PromotionAgent.save()`/`load()` round-trips a custom `actions` tuple.**
+  Was previously dropped on load and reconstructed from `_DEFAULT_ACTIONS`
+  regardless of what the saved agent actually used.
+- **`compute_physical_reward`'s `max_speedup` default matches
+  `constants.MAX_SPEEDUP_FULL` (1024), not a stale literal `576.0`.** They
+  only agreed before because `search_space_funnel.yaml` always supplies
+  `reward.max_speedup: 1024.0`; a custom space YAML without that key would
+  silently reintroduce a previously-fixed miscalibration.
+- **`funnel.py`'s constraint-skip logic is word-boundary, not substring.**
+  Guards against a future axis name that's a substring of another
+  constraint's variable name.
+- **Process-group cleanup on any `communicate()` failure**, not just
+  `TimeoutExpired` — `physical_runner.run_physical` now kills the ORFS
+  process group on any exception from `proc.communicate()`, not just a
+  timeout.
+- **Dead code removed:** `funnel.py`'s unused `compute_cascade_reward`
+  import and unenforced `self._gates` assignment (gates are loaded from YAML
+  but not applied — see the file's comment); `viz/comparison.py` (unreachable
+  via `cli.py`, TinyMAC-hardcoded, stale paths — deleted outright).
+- **`pyproject.toml`'s `[dashboard]` extra installs `optuna-dashboard`**, not
+  `streamlit` (the latter is gen1-only; `eda-rl dashboard` needs the former).
+- **`viz/report.py` HTML-escapes campaign-derived strings** (`abc_recipe`,
+  titles, section headings, etc.) before interpolating into HTML/Plotly
+  hovertext.
+- `docs/08_funnel_optimizer.md` now points at the real `eda_rl/...` module
+  paths and CLI subcommands instead of a fictional `optimizer/` package.
+- `.gitignore` covers `*_trial.jsonl` and `best_configs/` (ad hoc trial logs
+  / `eda-rl collect` output).
+- `validate.py`'s `eval()`-based constraint sandbox (`__builtins__: {}`) is
+  documented in-code as a known-insufficient sandbox — fine under this
+  repo's threat model (constraint expressions are author-controlled YAML,
+  not user input); revisit only if that assumption changes.
+
 ## Repo layout
 
 ```
