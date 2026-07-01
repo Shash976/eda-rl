@@ -240,14 +240,22 @@ def _write_row(out_path: Path, config: dict, fidelity: str, obs: dict,
 
 # ── F0: analytic (free) ───────────────────────────────────────────────────────
 
-def _eval_f0(config: dict) -> tuple[dict, str]:
+def _eval_f0(config: dict, design: "Any | None" = None) -> tuple[dict, str]:
     """Analytic evaluation: cycles from constants.py + accuracy gate.
 
     F0 obs keys: cycles, accuracy_flag, cycle_speedup
 
     Accepts both canonical (mac_lanes / accumulator_width) and legacy (lanes / acc_w)
     key names so this function works regardless of which grid-builder produced config.
+
+    design: when given and not TinyVAD (design.is_tinyvad() is False), the
+    TinyMAC-specific analytic cycle/accuracy model does not apply — mirrors
+    FunnelEnv._run_f0's generic-design branch (legality only, no phantom
+    cycle count).
     """
+    if design is not None and not design.is_tinyvad():
+        return {"cycles": 0.0, "accuracy_flag": 0.0, "cycle_speedup": 0.0}, "ok"
+
     lanes  = int(config.get("mac_lanes") or config.get("lanes") or 0)
     acc_w  = int(config.get("accumulator_width") or config.get("acc_w") or 0)
 
@@ -278,7 +286,7 @@ def _eval_f0(config: dict) -> tuple[dict, str]:
 _F1_CACHE: dict[int, tuple[dict, str]] = {}
 
 
-def _eval_f1(config: dict) -> tuple[dict, str]:
+def _eval_f1(config: dict, design: "Any | None" = None) -> tuple[dict, str]:
     """Behavioral sim.  Caches per-lanes (cycles invariant to acc_w/clk/recipe).
 
     DEDUP NOTE: F1 cycles = n_outputs × (ceil(K/LANES) + 2), formula from
@@ -286,7 +294,13 @@ def _eval_f1(config: dict) -> tuple[dict, str]:
     the accuracy of the output values, not the cycle count.  So we run the sim
     once per lanes value and reuse.  The accuracy obs comes from the F0 analytic
     model (same gate logic, already consistent with cascade.py _run_sim mock).
+
+    design: F1 (Verilator behavioral sim) is TinyVAD-specific — mirrors
+    FunnelEnv._f1_enabled(), which only runs F1 for design.is_tinyvad().
     """
+    if design is not None and not design.is_tinyvad():
+        return {"note": "F1 skipped: design has no TinyVAD functional evaluator"}, "skipped"
+
     lanes = int(config.get("mac_lanes") or config.get("lanes") or 0)
     acc_w = int(config.get("accumulator_width") or config.get("acc_w") or 0)
 
@@ -336,20 +350,23 @@ def _eval_f1(config: dict) -> tuple[dict, str]:
 _F2_CACHE: dict[tuple, tuple[dict, str]] = {}
 
 
-def _eval_f2(config: dict, platform: str) -> tuple[dict, str]:
-    """Run synth+STA proxy (run_synth_sta), importing abc_recipe defensively.
+def _eval_f2(config: dict, platform: str, design: "Any | None" = None) -> tuple[dict, str]:
+    """Run synth+STA proxy (run_synth_sta), importing abc_recipe/design defensively.
 
-    F2 cache key = (lanes, acc_w, clk, recipe) — util/density are fixed.
+    F2 cache key = (lanes, acc_w, clk, recipe, design name) — util/density are fixed.
 
-    The abc_recipe parameter is passed to run_synth_sta only if the function
-    signature accepts it (concurrent Stage-B recipe.py agent may add it).
+    The abc_recipe/design parameters are passed to run_synth_sta only if the
+    function signature accepts them. design=None means "use tinymac_accel
+    behaviour" (run_synth_sta's own default) — passing it explicitly for
+    non-tinymac designs is what makes `build-table --design <x>` actually
+    synthesize <x>'s RTL instead of silently falling back to tinymac_accel.
     """
     lanes  = int(config.get("mac_lanes") or config.get("lanes") or 0)
     acc_w  = int(config.get("accumulator_width") or config.get("acc_w") or 0)
     clk    = float(config.get("clock_period_ns") or config.get("clk") or 5.0)
     recipe = str(config.get("abc_recipe") or config.get("recipe") or "plain")
 
-    cache_key = (lanes, acc_w, round(clk, 4), recipe, platform)
+    cache_key = (lanes, acc_w, round(clk, 4), recipe, platform, getattr(design, "name", None))
     if cache_key in _F2_CACHE:
         obs, status = _F2_CACHE[cache_key]
         obs = dict(obs)
@@ -361,18 +378,24 @@ def _eval_f2(config: dict, platform: str) -> tuple[dict, str]:
     except ImportError as exc:
         return {"error": str(exc)}, "import_error"
 
-    # Defensive: pass abc_recipe only if run_synth_sta accepts it
+    # Defensive: pass abc_recipe/design only if run_synth_sta accepts them
+    # (mirrors funnel.py's _run_f2 signature-inspection pattern).
     try:
         sig = inspect.signature(run_synth_sta)
         accepts_recipe = "abc_recipe" in sig.parameters
+        accepts_design = "design" in sig.parameters
     except (ValueError, TypeError):
         accepts_recipe = False
+        accepts_design = False
+
+    kwargs: dict = {}
+    if accepts_recipe:
+        kwargs["abc_recipe"] = recipe
+    if accepts_design and design is not None:
+        kwargs["design"] = design
 
     try:
-        if accepts_recipe:
-            raw = run_synth_sta(lanes, acc_w, clk, platform, abc_recipe=recipe)
-        else:
-            raw = run_synth_sta(lanes, acc_w, clk, platform)
+        raw = run_synth_sta(lanes, acc_w, clk, platform, **kwargs)
     except Exception as exc:  # noqa: BLE001
         return {"error": str(exc)}, "error"
 
@@ -461,11 +484,18 @@ def run_table_builder(
     """
     space = _load_space(space_path)
 
+    # Resolved DesignSpec, threaded into _eval_f0/_eval_f1/_eval_f2 so F0-F2
+    # actually evaluate this design's RTL instead of silently falling back to
+    # tinymac_accel (run_synth_sta's design=None default).
+    design_spec: "Any | None" = None
+
     # When --design is provided, derive the space entirely from KnobRegistry.space()
     # so a design with no RTL params (e.g. gcd) gets no phantom lanes/acc_w axes.
     if design is not None:
         try:
+            from eda_rl.common.designs import DesignSpec
             from eda_rl.common.knobs import KnobRegistry
+            design_spec = DesignSpec.load(design)
             reg = KnobRegistry.load()
             # reg.space() accepts str and normalizes via DesignSpec.load() internally.
             knob_space = reg.space(max_tier=max_tier, design=design, platform=platform)
@@ -609,18 +639,18 @@ def run_table_builder(
 
         t0 = time.time()
         if fid == "F0":
-            obs, status = _eval_f0(cfg)
+            obs, status = _eval_f0(cfg, design=design_spec)
         elif fid == "F1":
-            obs, status = _eval_f1(cfg)
+            obs, status = _eval_f1(cfg, design=design_spec)
         elif fid == "F2":
-            obs, status = _eval_f2(cfg, platform)
+            obs, status = _eval_f2(cfg, platform, design=design_spec)
         else:
             obs, status = {}, "skipped"
         elapsed = time.time() - t0
 
         _write_row(out_path, config_doc, fid, obs, elapsed, platform, status)
         n_done += 1
-        if status not in ("ok", "mock", "mock-proxy", "fallback"):
+        if status not in ("ok", "mock", "mock-proxy", "fallback", "skipped"):
             n_errors += 1
 
         if n_done % 10 == 0 or n_done == len(pending):
