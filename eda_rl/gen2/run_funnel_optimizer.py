@@ -359,7 +359,11 @@ def run_campaign(
                 best_reward = f3_reward
                 best_config = dict(config)
         else:
-            gen.update(config, episode_reward_acc, fidelity=fidelity_reached)
+            # table_miss carries no real terminal data — route it through the
+            # kill-memo (not fidelity="F3", which CandidateGenerator.update()
+            # treats as a genuine observation and tells to the Optuna study).
+            not_f3_fidelity = "table_miss" if episode_table_miss else fidelity_reached
+            gen.update(config, episode_reward_acc, fidelity=not_f3_fidelity)
 
         # Update incumbent in env (for state slot [16])
         # env tracks its own incumbent; we track ours separately for logging
