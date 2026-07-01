@@ -28,7 +28,7 @@ from eda_rl.gen1.reward import SW_BASELINE_LATENCY_NS, acc_overflows
 # Measured 2026-06-10 after V13 saturation-order fix.
 # Old values: _CYCLE_OVERHEAD=28000, _CYCLE_MAC_WORK=242000 (synthetic fit).
 # New values: fit to measured AVG_CYCLES over lanes {1,2,4,8,16,32}.
-from eda_rl.common.constants import _CYCLE_OVERHEAD, _CYCLE_MAC_WORK
+from eda_rl.common.constants import _CYCLE_OVERHEAD, _CYCLE_MAC_WORK, MAX_SPEEDUP_FULL
 
 # Real nangate45 LANES=4 ACC_W=24 anchors (the first full GDS): area/power terms
 # are normalised to ~1.0 here so the YAML weights carry over from the proxy reward.
@@ -164,7 +164,11 @@ def compute_physical_reward(
     w_area   = w.get("w_area",             -0.4)
     w_pwr    = w.get("w_power",            -0.4)
     w_tv     = w.get("w_timing_violation", -3.0)
-    max_spd  = w.get("max_speedup",        576.0)
+    # MAX_SPEEDUP_FULL (1024), not the older MAX_SPEEDUP_GRID (576) — this
+    # default is for the full lanes-up-to-32 space and must match
+    # surrogate.py's UCB proxy (surrogate.py:485) or the two miscalibrate
+    # against each other whenever a space_yaml omits the reward: block.
+    max_spd  = w.get("max_speedup",        float(MAX_SPEEDUP_FULL))
     min_spd  = w.get("min_useful_speedup",  10.0)
     perf_pen = w.get("perf_floor_penalty",  -8.0)
 
