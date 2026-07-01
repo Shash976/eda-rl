@@ -153,8 +153,7 @@ PHYSICAL_MOCK=1 python -m eda_rl.gen2.build_table --subset strategic --limit 5
 
 ## Conventions
 
-- **Branch before committing on `main`.** End commit messages with the
-  `Co-Authored-By` / `Claude-Session` trailers per the harness.
+- **Branch before committing on `main`.** Instead of commiting with co-author, just add a note at the bottom that says "Done by an AI agent"
 - **Don't commit run artifacts.** Per-fidelity traces (`funnel_*.jsonl`) are
   gitignored; only the small `results_funnel_campaigns.jsonl` example logs under
   `campaigns/` are committed (kept for demos).
