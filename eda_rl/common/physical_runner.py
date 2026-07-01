@@ -699,6 +699,17 @@ def run_physical(lanes: int, acc_w: int, clk_ns: float, platform: str = "nangate
                     "tns_ns": None, "setup_viol": None, "power_mw": None,
                     "fmax_mhz": None, "period_min_ns": None,
                     "timing_met": None, "gds": None, "report": str(log_path)}
+        except BaseException:
+            # Any other failure during communicate() (decode error, OSError,
+            # KeyboardInterrupt, ...) — start_new_session=True detaches the
+            # child from our process group, so nothing else will reap the
+            # yosys/openroad grandchildren unless we kill them here too.
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            proc.wait()
+            raise
 
         # Persist the flow output so a failure is debuggable.
         (RUN_DIR / f"opt_{var}.log").write_text(
