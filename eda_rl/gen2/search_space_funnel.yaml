@@ -89,9 +89,12 @@ constraints:
   - "abc_recipe in ['orfs_speed', 'orfs_area', 'plain']"
 
 # ── Funnel gate thresholds ────────────────────────────────────────────────────
-# Used by cascade.evaluate when called via FunnelEnv live mode.
-# FunnelEnv itself does NOT hard-gate on accuracy (V13 note: acc_w=16 passes as
-# observation, agent decides whether to kill or promote).
+# NOTE: loaded by FunnelEnv._load_space() but not currently enforced anywhere —
+# these are documentation of intended thresholds, not an active gate. The
+# promotion policy (LinUCB / FixedGateAgent) decides kill/promote from the raw
+# observations instead; FunnelEnv itself does NOT hard-gate on accuracy or area
+# (V13 note: acc_w=16 passes as observation, agent decides whether to kill or
+# promote).
 gates:
   sim:
     min_accuracy: 0.0          # no hard accuracy kill — FunnelEnv carries acc as obs

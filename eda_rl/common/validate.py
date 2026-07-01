@@ -37,6 +37,16 @@ def _constraint_error(config: dict, constraints: list[str]) -> str:
     # Restricted eval: expose ONLY the config values, no builtins. Constraint
     # expressions are author-controlled (from the search-space YAML), not user
     # input, but we still sandbox to fail loudly on anything unexpected.
+    #
+    # KNOWN LIMITATION: clearing __builtins__ is not a real Python sandbox —
+    # attribute-chain escapes (e.g. ().__class__.__base__.__subclasses__())
+    # can still reach arbitrary objects and execute code. This is acceptable
+    # only under the threat model above (constraints come from a trusted YAML
+    # author, e.g. search_space_funnel.yaml's `constraints:` list). If
+    # constraint expressions are ever sourced from a less-trusted place (a
+    # shared/imported design bundle, agent-generated search spaces, etc.),
+    # this eval is a real code-execution path and needs a proper restricted
+    # evaluator (e.g. an AST whitelist), not just an empty __builtins__.
     safe_globals = {"__builtins__": {}}
     for expr in constraints or []:
         try:

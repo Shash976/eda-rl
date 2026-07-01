@@ -22,7 +22,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dashboard = ["streamlit"]
+dashboard = ["optuna-dashboard"]
 
 [project.scripts]
 eda-rl = "eda_rl.cli:main"

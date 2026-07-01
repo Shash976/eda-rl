@@ -241,6 +241,10 @@ def run_campaign(
     )
 
     # ── build agents ───────────────────────────────────────────────────────────
+    # surrogate_ucb must rank candidates with the same reward formula
+    # FunnelEnv._terminal_reward will actually use for this design (audit: was
+    # unconditionally "tinyvad", uncalibrated for non-TinyVAD designs like gcd/aes).
+    _ucb_kind, _ = env._surrogate_reward_kind()
     gen = CandidateGenerator(
         space=space,
         sampler=sampler,
@@ -248,6 +252,10 @@ def run_campaign(
         seed=seed,
         kappa=1.0,
         grid_snap=(table is not None),   # snap to table grid in table mode
+        reward_kind=_ucb_kind,
+        # refs is a live getter: FunnelEnv auto-anchors generic-design refs
+        # from the first F3 build, so a frozen dict here would go stale.
+        refs=(lambda: env._surrogate_reward_kind()[1]) if _ucb_kind == "generic" else None,
     )
     promo = _make_promotion_agent(promotion, seed=seed)
 
@@ -359,7 +367,11 @@ def run_campaign(
                 best_reward = f3_reward
                 best_config = dict(config)
         else:
-            gen.update(config, episode_reward_acc, fidelity=fidelity_reached)
+            # table_miss carries no real terminal data — route it through the
+            # kill-memo (not fidelity="F3", which CandidateGenerator.update()
+            # treats as a genuine observation and tells to the Optuna study).
+            not_f3_fidelity = "table_miss" if episode_table_miss else fidelity_reached
+            gen.update(config, episode_reward_acc, fidelity=not_f3_fidelity)
 
         # Update incumbent in env (for state slot [16])
         # env tracks its own incumbent; we track ours separately for logging

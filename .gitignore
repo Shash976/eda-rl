@@ -24,3 +24,7 @@ reports/
 # ─── Raw per-run campaign logs dumped at root (curated copies live in campaigns/)
 funnel_campaign_*.jsonl
 *_run[0-9]*.jsonl
+*_trial.jsonl
+
+# ─── Generated output of `eda-rl collect` (GDS + comparison page) ──────────────
+best_configs/

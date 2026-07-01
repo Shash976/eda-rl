@@ -19,6 +19,7 @@ Produces one HTML file (Plotly CDN, no server) with:
 from __future__ import annotations
 
 import argparse
+import html
 import sys
 import webbrowser
 from pathlib import Path
@@ -252,7 +253,7 @@ def build_pareto_figure(rows: list[dict]) -> tuple[str, object]:
         hover = [
             f"L{r['config'].get('mac_lanes')}_A{r['config'].get('accumulator_width')}<br>"
             f"clk={r['config'].get('clock_period_ns', 0):.2f} ns<br>"
-            f"recipe={r['config'].get('abc_recipe')}<br>"
+            f"recipe={html.escape(str(r['config'].get('abc_recipe')))}<br>"
             f"area={r['obs']['area_um2']:.0f} µm²<br>"
             f"fmax={r['obs']['fmax_mhz']:.0f} MHz<br>"
             f"wns={r['obs'].get('wns_ns', 0):.3f} ns<br>"
@@ -330,7 +331,8 @@ def build_iteration_figure(rows: list[dict]) -> tuple[str, object]:
     hover = [
         f"Run #{i}<br>"
         f"L{r['config'].get('mac_lanes')}_A{r['config'].get('accumulator_width')}<br>"
-        f"clk={r['config'].get('clock_period_ns', 0):.2f} ns  {r['config'].get('abc_recipe')}<br>"
+        f"clk={r['config'].get('clock_period_ns', 0):.2f} ns  "
+        f"{html.escape(str(r['config'].get('abc_recipe')))}<br>"
         f"fmax={r['obs']['fmax_mhz']:.0f} MHz  area={r['obs']['area_um2']:.0f} µm²"
         for i, r in zip(run_nums, f3)
     ]
@@ -449,7 +451,7 @@ def build_comparison_table(rows: list[dict]) -> tuple[str, object]:
         col_cells.append(f"{_nc:,.0f}" if _nc is not None else "—")
         col_fmax.append(f"{fmax:.0f}")
         col_wns.append(f"{obs.get('wns_ns', 0):.3f}")
-        col_recipe.append(obs.get("effective_abc_recipe") or cfg.get("abc_recipe", ""))
+        col_recipe.append(html.escape(str(obs.get("effective_abc_recipe") or cfg.get("abc_recipe", ""))))
         col_dfmax.append(_delta(fmax, b["fmax_mhz"]))
         col_darea.append(_delta(area, b["area_um2"], higher_better=False))
         row_colors.append("#d1fae5" if fmax > b["fmax_mhz"] else "#fef9c3")
@@ -763,21 +765,28 @@ def write_html(figs, out_path: Path, title: str, subtitle: str = ""):
       - label = "full-..."           → card spans the full grid width
       - otherwise                    → standard half-width card with Plotly figure
     """
+    # title/subtitle/section headings are not meant to carry raw HTML (unlike
+    # "--html:" blocks below, whose contract is exactly that) — escape them so
+    # a campaign log with attacker-influenced strings (e.g. design/campaign_id
+    # derived from the --log path, or a future free-text config axis) can't
+    # inject markup into the report shell.
+    title_safe = html.escape(title)
+    subtitle_safe = html.escape(subtitle)
     parts = [
         "<!doctype html><html><head>",
         "<meta charset='utf-8'>",
-        f"<title>{title}</title>",
+        f"<title>{title_safe}</title>",
         f"<style>{_CSS}</style>",
         "</head><body>",
-        f"<header><h1>{title}</h1>",
-        (f"<p class='subtitle'>{subtitle}</p>" if subtitle else ""),
+        f"<header><h1>{title_safe}</h1>",
+        (f"<p class='subtitle'>{subtitle_safe}</p>" if subtitle_safe else ""),
         "</header>",
         "<div class='grid'>",
     ]
     plotlyjs_included = False
     for label, content in figs:
         if label.startswith("section:"):
-            heading = label[len("section:"):]
+            heading = html.escape(label[len("section:"):])
             parts.append(f"<div class='section-header'>{heading}</div>")
             continue
         if label.startswith("--html:"):
