@@ -334,6 +334,20 @@ def _parse_metrics(work: Path, platform: str, variant: str, clk_ns: float,
     return out
 
 
+def _abort_risk_errors(knob_values: dict) -> list[str]:
+    """Subset of knobs.validate_config() findings severe enough to abort a
+    build before spending ORFS_TIMEOUT on a run the placer is known to reject.
+
+    Only "ABORT RISK"/"ERROR" entries gate; plain "WARNING" entries are left
+    to the existing print-only path in _config_mk (informational, not fatal).
+    """
+    try:
+        from eda_rl.common.knobs import validate_config as _vc
+    except ImportError:
+        return []
+    return [w for w in _vc(knob_values) if w.startswith(("ABORT RISK", "ERROR"))]
+
+
 # ── ORFS config generation (mirrors sweep.sh) ─────────────────────────────────
 
 def _config_mk(platform: str, variant: str, lanes: int, acc_w: int,
@@ -635,6 +649,25 @@ def run_physical(lanes: int, acc_w: int, clk_ns: float, platform: str = "nangate
 
     flow_status = "ok"
     if not gds.exists():
+        # Known-doomed placer configs (e.g. CORE_UTILIZATION>60 + large
+        # CELL_PAD) abort deep into the flow after burning most of
+        # ORFS_TIMEOUT; catch them up front instead (validate_config's
+        # ABORT RISK/ERROR findings — audit finding #5).
+        merged_knobs = {"CORE_UTILIZATION": util, "PLACE_DENSITY": density,
+                        "clock_period_ns": clk_ns, **(knob_values or {})}
+        abort_errs = _abort_risk_errors(merged_knobs)
+        if abort_errs:
+            import sys as _sys
+            for e in abort_errs:
+                print(f"[physical_runner] config_abort: {e}", file=_sys.stderr)
+            log_path = RUN_DIR / f"opt_{var}.log"
+            log_path.write_text("[config_abort]\n" + "\n".join(abort_errs) + "\n")
+            return {**base, "status": "config_abort",
+                    "area_um2": None, "util_pct": None, "wns_ns": None,
+                    "tns_ns": None, "setup_viol": None, "power_mw": None,
+                    "fmax_mhz": None, "period_min_ns": None,
+                    "timing_met": None, "gds": None, "report": str(log_path)}
+
         make_cmd = (
             f"source '{env_sh}' && "
             f"make --file='{ORFS_DIR}/flow/Makefile' "
@@ -666,6 +699,17 @@ def run_physical(lanes: int, acc_w: int, clk_ns: float, platform: str = "nangate
                     "tns_ns": None, "setup_viol": None, "power_mw": None,
                     "fmax_mhz": None, "period_min_ns": None,
                     "timing_met": None, "gds": None, "report": str(log_path)}
+        except BaseException:
+            # Any other failure during communicate() (decode error, OSError,
+            # KeyboardInterrupt, ...) — start_new_session=True detaches the
+            # child from our process group, so nothing else will reap the
+            # yosys/openroad grandchildren unless we kill them here too.
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            proc.wait()
+            raise
 
         # Persist the flow output so a failure is debuggable.
         (RUN_DIR / f"opt_{var}.log").write_text(

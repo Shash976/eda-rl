@@ -198,6 +198,11 @@ class PromotionAgent:
         arrays["alpha"] = np.array(self.alpha)
         arrays["lam"] = np.array(self.lam)
         arrays["n_updates"] = np.array(self._n_updates)
+        # Persist the action tuple itself — without this, load() always
+        # reconstructs with _DEFAULT_ACTIONS regardless of what actions this
+        # agent was actually trained with, silently mis-keying the A_*/b_*
+        # arrays for any non-default actions tuple.
+        arrays["actions"] = np.array(self.actions)
         np.savez(str(path), **arrays)
 
     @classmethod
@@ -207,7 +212,11 @@ class PromotionAgent:
         dim = int(data["dim"])
         alpha = float(data["alpha"])
         lam = float(data["lam"])
-        agent = cls(dim=dim, alpha=alpha, seed=seed, lam=lam)
+        # Older .npz files saved before this fix have no "actions" key —
+        # fall back to the default tuple for those (matches their save()-time
+        # behaviour, since only the default tuple was ever used pre-fix).
+        actions = tuple(data["actions"].tolist()) if "actions" in data else _DEFAULT_ACTIONS
+        agent = cls(dim=dim, alpha=alpha, seed=seed, actions=actions, lam=lam)
         for i, action in enumerate(agent.actions):
             key = action.replace("-", "_")
             agent._A[i] = data[f"A_{key}"]

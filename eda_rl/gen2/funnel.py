@@ -54,6 +54,7 @@ import inspect
 import json
 import math
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -99,7 +100,6 @@ from eda_rl.common.constants import (
 )
 from eda_rl.gen1.cascade import _run_sim  # reuse the mock-aware Verilator wrapper
 from eda_rl.common.physical_runner import run_synth_sta, run_physical
-from eda_rl.common.cascade_reward import compute_cascade_reward
 from eda_rl.common.physical_reward import compute_physical_reward, compute_generic_reward
 
 # ── Module paths ─────────────────────────────────────────────────────────────
@@ -281,7 +281,12 @@ def _validate_funnel(config: dict, sim: dict, proxy: dict,
             continue
         # Constraint failed.  If active_space redefines an axis this constraint
         # references, treat it as a foreign-design bound and skip; else reject.
-        if active_axes and any(aname in expr for aname in active_axes):
+        # Word-boundary match (not plain substring) so an axis name that
+        # happens to be a substring of an unrelated identifier in expr can't
+        # cause a genuinely-failing constraint to be silently skipped.
+        if active_axes and any(
+            re.search(rf"\b{re.escape(aname)}\b", expr) for aname in active_axes
+        ):
             continue
         return False, f"constraint failed: {expr}"
     return True, ""
@@ -496,9 +501,12 @@ class FunnelEnv:
         self._design_arg = design   # raw arg; resolved in property below
         self.__design_spec: Any = None  # cache
 
-        # Load space
+        # Load space.  `gates` (search_space_funnel.yaml's `gates:` block,
+        # e.g. proxy.max_area_um2) is loaded but not currently enforced
+        # anywhere in FunnelEnv — discarded here rather than kept as a
+        # self._gates attribute that looks load-bearing but isn't read.
         self._sim_params, self._proxy_params, self._constraints, \
-            self._gates, self._reward_cfg = _load_space(self._space_yaml)
+            _gates, self._reward_cfg = _load_space(self._space_yaml)
 
         # Runtime state (set by reset())
         self._config: dict | None = None

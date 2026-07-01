@@ -44,6 +44,7 @@ Design YAML spec format (see optimizer/designs/tinymac_accel.yaml for full examp
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -52,6 +53,11 @@ from typing import Any
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 # Designs YAML directory
 _DESIGNS_DIR = Path(__file__).resolve().parent.parent / "designs"
+
+# name/top become path components and get embedded in shell strings downstream
+# (physical_runner.py _stage_inputs/run_physical/run_elaborate/run_synth_sta),
+# so they must be safe plain identifiers — no slashes, quotes, or shell metachars.
+_SAFE_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 # SDC template — generic; physical_runner.py applies PLATFORM_TIME_UNIT conversion
 # before writing so clock_value_native is always in the platform's native unit.
@@ -147,6 +153,17 @@ class DesignSpec:
             if required not in raw:
                 raise ValueError(
                     f"DesignSpec.load: required field '{required}' missing in {yaml_path}"
+                )
+
+        # name/top flow into filesystem paths and shell command strings in
+        # physical_runner.py, so reject anything that isn't a plain identifier
+        # (blocks path traversal via name and shell injection via quotes/metachars).
+        for field_name in ("name", "top"):
+            value = str(raw[field_name])
+            if not _SAFE_IDENT_RE.fullmatch(value):
+                raise ValueError(
+                    f"DesignSpec.load: '{field_name}' must match "
+                    f"{_SAFE_IDENT_RE.pattern!r} (got {value!r} in {yaml_path})"
                 )
 
         # Resolve RTL file paths: relative paths anchor to the YAML's own directory,

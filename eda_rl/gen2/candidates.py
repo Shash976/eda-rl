@@ -156,6 +156,15 @@ class CandidateGenerator:
     seed       : RNG seed (ensures deterministic campaigns).
     kappa      : UCB exploration coefficient μ + κ·σ (surrogate_ucb only).
     grid_snap  : if True, continuous axes are snapped to table-grid resolution.
+    reward_kind: "tinyvad" (default) or "generic" — must match the design's
+                 actual FunnelEnv._terminal_reward branch (design.is_tinyvad()),
+                 else surrogate_ucb ranks candidates with the wrong reward
+                 formula (TinyMAC anchors on a non-TinyVAD design).
+    refs       : PPA anchors for reward_kind="generic" — either a dict
+                 ({area_ref_um2, fmax_ref_mhz, power_ref_mw}) or a zero-arg
+                 callable returning one, so callers whose anchors update over
+                 a campaign (e.g. FunnelEnv's auto-anchor-from-first-F3-build)
+                 can pass a live getter instead of a frozen snapshot.
     """
 
     def __init__(
@@ -166,6 +175,8 @@ class CandidateGenerator:
         seed: int = 0,
         kappa: float = 1.0,
         grid_snap: bool = True,
+        reward_kind: str = "tinyvad",
+        refs: "dict | Any | None" = None,
     ) -> None:
         if sampler not in ("tpe", "surrogate_ucb", "random"):
             raise ValueError(
@@ -177,6 +188,8 @@ class CandidateGenerator:
         self.seed = seed
         self.kappa = float(kappa)
         self.grid_snap = grid_snap
+        self.reward_kind = reward_kind
+        self.refs = refs
 
         # Kill-memo: set of config keys that were killed or failed before F3.
         # These are skipped in suggest() so TPE doesn't repeatedly re-propose
@@ -411,6 +424,10 @@ class CandidateGenerator:
         """Rebuild and sort the UCB candidate pool."""
         pool = self._build_raw_pool()
 
+        # refs may be a live getter (e.g. FunnelEnv's auto-anchor-from-first-F3
+        # dict, which changes over the campaign) rather than a frozen snapshot.
+        refs = self.refs() if callable(self.refs) else (self.refs or {})
+
         # Score each candidate: mu + kappa * sigma
         scored: list[tuple[float, dict]] = []
         for cfg in pool:
@@ -418,7 +435,8 @@ class CandidateGenerator:
             if key in self._killed:
                 continue
             try:
-                mu, sigma = self.surrogate.predict_reward_stats(cfg)
+                mu, sigma = self.surrogate.predict_reward_stats(
+                    cfg, reward_kind=self.reward_kind, refs=refs)
                 ucb_score = mu + self.kappa * sigma
             except Exception:   # noqa: BLE001
                 ucb_score = 0.0
