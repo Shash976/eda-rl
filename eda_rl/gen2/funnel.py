@@ -54,6 +54,7 @@ import inspect
 import json
 import math
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -281,7 +282,12 @@ def _validate_funnel(config: dict, sim: dict, proxy: dict,
             continue
         # Constraint failed.  If active_space redefines an axis this constraint
         # references, treat it as a foreign-design bound and skip; else reject.
-        if active_axes and any(aname in expr for aname in active_axes):
+        # Word-boundary match (not plain substring) so an axis name that
+        # happens to be a substring of an unrelated identifier in expr can't
+        # cause a genuinely-failing constraint to be silently skipped.
+        if active_axes and any(
+            re.search(rf"\b{re.escape(aname)}\b", expr) for aname in active_axes
+        ):
             continue
         return False, f"constraint failed: {expr}"
     return True, ""
