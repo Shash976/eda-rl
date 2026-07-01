@@ -21,6 +21,7 @@ analytically (acc_width=16 overflows); we reuse it so acc=16 is penalised.
 from __future__ import annotations
 
 import math
+import warnings
 
 from eda_rl.gen1.reward import SW_BASELINE_LATENCY_NS, acc_overflows
 # Single source of truth: cycle model constants come from constants.py.
@@ -103,6 +104,19 @@ def compute_generic_reward(
         return {"reward": -100.0, "norm_fmax": 0.0, "timing_violation": True,
                 "infeasible": True, "status": "PARSE_FAIL"}
 
+    if not r:
+        # FunnelEnv always pre-resolves refs (design YAML or auto-anchored from
+        # the first F3 build, see funnel.py._generic_reward_cfg) before calling
+        # here, so this only fires for standalone callers that skip that step —
+        # without it, norm_area/norm_fmax both collapse to 1.0 (self-normalised
+        # against this call's own metrics), giving a constant, uninformative
+        # reward regardless of actual PPA.
+        warnings.warn(
+            "compute_generic_reward called with no refs — norm_area/norm_fmax "
+            "will self-normalise to 1.0 (constant reward). Pass refs from the "
+            "design's reward: YAML block or an auto-anchored build.",
+            stacklevel=2,
+        )
     area_ref = float(r.get("area_ref_um2") or area_um2 or 1.0)
     fmax_ref = float(r.get("fmax_ref_mhz") or fmax_mhz or 1.0)
     power_mw = metrics.get("power_mw")
