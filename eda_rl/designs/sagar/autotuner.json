@@ -1,0 +1,15 @@
+{
+    "_SDC_FILE_PATH": "constraint.sdc",
+
+    "_SDC_CLK_PERIOD": {
+        "type": "float",
+        "minmax": [5.5, 8.0],
+        "step": 0.5
+    },
+
+    "PLACE_DENSITY_LB_ADDON": {
+        "type": "float",
+        "minmax": [0.20, 0.40],
+        "step": 0.05
+    }
+}

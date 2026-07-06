@@ -94,11 +94,32 @@ ORFS_DIR     = Path(os.environ.get("ORFS_DIR", "/opt/OpenROAD-flow-scripts"))
 ORFS_TIMEOUT = int(os.environ.get("ORFS_TIMEOUT", "2400"))   # seconds; P&R is slow
 PROXY_TIMEOUT = int(os.environ.get("PROXY_TIMEOUT", "300"))  # synth+STA is fast
 
-# Single std-cell liberty per platform, for the fast synth+STA proxy.
-# (asap7 ships many gzipped per-cell-type libs — not wired for the proxy.)
-_LIBERTY = {
-    "nangate45": "platforms/nangate45/lib/NangateOpenCellLibrary_typical.lib",
-    "sky130hd":  "platforms/sky130hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib",
+# Std-cell liberty file(s) per platform, for the fast synth+STA proxy.
+# nangate45/sky130hd each ship one merged .lib; asap7 has no merged liberty —
+# its cells are split across per-cell-type NLDM libs (4 gzipped + the plain
+# SEQ lib) that must all be loaded. yosys' abc/stat and OpenSTA's read_liberty
+# accept repeated -liberty flags (and read .gz natively), so we pass the whole
+# list, mirroring ORFS' synth_preamble.tcl `foreach lib $LIB_FILES`.
+# asap7 corner: ORFS' asap7/config.mk defaults CORNER ?= BC (best = FF) and
+# PRIMARY_VT = RVT (tag R), so we use the RVT/FF set — matching what the full
+# F3 flow synthesises with.
+_LIBERTY: dict[str, list[str]] = {
+    "nangate45": ["platforms/nangate45/lib/NangateOpenCellLibrary_typical.lib"],
+    "sky130hd":  ["platforms/sky130hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib"],
+    "asap7": [
+        "platforms/asap7/lib/NLDM/asap7sc7p5t_AO_RVT_FF_nldm_211120.lib.gz",
+        "platforms/asap7/lib/NLDM/asap7sc7p5t_INVBUF_RVT_FF_nldm_220122.lib.gz",
+        "platforms/asap7/lib/NLDM/asap7sc7p5t_OA_RVT_FF_nldm_211120.lib.gz",
+        "platforms/asap7/lib/NLDM/asap7sc7p5t_SIMPLE_RVT_FF_nldm_211120.lib.gz",
+        "platforms/asap7/lib/NLDM/asap7sc7p5t_SEQ_RVT_FF_nldm_220123.lib",
+    ],
+}
+# yosys' `dfflibmap` accepts only ONE liberty (see ORFS synth.tcl: "dfflibmap
+# only supports one liberty file"). For split-lib platforms the sequential
+# cells live in the SEQ lib; single-lib platforms map DFFs from their one lib.
+# Absent an entry, run_synth_sta falls back to the platform's first _LIBERTY.
+_DFF_LIB: dict[str, str] = {
+    "asap7": "platforms/asap7/lib/NLDM/asap7sc7p5t_SEQ_RVT_FF_nldm_220123.lib",
 }
 # Tech + std-cell LEF (OpenROAD's link_design needs a technology, not just
 # liberty).  Curated — deliberately excludes the SRAM/fakeram macro LEFs.
@@ -107,6 +128,10 @@ _LEF = {
                   "platforms/nangate45/lef/NangateOpenCellLibrary.macro.lef"],
     "sky130hd":  ["platforms/sky130hd/lef/sky130_fd_sc_hd.tlef",
                   "platforms/sky130hd/lef/sky130_fd_sc_hd_merged.lef"],
+    # asap7: tech LEF + primary-VT (R) std-cell LEF, per asap7/config.mk
+    # (TECH_LEF, SC_LEF with PRIMARY_VT_TAG=R).
+    "asap7": ["platforms/asap7/lef/asap7_tech_1x_201209.lef",
+              "platforms/asap7/lef/asap7sc7p5t_28_R_1x_220121a.lef"],
 }
 # Synth cell area → estimated post-P&R "Design area" inflation (CTS/repair
 # buffers). Calibrated on nangate45 LANES=4: 19738 / 14589 ≈ 1.35.
@@ -354,7 +379,8 @@ def _config_mk(platform: str, variant: str, lanes: int, acc_w: int,
                util: int = 40, density: float = 0.60, abc: str | None = None,
                abc_recipe: str | None = None,
                design: "Any | None" = None,
-               knob_values: "dict | None" = None) -> str:
+               knob_values: "dict | None" = None,
+               fastroute_tcl_rel: "str | None" = None) -> str:
     """Generate the per-variant ORFS config.mk content.
 
     When `design` is None, falls back to the legacy hardcoded tinymac_accel
@@ -365,6 +391,11 @@ def _config_mk(platform: str, variant: str, lanes: int, acc_w: int,
       - VERILOG_TOP_PARAMS is built from design.params ∩ config (lanes/acc_w
         are passed as top-level args for backward compat; the design bridge
         assembles the full string).
+      - fastroute_tcl_rel: relative path (DESIGN_HOME-relative content already
+        included) to a per-variant fastroute.tcl written by _stage_inputs when
+        the GR_SEED knob is active; emits FASTROUTE_TCL. None (the GR_SEED
+        knob absent/not sampled) omits the export entirely, so ORFS falls back
+        to its own platform-default fastroute.tcl — today's behavior.
       - knob_values: additional ORFS knob k→v pairs emitted after the standard
         lines.  validate_config() is called first; any errors are printed as
         warnings but do not abort (let the flow fail naturally for hard conflicts).
@@ -459,9 +490,13 @@ def _config_mk(platform: str, variant: str, lanes: int, acc_w: int,
             for w in warnings:
                 print(f"[physical_runner] knob warning: {w}", file=_sys.stderr)
             reg = KnobRegistry.load()
-            # Only emit knobs that are not already emitted above (util/density/abc/vtp)
+            # Only emit knobs that are not already emitted above (util/density/abc/vtp).
+            # CLOCK_UNCERTAINTY/IO_DELAY are SDC-owned (written by _stage_inputs via
+            # design.sdc_text()); GR_SEED is fastroute.tcl-owned (written by
+            # _stage_inputs directly) — none belong in config.mk.
             _SKIP_EMIT = {"CORE_UTILIZATION", "PLACE_DENSITY", "VERILOG_TOP_PARAMS",
-                          "ABC_AREA", "CLOCK_PERIOD"}
+                          "ABC_AREA", "CLOCK_PERIOD", "CLOCK_UNCERTAINTY", "IO_DELAY",
+                          "GR_SEED"}
             for kname, kval in knob_values.items():
                 if kname in _SKIP_EMIT:
                     continue
@@ -472,6 +507,11 @@ def _config_mk(platform: str, variant: str, lanes: int, acc_w: int,
                 # Unknown knob names are silently dropped (future-proofing)
         except ImportError:
             pass  # knobs.py not yet available; skip knob emission
+
+    fastroute_line = (
+        f"export FASTROUTE_TCL = $(DESIGN_HOME)/{fastroute_tcl_rel}\n"
+        if fastroute_tcl_rel is not None else ""
+    )
 
     return (
         "export DESIGN_HOME = .\n"
@@ -487,6 +527,7 @@ def _config_mk(platform: str, variant: str, lanes: int, acc_w: int,
         f"export PLATFORM    = {platform}\n"
         f"{vfile_lines}"
         f"export SDC_FILE      = $(DESIGN_HOME)/{platform}/{design_name}/constraint_{variant}.sdc\n"
+        f"{fastroute_line}"
         f"export CORE_UTILIZATION      = {util}\n"
         f"export PLACE_DENSITY          = {density}\n"
         f"{abc_lines}"
@@ -561,14 +602,43 @@ def _stage_inputs(platform: str, variant: str, lanes: int, acc_w: int, clk_ns: f
     time_unit = PLATFORM_TIME_UNIT.get(platform, 1.0)
     sdc_clk_value = clk_ns * time_unit
 
+    # CLOCK_UNCERTAINTY/IO_DELAY (SDC-owned pseudo-knobs): convert ns -> native
+    # unit the same way clk_ns is, above. Absent from knob_values (e.g. tier <2,
+    # or a design that doesn't opt in) -> None -> sdc_text() reproduces the
+    # original SDC unchanged (no uncertainty line; clk_period*0.2 io delay).
+    uncertainty_native = None
+    io_delay_native = None
+    if knob_values:
+        if knob_values.get("CLOCK_UNCERTAINTY") is not None:
+            uncertainty_native = float(knob_values["CLOCK_UNCERTAINTY"]) * time_unit
+        if knob_values.get("IO_DELAY") is not None:
+            io_delay_native = float(knob_values["IO_DELAY"]) * time_unit
+
     # Generate SDC from DesignSpec template
     gen_sdc = cfgdir / f"constraint_{variant}.sdc"
-    gen_sdc.write_text(design.sdc_text(platform, sdc_clk_value))
+    gen_sdc.write_text(design.sdc_text(platform, sdc_clk_value,
+                                        uncertainty=uncertainty_native,
+                                        io_delay=io_delay_native))
+
+    # GR_SEED (fastroute.tcl-owned pseudo-knob): absent -> no custom fastroute.tcl
+    # is written, ORFS uses its own platform-default file (original behavior).
+    fastroute_tcl_rel = None
+    gr_seed = knob_values.get("GR_SEED") if knob_values else None
+    if gr_seed is not None:
+        base_fr = ORFS_DIR / "flow" / "platforms" / platform / "fastroute.tcl"
+        base_text = base_fr.read_text() if base_fr.exists() else ""
+        gen_fr = cfgdir / f"fastroute_{variant}.tcl"
+        gen_fr.write_text(
+            base_text.rstrip("\n") + "\n"
+            f"set_global_routing_random -seed {int(gr_seed)}\n"
+        )
+        fastroute_tcl_rel = f"{platform}/{design_name}/fastroute_{variant}.tcl"
 
     gen_cfg = cfgdir / f"config_{variant}.mk"
     gen_cfg.write_text(_config_mk(platform, variant, lanes, acc_w,
                                    util, density, abc, abc_recipe,
-                                   design=design, knob_values=knob_values))
+                                   design=design, knob_values=knob_values,
+                                   fastroute_tcl_rel=fastroute_tcl_rel))
     return gen_cfg
 
 
@@ -792,10 +862,11 @@ def run_elaborate(lanes: int, acc_w: int, platform: str = "nangate45") -> dict:
 
 # ── Fast proxy: Yosys synthesis + OpenROAD STA (no place & route) ──────────────
 
-def _yosys_synth_script(lanes: int, acc_w: int, lib: Path, netlist: Path,
+def _yosys_synth_script(lanes: int, acc_w: int, libs: "list[Path]", netlist: Path,
                         abc_recipe: str = "orfs_speed", platform: str = "nangate45",
                         clk_ns: float | None = None, work_dir: Path | None = None,
-                        design: "Any | None" = None) -> str:
+                        design: "Any | None" = None,
+                        dff_lib: "Path | None" = None) -> str:
     """Return a Yosys synthesis script string.
 
     Stage-B recipe extension: the abc command is now recipe-aware.
@@ -819,6 +890,11 @@ def _yosys_synth_script(lanes: int, acc_w: int, lib: Path, netlist: Path,
     """
     resolved = resolve_recipe(abc_recipe)
 
+    # Repeated `-liberty <path>` args for the multi-command yosys flow. abc and
+    # stat accept many; dfflibmap accepts exactly one (the DFF/SEQ lib).
+    lib_flags = " ".join(f"-liberty {one}" for one in libs)
+    dff = dff_lib if dff_lib is not None else libs[0]
+
     if design is None:
         # Legacy tinymac path
         rtl = " ".join(str(RTL_DIR / f) for f in RTL_FILES)
@@ -841,28 +917,28 @@ def _yosys_synth_script(lanes: int, acc_w: int, lib: Path, netlist: Path,
                 chparam_lines.append(f"chparam -set ACC_W {acc_w} {top}")
 
     if resolved == "plain":
-        abc_cmd = f"abc -liberty {lib}"
+        abc_cmd = f"abc {lib_flags}"
     else:
         # Write the abc.constr file so -constr has a real target.
-        constr_dir = work_dir if work_dir is not None else lib.parent
+        constr_dir = work_dir if work_dir is not None else dff.parent
         constr_path = write_abc_constr(constr_dir, platform)
-        abc_cmd = yosys_abc_line(resolved, platform, clk_ns, lib,
+        abc_cmd = yosys_abc_line(resolved, platform, clk_ns, list(libs),
                                  constr_path=constr_path)
 
     return "\n".join([
         f"read_verilog -sv {rtl}",
         *chparam_lines,
         f"synth -top {top} -flatten",
-        f"dfflibmap -liberty {lib}",
+        f"dfflibmap -liberty {dff}",
         abc_cmd,
         "opt_clean -purge",
-        f"stat -liberty {lib}",
+        f"stat {lib_flags}",
         f"write_verilog -noattr {netlist}",
         "",
     ])
 
 
-def _sta_script(lefs: list[Path], lib: Path, netlist: Path, sdc: Path,
+def _sta_script(lefs: list[Path], libs: "list[Path]", netlist: Path, sdc: Path,
                 top: str = DESIGN) -> str:
     # Pre-layout STA in OpenROAD: cell delays only (optimistic, no net RC), but
     # fast and — unlike the routed flow — target-clock-independent, so Fmax is a
@@ -870,9 +946,10 @@ def _sta_script(lefs: list[Path], lib: Path, netlist: Path, sdc: Path,
     # so read the tech + std-cell LEF first.  report_clock_min_period prints the
     # same "period_min = X fmax = Y" line the full-flow parser already handles.
     lef_lines = "".join(f"read_lef {lef}\n" for lef in lefs)
+    lib_lines = "".join(f"read_liberty {one}\n" for one in libs)
     return (
         lef_lines
-        + f"read_liberty {lib}\n"
+        + lib_lines
         + f"read_verilog {netlist}\n"
         + f"link_design {top}\n"
         + f"read_sdc {sdc}\n"
@@ -938,10 +1015,13 @@ def run_synth_sta(lanes: int, acc_w: int, clk_ns: float, platform: str = "nangat
         raise FileNotFoundError(
             f"ORFS not found at {ORFS_DIR} (set ORFS_DIR, or PHYSICAL_MOCK=1 to test offline)"
         )
-    lib_rel = _LIBERTY.get(platform)
-    if lib_rel is None or platform not in _LEF:
-        raise ValueError(f"no proxy lib/lef for platform '{platform}' (try nangate45 / sky130hd)")
-    lib  = ORFS_DIR / "flow" / lib_rel
+    lib_rels = _LIBERTY.get(platform)
+    if not lib_rels or platform not in _LEF:
+        raise ValueError(f"no proxy lib/lef for platform '{platform}' "
+                         f"(try nangate45 / sky130hd / asap7)")
+    libs = [ORFS_DIR / "flow" / rel for rel in lib_rels]
+    dff_rel = _DFF_LIB.get(platform)
+    dff_lib = (ORFS_DIR / "flow" / dff_rel) if dff_rel else libs[0]
     lefs = [ORFS_DIR / "flow" / rel for rel in _LEF[platform]]
 
     gen_cfg = _stage_inputs(platform, var, lanes, acc_w, clk_ns,
@@ -959,11 +1039,12 @@ def run_synth_sta(lanes: int, acc_w: int, clk_ns: float, platform: str = "nangat
 
     # Pass recipe, platform, clk_ns, design, and work_dir so the constr file is written
     # inside the proxy work directory (same isolation as the full flow).
-    synth_ys.write_text(_yosys_synth_script(lanes, acc_w, lib, netlist,
+    synth_ys.write_text(_yosys_synth_script(lanes, acc_w, libs, netlist,
                                             abc_recipe=resolved_recipe,
                                             platform=platform, clk_ns=clk_ns,
-                                            work_dir=work, design=eff_design))
-    sta_tcl.write_text(_sta_script(lefs, lib, netlist, sdc, top=top_module))
+                                            work_dir=work, design=eff_design,
+                                            dff_lib=dff_lib))
+    sta_tcl.write_text(_sta_script(lefs, libs, netlist, sdc, top=top_module))
 
     # 1) synthesis (script FILE, not -p, to avoid shell-quoting issues; no -q,
     #    which would suppress the `stat` output we parse).

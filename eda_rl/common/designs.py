@@ -18,7 +18,9 @@ PINNED interface (concurrent agents code against this exactly):
         functional_eval: dict | None   # {"kind":"tinyvad_sim"} or {"kind":"none"} or None
         @classmethod
         def load(cls, name_or_path: str) -> "DesignSpec"
-        def sdc_text(self, platform: str, clock_value_native: float) -> str
+        def sdc_text(self, platform: str, clock_value_native: float,
+                     uncertainty: float | None = None,
+                     io_delay: float | None = None) -> str
 
 Design YAML spec format (see optimizer/designs/tinymac_accel.yaml for full example):
     name: <str>
@@ -59,23 +61,52 @@ _DESIGNS_DIR = Path(__file__).resolve().parent.parent / "designs"
 # so they must be safe plain identifiers — no slashes, quotes, or shell metachars.
 _SAFE_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
-# SDC template — generic; physical_runner.py applies PLATFORM_TIME_UNIT conversion
-# before writing so clock_value_native is always in the platform's native unit.
-_SDC_TEMPLATE = """\
-current_design {top}
-
-set clk_name      core_clock
-set clk_port_name {clock_port}
-set clk_period    {clock_period}
-set clk_io_pct    0.2
-
-set clk_port [get_ports $clk_port_name]
-create_clock -name $clk_name -period $clk_period $clk_port
-
-set non_clock_inputs [all_inputs -no_clocks]
-set_input_delay  [expr $clk_period * $clk_io_pct] -clock $clk_name $non_clock_inputs
-set_output_delay [expr $clk_period * $clk_io_pct] -clock $clk_name [all_outputs]
-"""
+# SDC generation — generic; physical_runner.py applies PLATFORM_TIME_UNIT
+# conversion before writing so clock_value_native/uncertainty/io_delay are
+# always already in the platform's native unit.
+#
+# uncertainty/io_delay are None by default, which reproduces the original
+# static template byte-for-byte (no set_clock_uncertainty line; io delay is
+# the fixed clk_period*0.2 fraction) — every design that doesn't opt into the
+# CLOCK_UNCERTAINTY/IO_DELAY knobs (see common/knobs.py) is unaffected.
+def _sdc_text(top: str, clock_port: str, clock_period: float,
+              uncertainty: float | None = None,
+              io_delay: float | None = None) -> str:
+    lines = [
+        f"current_design {top}",
+        "",
+        "set clk_name      core_clock",
+        f"set clk_port_name {clock_port}",
+        f"set clk_period    {clock_period}",
+    ]
+    if io_delay is None:
+        lines.append("set clk_io_pct    0.2")
+    lines += [
+        "",
+        "set clk_port [get_ports $clk_port_name]",
+        "create_clock -name $clk_name -period $clk_period $clk_port",
+    ]
+    if uncertainty is not None:
+        # AutoTuner equivalent: _SDC_UNCERTAINTY.
+        lines.append(f"set_clock_uncertainty {uncertainty} [get_clocks $clk_name]")
+    lines += [
+        "",
+        "set non_clock_inputs [all_inputs -no_clocks]",
+    ]
+    if io_delay is None:
+        lines += [
+            "set_input_delay  [expr $clk_period * $clk_io_pct] -clock $clk_name $non_clock_inputs",
+            "set_output_delay [expr $clk_period * $clk_io_pct] -clock $clk_name [all_outputs]",
+        ]
+    else:
+        # AutoTuner equivalent: _SDC_IO_DELAY — an absolute delay value, not a
+        # clk_period fraction (matches ORFS's own convention, e.g.
+        # flow/designs/asap7/mock-cpu/constraint.sdc).
+        lines += [
+            f"set_input_delay  {io_delay} -clock $clk_name $non_clock_inputs",
+            f"set_output_delay {io_delay} -clock $clk_name [all_outputs]",
+        ]
+    return "\n".join(lines) + "\n"
 
 
 @dataclass
@@ -208,19 +239,28 @@ class DesignSpec:
 
     # ── SDC generation ────────────────────────────────────────────────────────
 
-    def sdc_text(self, platform: str, clock_value_native: float) -> str:
+    def sdc_text(self, platform: str, clock_value_native: float,
+                 uncertainty: float | None = None,
+                 io_delay: float | None = None) -> str:
         """Return the SDC content for the given platform clock value.
 
-        clock_value_native must already be in the platform's native unit
-        (ns for nangate45, ps for asap7).  The caller (physical_runner) applies
-        the PLATFORM_TIME_UNIT conversion BEFORE calling this method.
+        clock_value_native/uncertainty/io_delay must already be in the
+        platform's native unit (ns for nangate45, ps for asap7).  The caller
+        (physical_runner) applies the PLATFORM_TIME_UNIT conversion BEFORE
+        calling this method.
+
+        uncertainty/io_delay are optional (CLOCK_UNCERTAINTY/IO_DELAY knobs,
+        see common/knobs.py); omitting them reproduces the original SDC
+        exactly (no set_clock_uncertainty line; io delay = clk_period*0.2).
 
         The SDC uses the design's top module name and clock port.
         """
-        return _SDC_TEMPLATE.format(
+        return _sdc_text(
             top=self.top,
             clock_port=self.clock_port,
             clock_period=clock_value_native,
+            uncertainty=uncertainty,
+            io_delay=io_delay,
         )
 
     # ── RTL content hash ──────────────────────────────────────────────────────
@@ -346,6 +386,23 @@ if __name__ == "__main__":
         sdc_asap7 = tm.sdc_text("asap7", 5000.0)   # 5.0 ns × 1000 = 5000 ps
         assert "5000.0" in sdc_asap7, "asap7 native clock not in SDC"
         print(f"  sdc_text nangate45 / asap7  PASS")
+
+        # 3b. uncertainty/io_delay default to None -> byte-identical to the
+        # pre-CLOCK_UNCERTAINTY/IO_DELAY-knob SDC (backward-compat regression guard).
+        sdc_default = tm.sdc_text("nangate45", 5.0)
+        sdc_explicit_none = tm.sdc_text("nangate45", 5.0, uncertainty=None, io_delay=None)
+        assert sdc_default == sdc_explicit_none
+        assert "set_clock_uncertainty" not in sdc_default
+        assert "clk_io_pct" in sdc_default
+        assert "[expr $clk_period * $clk_io_pct]" in sdc_default
+
+        # 3c. uncertainty/io_delay given -> new lines appear, old fraction form doesn't
+        sdc_tuned = tm.sdc_text("nangate45", 5.0, uncertainty=0.05, io_delay=0.3)
+        assert "set_clock_uncertainty 0.05 [get_clocks $clk_name]" in sdc_tuned
+        assert "set_input_delay  0.3 -clock $clk_name" in sdc_tuned
+        assert "set_output_delay 0.3 -clock $clk_name" in sdc_tuned
+        assert "clk_io_pct" not in sdc_tuned
+        print(f"  sdc_text uncertainty/io_delay (backward-compat + new lines)  PASS")
     except FileNotFoundError:
         print("  SKIP sdc_text test (tinymac YAML not yet written)")
 

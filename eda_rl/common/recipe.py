@@ -68,6 +68,10 @@ _ABC_CONSTR: dict[str, tuple[str, float]] = {
     "nangate45": ("BUF_X1", 3.898),
     # sky130hd would go here when wired; placeholder to avoid KeyError
     "sky130hd":  ("sky130_fd_sc_hd__buf_1", 5.0),
+    # asap7: ORFS config.mk ABC_DRIVER_CELL=BUFx2_ASAP7_75t_<PRIMARY_VT_TAG=R>,
+    # ABC_LOAD_IN_FF=3.898. Without this abc falls back to BUF_X1 (absent from
+    # the asap7 libs) and logs "Cannot find the default PI driving cell".
+    "asap7":     ("BUFx2_ASAP7_75t_R", 3.898),
 }
 
 
@@ -112,7 +116,7 @@ def recipe_suffix(recipe: str) -> str:
 
 
 def yosys_abc_args(recipe: str, platform: str, clk_ns: float | None,
-                   lib: str | Path) -> list[str]:
+                   lib: "str | Path | list") -> list[str]:
     """Return the yosys `abc` command arguments for a given recipe.
 
     Parameters
@@ -123,8 +127,9 @@ def yosys_abc_args(recipe: str, platform: str, clk_ns: float | None,
               If None or ≤ 0, -D is omitted (safe for area-mode; the
               ORFS speed script uses -D for delay-targeted mapping but
               P1 shows -D is a no-op in yosys 0.64 regardless).
-    lib:      path to the standard-cell liberty file (passed as -liberty
-              and inside the -constr file).
+    lib:      path to the standard-cell liberty file (passed as -liberty),
+              or a list of such paths for split-lib PDKs (asap7) — each is
+              emitted as its own `-liberty <path>` pair, mirroring ORFS.
 
     Returns
     -------
@@ -139,16 +144,22 @@ def yosys_abc_args(recipe: str, platform: str, clk_ns: float | None,
     `write_abc_constr`).  This function only emits the argument list.
     """
     recipe = resolve_recipe(recipe)
-    lib = str(lib)
+    # `lib` may be a single path or a list of paths (split-lib PDKs such as
+    # asap7). Emit a repeated `-liberty <path>` pair for each, exactly as ORFS'
+    # synth_preamble.tcl does (`foreach lib $LIB_FILES { -liberty $lib }`).
+    libs = lib if isinstance(lib, (list, tuple)) else [lib]
+    lib_args: list[str] = []
+    for one in libs:
+        lib_args += ["-liberty", str(one)]
 
     if recipe == "plain":
         # Bare abc: no script, no constr, no -D — exactly the current proxy.
-        return ["-liberty", lib]
+        return list(lib_args)
 
     script_name = "abc_speed.script" if recipe == "orfs_speed" else "abc_area.script"
     script_path = str(ORFS_SCRIPTS_DIR / script_name)
 
-    args = ["-script", script_path, "-liberty", lib]
+    args = ["-script", script_path, *lib_args]
 
     # -constr placeholder; the actual file path is injected by the caller after
     # write_abc_constr() places it.  We use the sentinel "<CONSTR>" so callers
@@ -183,7 +194,7 @@ def write_abc_constr(work_dir: Path, platform: str) -> Path:
 
 
 def yosys_abc_line(recipe: str, platform: str, clk_ns: float | None,
-                   lib: str | Path, constr_path: str | Path | None = None) -> str:
+                   lib: "str | Path | list", constr_path: str | Path | None = None) -> str:
     """Return a complete yosys `abc ...` command string for embedding in a .ys script.
 
     Parameters

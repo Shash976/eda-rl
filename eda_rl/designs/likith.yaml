@@ -1,0 +1,88 @@
+# designs/likith.yaml — tiny combinational instruction decoder (module `id`).
+#
+# id.v: 3-bit opcode in, 5 control signals out, pure `always @(*)` — NO clock
+# port on the module at all. eda-rl's SDC generator does `get_ports
+# <clock_port>` → create_clock; on a module with no matching port this
+# produces a genuine floating/virtual clock (verified: real OpenSTA ran real
+# timing analysis against it — found and partially repaired real setup
+# violations), so `clock_port: clk` below works fine as a placeholder despite
+# id.v having no clk pin. No code change was needed for this.
+#
+# Platform: asap7 — this design's real target; do not retarget it. The F2
+# proxy (run_synth_sta) needed asap7 liberty/LEF wiring added to
+# common/physical_runner.py to support this platform at all (asap7, unlike
+# nangate45/sky130hd, ships no single merged liberty file).
+#
+# CORE_UTILIZATION override: eda-rl's tool-default range [20,60] is far too
+# dense for a design this tiny — ORFS's default PDN power-grid can't fit its
+# straps in the resulting floorplan. Verified via real ORFS builds:
+# util=40 -> ERROR PDN-0185 (insufficient strap width); util=5 -> clean full
+# RTL-to-GDS build (area 3.0 um^2, wns ~-0.017 ns @ 0.05 ns clock,
+# fmax ~15 GHz, cell_count=46, real GDS produced).
+#
+# CLOCK_UNCERTAINTY / IO_DELAY / GR_SEED / ROUTING_LAYER_ADJUSTMENT overrides:
+# narrowed to match likith/autotuner.json's declared bounds — the leftover
+# ORFS-AutoTuner bundle (config.mk/autotuner.json/fastroute.tcl in
+# designs/likith/) this design was originally set up for. That bundle is NOT
+# read by eda-rl (no code parses config.mk/autotuner.json here); it's used
+# only as the source of truth for which parameters should be tunable.
+# asap7 SDC time values are picoseconds; DesignSpec clock/time ranges are
+# always nanoseconds (PLATFORM_TIME_UNIT converts downstream), so a ps bound
+# from autotuner.json becomes ps/1000 here.
+#
+# Campaigns need --max-tier 3 to actually exercise ROUTING_LAYER_ADJUSTMENT
+# and GR_SEED (both tier 3); CLOCK_UNCERTAINTY/IO_DELAY need --max-tier 2+;
+# CORE_UTILIZATION/CLOCK_PERIOD are tier 1 / unconditional (no flag needed).
+
+name: id
+top:  id
+
+rtl_files:
+  # Relative path resolves against this YAML's own directory (like gcd.yaml).
+  - likith/id.v
+
+# Placeholder — id.v has no physical clk port; this becomes a virtual clock
+# (see header comment above). Any name absent from the RTL works identically.
+clock_port: clk
+
+# No RTL chparam axes (id has no configurable parameters).
+params: {}
+
+platforms:
+  asap7:
+    # autotuner.json _SDC_CLK_PERIOD [45,70] ps -> [0.045,0.070] ns
+    clock_range_ns: [0.045, 0.070]
+    default_clock_ns: 0.050
+
+# has_macros: false — id is a pure std-cell design (no SRAM/macro instances).
+has_macros: false
+
+# functional_eval: none — id has no behavioral simulation hook.
+# F0 is legality/validate_config only; F1 is skipped (functional_eval.kind != tinyvad_sim).
+functional_eval:
+  kind: none
+
+knobs:
+  override:
+    CORE_UTILIZATION:
+      # Verified working value is 5 on asap7 (see header comment); bracket it
+      # with margin. Top of range is untested — an occasional PDN-0185 there
+      # is a failed episode, not a crash.
+      range: [3.0, 7.0]
+      default: 5.0
+    CLOCK_UNCERTAINTY:
+      # autotuner.json _SDC_UNCERTAINTY [0.0,1.0] ps -> [0.0,0.001] ns
+      range: [0.0, 0.001]
+      default: 0.0005
+    IO_DELAY:
+      # autotuner.json _SDC_IO_DELAY [0.5,2.0] ps -> [0.0005,0.002] ns
+      range: [0.0005, 0.002]
+      default: 0.001
+    GR_SEED:
+      # autotuner.json _FR_GR_SEED [1,100]
+      range: [1, 100]
+      default: 1
+    ROUTING_LAYER_ADJUSTMENT:
+      # autotuner.json _FR_LAYER_ADJUST [0.20,0.80] — widens the tool default (0.1,0.7)
+      range: [0.20, 0.80]
+      default: 0.50

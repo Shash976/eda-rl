@@ -1,8 +1,11 @@
 """optimizer/common/knobs.py — design-agnostic ORFS knob registry.
 
-All 28 knobs are transcribed from /tmp/knobs_research.yaml (the evidence-annotated
-research pass over ORFS variables.yaml and AutoTuner JSON configs).  The registry
-data is EMBEDDED here — do NOT read /tmp at runtime.
+The original 28 knobs are transcribed from /tmp/knobs_research.yaml (the
+evidence-annotated research pass over ORFS variables.yaml and AutoTuner JSON
+configs).  3 more (CLOCK_UNCERTAINTY, IO_DELAY, GR_SEED) were added later to
+close an autotuner.json parity gap for a specific design (asap7, no merged
+SDC clock uncertainty/IO-delay/routing-seed axes existed before).  The
+registry data is EMBEDDED here — do NOT read /tmp at runtime.
 
 Tiers:
     1 — dominant (≥5% area or ≥2× timing/cycles); always included
@@ -41,12 +44,13 @@ class Knob:
     name: str
     tier: int
     stage: str
-    type: str           # "int" | "float" | "categorical" | "bool" | "pseudo_sdc"
+    type: str           # "int" | "float" | "categorical" | "bool" | "pseudo_sdc" | "pseudo_fastroute"
     default: Any
     range: tuple | None = None       # (lo, hi) for int/float
     choices: list | None = None      # for categorical
     # Internal emit template; {v} is replaced by the value.
-    # Empty string "" means the caller handles emission (CLOCK_PERIOD / VERILOG_TOP_PARAMS).
+    # Empty string "" means the caller handles emission (CLOCK_PERIOD / VERILOG_TOP_PARAMS /
+    # CLOCK_UNCERTAINTY / IO_DELAY / GR_SEED).
     _emit_template: str = field(default="", repr=False)
     notes: str = ""
     evidence: str = ""
@@ -56,14 +60,21 @@ class Knob:
     def emit_lines(self, value: Any) -> list[str]:
         """Return zero or more 'export NAME = value' config.mk lines.
 
-        CLOCK_PERIOD  → [] (written to SDC by physical_runner, not config.mk)
+        CLOCK_PERIOD, CLOCK_UNCERTAINTY, IO_DELAY → [] (written to SDC by
+                              physical_runner, not config.mk)
+        GR_SEED       → [] (written to a per-variant fastroute.tcl by
+                              physical_runner, not config.mk)
         VERILOG_TOP_PARAMS → [] when value is empty/None (no RTL params);
                               otherwise one line with the pre-built string.
         MACRO_PLACE_HALO  → emits "export MACRO_PLACE_HALO = v v" (x y both the same).
         All others         → one line: "export NAME = value"
         """
         if self.type == "pseudo_sdc":
-            # CLOCK_PERIOD: physical_runner owns the SDC write
+            # CLOCK_PERIOD/CLOCK_UNCERTAINTY/IO_DELAY: physical_runner owns the SDC write
+            return []
+
+        if self.type == "pseudo_fastroute":
+            # GR_SEED: physical_runner owns the fastroute.tcl write
             return []
 
         if self.name == "VERILOG_TOP_PARAMS":
@@ -105,7 +116,7 @@ class Knob:
 
 
 class KnobRegistry:
-    """Registry of all 28 ORFS knobs, with tier-filtering and space-building."""
+    """Registry of all 27 ORFS knobs, with tier-filtering and space-building."""
 
     def __init__(self, knobs: list[Knob]) -> None:
         self._knobs: dict[str, Knob] = {k.name: k for k in knobs}
@@ -246,10 +257,21 @@ class KnobRegistry:
 
         # 4. Active ORFS knobs (skip pseudo-knobs already handled above)
         _SKIP = {"CLOCK_PERIOD", "VERILOG_TOP_PARAMS", "ABC_AREA"}
+        # candidates.py's _trial_to_config() only knows how to sample
+        # "categorical"/"int"/"float"/"bool" space-entry types — "pseudo_sdc"/
+        # "pseudo_fastroute" are emission-routing types (control emit_lines()
+        # in Knob, see knobs.py:69-75), NOT sampling types. Without this
+        # translation, CLOCK_UNCERTAINTY/IO_DELAY/GR_SEED would silently fall
+        # into _trial_to_config's "unknown type" branch and get pinned to
+        # their default every episode instead of being sampled (this was
+        # caught by a real campaign: all three were constant across 7
+        # episodes while every properly-typed axis varied normally).
+        _SPACE_TYPE = {"pseudo_sdc": "float", "pseudo_fastroute": "int"}
         for knob in self.active(max_tier, design):
             if knob.name in _SKIP:
                 continue
-            entry: dict = {"type": knob.type, "default": knob.default}
+            entry: dict = {"type": _SPACE_TYPE.get(knob.type, knob.type),
+                           "default": knob.default}
             if knob.choices is not None:
                 entry["choices"] = list(knob.choices)
             elif knob.range is not None:
@@ -398,7 +420,7 @@ def validate_config(config: dict) -> list[str]:
 
 
 def _build_knobs() -> list[Knob]:
-    """Return all 28 Knob objects from the embedded registry data."""
+    """Return all 27 Knob objects from the embedded registry data."""
     return [
 
         # =====================================================================
@@ -454,6 +476,56 @@ def _build_knobs() -> list[Knob]:
                 "area ±18%, power ×3 as clock tightens. Surrogate must learn the "
                 "effort-coupling response surface; the old max(clk, 3.72) analytic "
                 "cap contradicts measurements (doc07 Phase 3, Phase 5 Exp 2)."
+            ),
+        ),
+
+        Knob(
+            name="CLOCK_UNCERTAINTY",
+            tier=2,
+            stage="sdc",
+            type="pseudo_sdc",
+            # Value is ns, converted to the platform's native SDC unit the same
+            # way CLOCK_PERIOD is (physical_runner PLATFORM_TIME_UNIT).
+            range=(0.0, 0.1),
+            default=0.0,
+            _emit_template="",   # SDC write owned by physical_runner
+            notes=(
+                "AutoTuner pseudo-knob (_SDC_UNCERTAINTY) -> set_clock_uncertainty "
+                "in constraint.sdc. NOT a config.mk variable — written to the SDC "
+                "by physical_runner.py, same mechanism as CLOCK_PERIOD. "
+                "Not sampled unless a design's active knob space includes it "
+                "(tier 2+); when absent, no set_clock_uncertainty line is "
+                "emitted at all (original SDC behavior, unchanged)."
+            ),
+            evidence=(
+                "AutoTuner exposes this on some designs (e.g. asap7 blocks) as a "
+                "small margin axis; no eda-rl DSE evidence yet — added to close "
+                "the autotuner.json parity gap for asap7 designs."
+            ),
+        ),
+
+        Knob(
+            name="IO_DELAY",
+            tier=2,
+            stage="sdc",
+            type="pseudo_sdc",
+            # Value is ns, converted like CLOCK_PERIOD. Absolute delay, NOT a
+            # clk_period fraction (matches AutoTuner's _SDC_IO_DELAY convention).
+            range=(0.02, 1.0),
+            default=0.1,
+            _emit_template="",   # SDC write owned by physical_runner
+            notes=(
+                "AutoTuner pseudo-knob (_SDC_IO_DELAY) -> set_input_delay / "
+                "set_output_delay in constraint.sdc, replacing the fixed "
+                "clk_period*0.2 fraction the SDC otherwise uses. NOT a config.mk "
+                "variable. Not sampled unless a design's active knob space "
+                "includes it (tier 2+); when absent, the original "
+                "clk_period*0.2 fraction is used (unchanged)."
+            ),
+            evidence=(
+                "AutoTuner exposes this on some designs (e.g. asap7 blocks) as an "
+                "absolute I/O timing budget; added to close the autotuner.json "
+                "parity gap for asap7 designs."
             ),
         ),
 
@@ -749,6 +821,29 @@ def _build_knobs() -> list[Knob]:
         ),
 
         Knob(
+            name="GR_SEED",
+            tier=3,
+            stage="grt",
+            type="pseudo_fastroute",
+            range=(1, 100),
+            default=1,
+            _emit_template="",   # fastroute.tcl write owned by physical_runner
+            notes=(
+                "AutoTuner equivalent: _FR_GR_SEED -> set_global_routing_random "
+                "-seed N, written into a per-variant fastroute.tcl (NOT a config.mk "
+                "variable). Not sampled unless a design's active knob space "
+                "includes it (tier 3+); when absent, no custom fastroute.tcl is "
+                "written and ORFS's platform-default fastroute.tcl is used "
+                "unchanged (original behavior)."
+            ),
+            evidence=(
+                "AutoTuner exposes this on some designs for global-route "
+                "reproducibility/DSE noise studies; added to close the "
+                "autotuner.json parity gap for asap7 designs (likith/id)."
+            ),
+        ),
+
+        Knob(
             name="RECOVER_POWER",
             tier=3,
             stage="grt",
@@ -965,8 +1060,27 @@ if __name__ == "__main__":
     reg = KnobRegistry.load()
     all_k = reg.all_knobs()
     print(f"  Registry loaded: {len(all_k)} knobs")
-    # Tier 1: 4, Tier 2: 6, Tier 3: 9, Tier 4: 5 → 24 total
-    assert len(all_k) == 24, f"Expected 24 knobs, got {len(all_k)}"
+    # Tier 1: 4, Tier 2: 6+2 (CLOCK_UNCERTAINTY, IO_DELAY), Tier 3: 9+1 (GR_SEED),
+    # Tier 4: 5 → 27 total
+    assert len(all_k) == 27, f"Expected 27 knobs, got {len(all_k)}"
+    assert {"CLOCK_UNCERTAINTY", "IO_DELAY", "GR_SEED"} <= {k.name for k in all_k}, \
+        "new autotuner-parity knobs missing from registry"
+
+    # 1b. space() must expose CLOCK_UNCERTAINTY/IO_DELAY/GR_SEED as a real
+    # sampling type ("float"/"int"), NOT their raw Knob.type ("pseudo_sdc"/
+    # "pseudo_fastroute") — candidates.py's _trial_to_config() doesn't know
+    # those emission-routing types and would silently pin them to a constant
+    # default every episode instead of sampling them (regression caught by a
+    # real live campaign: all three were constant across 7 episodes while
+    # every properly-typed axis varied).
+    try:
+        sp = reg.space(max_tier=3, design="likith", platform="asap7")
+        assert sp["CLOCK_UNCERTAINTY"]["type"] == "float", sp["CLOCK_UNCERTAINTY"]
+        assert sp["IO_DELAY"]["type"] == "float", sp["IO_DELAY"]
+        assert sp["GR_SEED"]["type"] == "int", sp["GR_SEED"]
+        print("  space() sampling types for CLOCK_UNCERTAINTY/IO_DELAY/GR_SEED  PASS")
+    except FileNotFoundError:
+        print("  SKIP CLOCK_UNCERTAINTY/IO_DELAY/GR_SEED sampling-type test (likith YAML not found)")
 
     # 2. Tier filtering works
     tier1 = reg.active(max_tier=1, design=None)
@@ -1054,9 +1168,9 @@ if __name__ == "__main__":
 
     # 8. Every emit line is a sane "export NAME = value" string
     for knob in all_k:
-        if knob.type == "pseudo_sdc":
+        if knob.type in ("pseudo_sdc", "pseudo_fastroute"):
             lines = knob.emit_lines(5.0)
-            assert lines == [], f"CLOCK_PERIOD emit_lines should be [], got {lines}"
+            assert lines == [], f"{knob.name} emit_lines should be [], got {lines}"
             continue
         if knob.choices:
             val = knob.choices[0]
