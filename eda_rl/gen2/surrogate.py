@@ -11,15 +11,21 @@ estimates: sigma ≈ (q84 − q16) / 2, mu = q50 prediction.
 
 Features
 --------
-Config features (always present):
-  - log2(lanes)        — log scale because area/cycles grow sub-linearly
-  - acc_w              — raw; three discrete values {16,24,32}
-  - clk_ns             — continuous clock constraint (the single biggest driver
-                         of Fmax and power, per Phase 5 data)
-  - abc_area_flag      — 1 if abc_recipe == 'area', 0 otherwise
-  - platform_flag      — 1 if platform == 'asap7', 0 otherwise
-  - rtl_hash_cat       — integer-encoded RTL hash (context for transfer; one
-                         value per RTL version in the corpus)
+Config features are DISCOVERED from the training corpus, not hardcoded (audit
+F5). At fit() time an axis schema is built from the config axes present in the
+rows: every numeric axis (sorted by name) becomes one feature; every small
+categorical axis becomes a one-hot block. The ordered schema is stored in the
+joblib payload so predict() builds features identically, and predict() REFUSES
+(raises) when the incoming config does not cover the schema's required axes —
+which also prevents a surrogate fitted on one design from silently
+mispredicting another's configs. Notable transforms:
+  - lanes              — featurized as log2(lanes) (area/cycles sub-linear)
+  - abc (recipe)       — one-hot; the 'area' recipes ('area'/'orfs_area') are
+                         distinguished from 'orfs_speed'/'plain'
+  - util  ← CORE_UTILIZATION,  density ← PLACE_DENSITY (aliased so the funnel's
+                         actual knob keys are seen, not the wrong 'util'/'density')
+  - tier-2/3 knobs     — IO_DELAY, PLACE_DENSITY_LB_ADDON, CTS_*, … all featurized
+  - platform, rtl_hash — one-hot context axes (not required by the coverage check)
 
 Conditional F2 observables (present or missing — handled with indicator cols):
   - proxy_area_um2     — synth cell area × 1.35 inflation estimate
@@ -118,11 +124,124 @@ def _obs_value(obs: dict | None, col: str):
             return v
     return None
 
+
+# ── Generalized config featurization (audit F5) ────────────────────────────────
+#
+# The old surrogate hardcoded an 8-element config vector (log2 lanes, acc_w, clk,
+# abc_flag, plat_flag, hash_cat, util, density). That made it structurally blind
+# to every tier-2/3 knob the campaigns actually vary (IO_DELAY, CTS_*,
+# PLACE_DENSITY_LB_ADDON, …) and read util/density from the wrong keys. We now
+# discover the config axes from the training corpus and featurize ALL of them:
+# every numeric axis (sorted by name) becomes one feature; every small
+# categorical axis becomes a one-hot block. The ordered axis schema is stored in
+# the joblib payload so fit and predict agree, and predict refuses to run when
+# the incoming config doesn't cover the schema's required axes (this also
+# neutralizes the cross-design auto-load hazard: a tinymac-fitted surrogate can't
+# silently mispredict a gcd/likith config).
+
+# Max distinct values for an axis to be one-hot encoded (else it is dropped from
+# the feature vector — e.g. a high-cardinality free axis; rtl_hash is context and
+# handled separately).
+_MAX_ONEHOT = 24
+
+# Numeric axes featurized on a log2 scale (area/cycles grow sub-linearly in lanes).
+_SPECIAL_LOG = {"lanes"}
+
+# Categorical context axes: always featurized (missing → all-zero one-hot) but
+# NOT required by the coverage check — a config being predicted need not carry
+# them (platform is passed out-of-band; rtl_hash enables transfer to unseen RTL).
+_CONTEXT_AXES = {"rtl_hash", "platform"}
+
+# Row keys that are metrics / obs / bookkeeping, NOT config axes. Everything in a
+# flattened row that is not one of these (and not an obs alias) is a config axis.
+_NONCONFIG_KEYS = {
+    # F3 / F2 metrics + obs
+    "area_um2", "period_ns", "period_min_ns", "fmax_mhz", "power_mw",
+    "wns_ns", "tns_ns", "setup_viol", "timing_met", "util_pct",
+    "proxy_area_um2", "proxy_wns_ns", "ff_count", "cell_count", "cells",
+    "logic_levels", "accuracy", "accuracy_flag", "avg_cycles", "cycles",
+    # bookkeeping / structural
+    "status", "variant", "design", "gds", "reward", "fidelity",
+    "obs", "config", "metrics", "effective_abc_recipe",
+}
+
+
+def _is_number(v: Any) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _config_view(flat: dict) -> dict:
+    """Extract the config-axis view of a flattened row for featurization.
+
+    Canonicalizes the RTL/clock/recipe/util/density aliases to a single axis
+    namespace and passes every other non-metric key (the tier-2/3 knobs) through
+    unchanged. Only axes actually present are included — no defaults are injected,
+    so the coverage check can tell a gcd config (no lanes/IO_DELAY) apart from a
+    tinymac/likith one.
+    """
+    v: dict = {}
+
+    def _first(*keys):
+        for k in keys:
+            if flat.get(k) is not None:
+                return flat[k]
+        return None
+
+    lanes = _first("mac_lanes", "lanes")
+    if lanes is not None:
+        v["lanes"] = int(lanes)
+    acc = _first("accumulator_width", "acc_w")
+    if acc is not None:
+        v["acc_w"] = int(acc)
+    clk = _first("clock_period_ns", "clk_ns")
+    if clk is not None:
+        v["clk_ns"] = float(clk)
+    abc = _first("abc_recipe", "abc")
+    if abc is not None:
+        v["abc"] = str(abc)
+    util = _first("CORE_UTILIZATION", "util")
+    if util is not None:
+        v["util"] = float(util)
+    density = _first("PLACE_DENSITY", "density")
+    if density is not None:
+        v["density"] = float(density)
+    plat = _first("platform")
+    if plat is not None:
+        v["platform"] = str(plat)
+    rtl_hash = _first("rtl_hash")
+    if rtl_hash is not None:
+        v["rtl_hash"] = str(rtl_hash)
+
+    # Pass-through knob axes (IO_DELAY, PLACE_DENSITY_LB_ADDON, CTS_*, …). Skip
+    # metric/obs/bookkeeping keys, the alias source keys already canonicalized,
+    # and obs-alias keys.
+    _consumed = {
+        "mac_lanes", "lanes", "accumulator_width", "acc_w",
+        "clock_period_ns", "clk_ns", "abc_recipe", "abc",
+        "CORE_UTILIZATION", "util", "PLACE_DENSITY", "density",
+        "platform", "rtl_hash",
+    }
+    _obs_alias_keys = {a for aliases in _OBS_ALIASES.values() for a in aliases}
+    for k, val in flat.items():
+        if k in _consumed or k in _NONCONFIG_KEYS or k in _obs_alias_keys:
+            continue
+        if val is None:
+            continue
+        v[k] = val
+    return v
+
+
 # ── Feature engineering ────────────────────────────────────────────────────────
 
 
 def _encode_config(x: dict) -> list[float]:
-    """Return the 6-element config feature vector for a single config dict.
+    """LEGACY, unused: the fixed 8-element config feature vector.
+
+    Kept only for reference — the live path is Surrogate._build_feature_row,
+    which featurizes the full discovered axis schema (see _config_view). This
+    helper returns 8 elements (log2 lanes, acc_w, clk, abc_flag, plat_flag,
+    hash placeholder, util, density); the old docstring's "6-element" claim was
+    stale (audit F17).
 
     Accepts either the optimizer-facing keys (mac_lanes / accumulator_width /
     clock_period_ns / abc_recipe / platform) or the runner-facing keys
@@ -133,9 +252,9 @@ def _encode_config(x: dict) -> list[float]:
     acc_w = int(x.get("accumulator_width") or x.get("acc_w") or 24)
     clk   = float(x.get("clock_period_ns") or x.get("clk_ns") or 5.0)
 
-    # abc_recipe: 'area' → 1; anything else (None/'speed'/absent) → 0
+    # abc_recipe: any 'area' recipe → 1 (catches 'area' and 'orfs_area'); else 0
     abc_raw = x.get("abc_recipe") or x.get("abc") or ""
-    abc_flag = 1.0 if str(abc_raw).lower() == "area" else 0.0
+    abc_flag = 1.0 if "area" in str(abc_raw).lower() else 0.0
 
     # platform: 'asap7' → 1; everything else (nangate45/sky130…) → 0
     plat_raw = x.get("platform") or "nangate45"
@@ -241,6 +360,13 @@ class Surrogate:
         self._obs_means: dict[str, float] = {c: 0.0 for c in _OBS_COLS}
         # RTL hash → integer encoding for the context feature
         self._hash_map: dict[str, int] = {}
+        # Discovered config-axis schema (audit F5): built at fit(), stored in the
+        # joblib payload, and enforced at predict(). Shape:
+        #   {"numeric": [axis, ...], "categorical": {axis: [cat, ...]}}
+        self._schema: dict[str, Any] = {"numeric": [], "categorical": {}}
+        # Per-numeric-axis training means, for imputing an absent CONTEXT axis
+        # (required axes are enforced, not imputed).
+        self._numeric_means: dict[str, float] = {}
         # Per-metric target statistics for the fallback regime
         self._target_stats: dict[str, tuple[float, float]] = {
             m: (0.0, 1.0) for m in METRICS
@@ -297,6 +423,9 @@ class Surrogate:
         # Build RTL hash encoding (context feature)
         all_hashes = list({str(r.get("rtl_hash", "unknown")) for r in f3_rows})
         self._hash_map = {h: i for i, h in enumerate(sorted(all_hashes))}
+
+        # Discover the config-axis schema from the training configs (audit F5).
+        self._build_schema([_config_view(r) for r in f3_rows])
 
         # Compute obs means for imputation (from F3 rows that carry obs columns)
         obs_cols_present = {c: [] for c in _OBS_COLS}
@@ -395,6 +524,14 @@ class Surrogate:
             {metric: (mu, sigma)} for each metric in METRICS.
             If not fitted (too few rows), returns (training_mean, 2*std).
         """
+        # Cross-design guard (audit F5): a fitted surrogate refuses to predict a
+        # config that does not cover its fitted axis schema. Checked once, up
+        # front, so callers get a clear error instead of a silent misprediction
+        # (this is also what neutralizes the surrogate_n45 auto-load hazard —
+        # its callers wrap predict in try/except and degrade to no-surrogate).
+        if self._fitted and self._required_axes():
+            self._check_coverage(_config_view(x))
+
         result = {}
         for m in METRICS:
             if self._models[m] is _FALLBACK or not self._fitted:
@@ -505,7 +642,13 @@ class Surrogate:
     # ── Serialisation ─────────────────────────────────────────────────────────
 
     def save(self, path) -> None:
-        """Save the fitted surrogate to a joblib file."""
+        """Save the fitted surrogate to a joblib file.
+
+        The discovered config-axis schema (audit F5) is part of the payload —
+        it is the contract that makes fit-time and predict-time feature rows
+        agree, and what lets a loaded surrogate refuse configs from a
+        different design's space.
+        """
         payload = {
             "models": self._models,
             "obs_means": self._obs_means,
@@ -515,12 +658,21 @@ class Surrogate:
             "n_rows": self._n_rows,
             "meta": self.meta,
             "seed": self.seed,
+            "schema": self._schema,
+            "numeric_means": self._numeric_means,
         }
         joblib.dump(payload, path)
 
     @classmethod
     def load(cls, path) -> "Surrogate":
-        """Load a previously saved surrogate from a joblib file."""
+        """Load a previously saved surrogate from a joblib file.
+
+        Raises ValueError for a fitted pre-schema (pre-audit-F5) payload: its
+        models were trained on the old fixed 8-element feature layout, which
+        the current feature builder no longer produces, so predictions would
+        be silently wrong. Refit from the campaign corpus instead
+        (eda-rl fit-surrogate / python -m eda_rl.gen2.fit_surrogate).
+        """
         payload = joblib.load(path)
         s = cls(seed=payload.get("seed", 0))
         s._models = payload["models"]
@@ -530,9 +682,96 @@ class Surrogate:
         s._fitted = payload["fitted"]
         s._n_rows = payload["n_rows"]
         s.meta = payload.get("meta", {})
+        if "schema" in payload:
+            s._schema = payload["schema"]
+            s._numeric_means = payload.get("numeric_means", {})
+        elif s._fitted:
+            raise ValueError(
+                f"Surrogate.load({path}): fitted payload has no config-axis "
+                "schema — it predates the audit-F5 featurization change and "
+                "its models are incompatible with the current feature layout. "
+                "Refit the surrogate from the campaign corpus "
+                "(python -m eda_rl.gen2.fit_surrogate)."
+            )
         return s
 
     # ── Internal helpers ──────────────────────────────────────────────────────
+
+    # ── Schema construction / featurization (audit F5) ─────────────────────────
+
+    def _build_schema(self, config_views: list[dict]) -> None:
+        """Discover the config-axis schema from training config views.
+
+        A key that is numeric in every row where it appears → numeric axis.
+        A key that is ever non-numeric → categorical axis (one-hot), kept only
+        if it has ≤ _MAX_ONEHOT distinct values (rtl_hash/platform are context
+        categoricals and always kept). Numeric means are recorded for imputing
+        an absent context axis at predict time.
+        """
+        from collections import defaultdict
+
+        numeric_vals: dict[str, list[float]] = defaultdict(list)
+        cat_vals: dict[str, set] = defaultdict(set)
+        ever_nonnumeric: set[str] = set()
+        for cv in config_views:
+            for k, val in cv.items():
+                if _is_number(val):
+                    numeric_vals[k].append(float(val))
+                else:
+                    ever_nonnumeric.add(k)
+                    cat_vals[k].add(str(val))
+
+        numeric = sorted(k for k in numeric_vals if k not in ever_nonnumeric)
+        categorical: dict[str, list[str]] = {}
+        for k in sorted(cat_vals):
+            if k in _CONTEXT_AXES or len(cat_vals[k]) <= _MAX_ONEHOT:
+                categorical[k] = sorted(cat_vals[k])
+
+        self._schema = {"numeric": numeric, "categorical": categorical}
+        self._numeric_means = {
+            k: float(np.mean(v)) for k, v in numeric_vals.items() if k in set(numeric)
+        }
+
+    def _required_axes(self) -> list[str]:
+        """Axes a config MUST provide to be predictable (context axes excluded)."""
+        req = list(self._schema.get("numeric", []))
+        req += [k for k in self._schema.get("categorical", {}) if k not in _CONTEXT_AXES]
+        return req
+
+    def _featurize_config(self, cview: dict) -> list[float]:
+        """Build the config feature block from a config view using the schema."""
+        feats: list[float] = []
+        for axis in self._schema.get("numeric", []):
+            val = cview.get(axis)
+            if val is None:
+                val = self._numeric_means.get(axis, 0.0)   # context axis only
+            x = float(val)
+            if axis in _SPECIAL_LOG:
+                x = math.log2(max(x, 1.0))
+            feats.append(x)
+        for axis in sorted(self._schema.get("categorical", {})):
+            cats = self._schema["categorical"][axis]
+            cur = str(cview.get(axis, ""))
+            feats.extend(1.0 if cur == c else 0.0 for c in cats)
+        return feats
+
+    def _check_coverage(self, cview: dict) -> None:
+        """Raise if the config does not cover the schema's required axes.
+
+        This is the cross-design guard (audit F5): a surrogate fitted on one
+        design's space refuses to predict for a config from a different space
+        (e.g. a tinymac-fitted model asked about a gcd config lacking lanes, or
+        a likith-fitted model asked about a config lacking IO_DELAY).
+        """
+        missing = [a for a in self._required_axes() if cview.get(a) is None]
+        if missing:
+            raise ValueError(
+                "Surrogate.predict: incoming config does not cover the fitted "
+                f"axis schema — missing required axes {missing}. This surrogate "
+                f"was fit on axes {self._required_axes()}; predicting a config "
+                "from a different design/space would be a silent misprediction. "
+                "Refusing. Fit a surrogate on this design's corpus instead."
+            )
 
     def _build_feature_row(
         self,
@@ -547,26 +786,15 @@ class Surrogate:
         is the optional F2 observable dict passed by the caller.
         """
         flat = row_or_x  # already flat at this point
+        cview = _config_view(flat)
 
-        # Config features
-        lanes = int(flat.get("mac_lanes") or flat.get("lanes") or 4)
-        acc_w = int(flat.get("accumulator_width") or flat.get("acc_w") or 24)
-        clk   = float(flat.get("clock_period_ns") or flat.get("clk_ns") or 5.0)
-        abc_raw = flat.get("abc_recipe") or flat.get("abc") or ""
-        abc_flag = 1.0 if str(abc_raw).lower() == "area" else 0.0
-        plat_raw = flat.get("platform") or "nangate45"
-        plat_flag = 1.0 if str(plat_raw).lower() == "asap7" else 0.0
-        h = str(flat.get("rtl_hash", "unknown"))
-        hash_cat = float(self._hash_map.get(h, len(self._hash_map)))  # unseen = n+1
+        # Config features from the discovered schema (audit F5).
+        cfg_feats = self._featurize_config(cview)
 
-        # Floorplan/placement axes: kept as explicit features so matched builds
-        # that differ ONLY in util/density do not collapse to identical rows
-        # (the EXP-F3 leak). Default to the funnel-frozen values when absent.
-        util    = float(flat.get("util", 40) or 40)
-        density = float(flat.get("density", 0.60) or 0.60)
-
-        cfg_feats = [math.log2(max(lanes, 1)), float(acc_w), clk, abc_flag,
-                     plat_flag, hash_cat, util, density]
+        # For the obs_index training-time join we still key on (lanes, acc_w, clk).
+        lanes = int(cview.get("lanes") or 4)
+        acc_w = int(cview.get("acc_w") or 24)
+        clk   = float(cview.get("clk_ns") or 5.0)
 
         # Resolve obs: priority = explicit obs_dict > obs from the row itself >
         # obs looked up from obs_index (training time join)
