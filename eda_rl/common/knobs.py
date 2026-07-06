@@ -557,9 +557,16 @@ def _build_knobs() -> list[Knob]:
             name="CORE_UTILIZATION",
             tier=1,
             stage="floorplan",
-            type="float",
-            range=(20.0, 60.0),
-            default=40.0,
+            # int, not float: ORFS emits CORE_UTILIZATION as an integer percentage
+            # and the funnel truncates it to int before the build, so a sampled
+            # 6.01 vs 6.99 are the SAME physical build but hashed to different
+            # variant dirs (cache misses) and shown to Optuna as distinct levels
+            # (audit F9).  Declaring it int makes sampler/log/variant/emission
+            # agree.  Per-design float override ranges (e.g. likith [3.0, 7.0])
+            # still work: space() runs suggest_int(int(lo), int(hi)).
+            type="int",
+            range=(20, 60),
+            default=40,
             _emit_template="export CORE_UTILIZATION = {v}",
             notes=(
                 "Verified tunable=1 in variables.yaml (stages: floorplan). "

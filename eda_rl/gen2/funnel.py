@@ -929,7 +929,10 @@ class FunnelEnv:
         # from the sampled config, falling back to design-fixed constants, then
         # to the historical defaults (40 / 0.60).
         eff = self._effective_orfs_knobs()
-        util    = int(eff.pop("CORE_UTILIZATION", 40))
+        # CORE_UTILIZATION is an int knob (audit F9), but a design's fixed/override
+        # value may still arrive as a float (e.g. YAML default 5.0); round rather
+        # than truncate so 6.99 -> 7, not 6, and sampler/log/variant/emission agree.
+        util    = int(round(float(eff.pop("CORE_UTILIZATION", 40))))
         density = float(eff.pop("PLACE_DENSITY", 0.60))
         knob_values = eff
         # M3: lanes/acc_w are RTL chparams.  For designs without them (e.g. gcd,
