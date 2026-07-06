@@ -135,10 +135,21 @@ FIDELITY_COST_S: dict[str, float] = {
 # Ordered fidelity list (F4 is asap7 and not used in the standard promote chain)
 _FIDELITY_ORDER = ["F0", "F1", "F2", "F3"]
 
-# Platform normalisations for state dim [2] (clock)
+# Legacy platform normalisations for state dim [2] (clock).  Used only for the
+# TinyVAD / no-design / clock-range-missing fallback path — generic designs
+# normalise per their own declared clock_range_ns (F10, see _build_state).
 _CLK_NORM: dict[str, tuple[float, float]] = {
     "nangate45": (3.0, 5.0),   # (offset, scale): (clk - 3.0) / 5.0
     "asap7":     (0.3, 1.2),   # (clk - 0.3) / 1.2
+}
+
+# Platform ordinal for state dim [4] (F10): a 3-level ordinal within the fixed
+# 22-dim contract, replacing the old binary asap7-vs-rest flag that encoded
+# sky130hd as nangate45.  nangate45/asap7 keep 0.0/1.0 (tinymac unchanged).
+_PLATFORM_ORDINAL: dict[str, float] = {
+    "nangate45": 0.0,
+    "sky130hd":  0.5,
+    "asap7":     1.0,
 }
 
 from eda_rl.gen2.state_spec import STATE_DIM as _STATE_DIM  # canonical 22-dim spec
@@ -328,22 +339,54 @@ def _build_state(
     depth: int,                         # 0=F0, 1=F1, 2=F2, 3=F3
     surrogate_reward_kind: str = "tinyvad",
     surrogate_refs: dict | None = None,
+    design: Any | None = None,
 ) -> np.ndarray:
     lanes  = int(config.get("mac_lanes", 1))        # 1 = sentinel for generic designs
     acc_w  = int(config.get("accumulator_width", 24))  # 24 = default for generic designs
     clk    = float(config["clock_period_ns"])
     recipe = config.get("abc_recipe", "plain")
 
-    clk_offset, clk_scale = _CLK_NORM.get(platform, (3.0, 5.0))
-    plat_flag = 1.0 if platform == "asap7" else 0.0
     recipe_idx = _RECIPE_IDX.get(recipe, 2)
+
+    # Clock (state[2]) and WNS (state[10]) normalisation (F10).
+    #   Generic (non-TinyVAD) designs: normalise per the design's OWN declared
+    #   clock range — (clk-lo)/(hi-lo) — so narrow / sub-ns platforms (asap7,
+    #   sky130hd) span the full [0,1] scale instead of ~2% of a fixed nangate45
+    #   ruler, and normalise WNS by the actual clock period (wns/clk) so the
+    #   FixedGate clock-relative kill rule (F11) is computable from state[10].
+    #   TinyVAD / legacy / no-design path: keep the fixed platform table
+    #   (_CLK_NORM) and the fixed /5-ns WNS ruler for bit-exact compat — saved
+    #   LinUCB agents and the benchmark tables assume it.  (nangate45 tinymac is
+    #   identical either way since _CLK_NORM nangate45 == (3, 8-3); the legacy
+    #   path additionally pins tinymac's asap7 numbers.)
+    wns_scale = 5.0                         # legacy fixed /5-ns WNS ruler
+    clk_range: tuple[float, float] | None = None
+    if design is not None:
+        try:
+            if not design.is_tinyvad():
+                cr = (design.platforms.get(platform) or {}).get("clock_range_ns")
+                if cr and len(cr) == 2 and float(cr[1]) > float(cr[0]):
+                    clk_range = (float(cr[0]), float(cr[1]))
+        except Exception:  # noqa: BLE001
+            clk_range = None
+    if clk_range is not None:
+        clk_lo, clk_hi = clk_range
+        d2 = (clk - clk_lo) / (clk_hi - clk_lo)
+        wns_scale = max(clk, 1e-9)          # normalise WNS by the clock period
+    else:
+        clk_offset, clk_scale = _CLK_NORM.get(platform, (3.0, 5.0))
+        d2 = (clk - clk_offset) / clk_scale
 
     # [0..4] config encoding
     d0 = math.log2(max(lanes, 1)) / 5.0
     d1 = (acc_w - 16) / 16.0
-    d2 = (clk - clk_offset) / clk_scale
     d3 = recipe_idx / 2.0
-    d4 = plat_flag
+    # [4] platform ordinal: 0.0 = nangate45, 0.5 = sky130hd, 1.0 = asap7 (F10).
+    # Was a binary asap7-vs-rest flag that silently encoded sky130hd as
+    # nangate45; the ordinal separates the three platforms within the fixed
+    # 22-dim contract.  nangate45/asap7 keep their old values (0.0/1.0), so
+    # tinymac is unchanged; only sky130hd (sagar) moves 0.0 -> 0.5.
+    d4 = _PLATFORM_ORDINAL.get(platform, 0.0)
 
     # [5..6] F0 analytic
     d5 = math.log2(SW_BASELINE_CYCLES / max(f0_cycles, 1.0)) / 10.0
@@ -363,7 +406,7 @@ def _build_state(
         raw_area = f2_obs.get("area_um2")
         raw_wns  = f2_obs.get("wns_ns")
         d9  = float(np.clip(raw_area / 20000.0, 0.0, 3.0)) if raw_area is not None else 0.0
-        d10 = float(np.clip((raw_wns or 0.0) / 5.0, -2.0, 2.0))
+        d10 = float(np.clip((raw_wns or 0.0) / wns_scale, -2.0, 2.0))
         # netlist stats (cells/FF count) from F2 proxy result
         ff_count    = f2_obs.get("ff_count")    or f2_obs.get("cells") or 0
         cell_count  = f2_obs.get("cell_count") or f2_obs.get("cells") or 0
@@ -1232,6 +1275,7 @@ class FunnelEnv:
             depth=self._depth,
             surrogate_reward_kind=kind,
             surrogate_refs=refs,
+            design=self._design_spec,
         )
 
     def _log_row(self, fidelity: str, obs: dict, cost_s: float, status: str) -> None:
