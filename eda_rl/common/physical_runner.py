@@ -51,12 +51,15 @@ DESIGN-AGNOSTIC EXTENSION (V12):
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import os
 import re
 import shutil
 import signal
 import subprocess
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from eda_rl.common.recipe import (
@@ -211,6 +214,62 @@ def _run_capture(cmd: "list[str]", cwd: str, timeout: int) -> subprocess.Complet
         proc.wait()
         raise
     return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+
+
+def _staged_src_subdir(design: "Any") -> str:
+    """Content-addressed RTL staging subdir under src/ (audit F13).
+
+    Staging into ``src/<design>_<rtlhash8>/`` (not the shared ``src/<design>/``)
+    makes the staged source immutable per RTL-content hash.  Before this, two
+    campaigns on the same design name but different RTL content (an edited working
+    tree vs an older checkout sharing one EDA_RL_WORK) both wrote
+    ``src/<design>/<file>``; campaign B's copy would poison campaign A's next
+    build, which then synthesised B's RTL into a variant dir whose name claims
+    A's hash — a permanently poisoned cache.  The variant name already embeds the
+    same ``design.rtl_hash()``, so the staging dir and the results dir stay in
+    lockstep.  (Legacy design=None tinymac path keeps the flat ``src/<DESIGN>/``.)
+    """
+    return f"{design.name}_{design.rtl_hash()}"
+
+
+@contextmanager
+def _variant_build_lock(var: str, gds: "Path"):
+    """Exclusive per-variant build lock around the ORFS make invocation (F13).
+
+    Yields True if we acquired the lock (the caller should build), or False if
+    another process already holds it — meaning an identical config from another
+    seed/campaign sharing this EDA_RL_WORK is building the same variant, whose
+    ``config_<var>.mk`` / ``results/<plat>/<design>/<var>/`` paths we'd otherwise
+    race on.  When the lock is contended we DON'T double-build: we poll (every
+    2 s, up to ORFS_TIMEOUT) until either the result GDS appears (reuse it) or the
+    other builder releases the lock (it finished or failed — then we take the lock
+    and build).  Non-blocking throughout, so a stuck peer can't wedge us forever.
+    """
+    lock_dir = RUN_DIR / "locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_fh = open(lock_dir / f"{var}.lock", "w")
+    have_lock = False
+    try:
+        try:
+            fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            have_lock = True
+        except OSError:
+            # Held by another process building this exact variant — wait it out.
+            deadline = time.time() + ORFS_TIMEOUT
+            while time.time() < deadline:
+                if gds.exists():
+                    break                       # peer produced the GDS → reuse
+                try:
+                    fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    have_lock = True
+                    break                       # peer released → we build
+                except OSError:
+                    time.sleep(2.0)
+        yield have_lock
+    finally:
+        if have_lock:
+            fcntl.flock(lock_fh, fcntl.LOCK_UN)
+        lock_fh.close()
 
 
 def variant_name(lanes: int, acc_w: int, clk_ns: float,
@@ -483,14 +542,18 @@ def _config_mk(platform: str, variant: str, lanes: int, acc_w: int,
     # For external absolute paths (e.g. gcd from ORFS), we must use the
     # absolute path directly since we copy to src/<design>/<filename>.
     rtl_fnames = [Path(f).name for f in design.rtl_files]
+    # F13: point VERILOG_FILES at the content-addressed staging dir that
+    # _stage_inputs copied into (src/<design>_<rtlhash8>/), never the shared
+    # src/<design>/ that a concurrent differing-RTL campaign could overwrite.
+    src_sub = _staged_src_subdir(design)
     if len(rtl_fnames) == 1:
         vfile_lines = (
-            f"export VERILOG_FILES = $(DESIGN_HOME)/src/{design_name}/{rtl_fnames[0]}\n"
+            f"export VERILOG_FILES = $(DESIGN_HOME)/src/{src_sub}/{rtl_fnames[0]}\n"
         )
     else:
-        first = f"$(DESIGN_HOME)/src/{design_name}/{rtl_fnames[0]}"
+        first = f"$(DESIGN_HOME)/src/{src_sub}/{rtl_fnames[0]}"
         rest  = " \\\n".join(
-            f"                       $(DESIGN_HOME)/src/{design_name}/{fn}"
+            f"                       $(DESIGN_HOME)/src/{src_sub}/{fn}"
             for fn in rtl_fnames[1:]
         )
         vfile_lines = f"export VERILOG_FILES = {first} \\\n{rest}\n"
@@ -631,7 +694,10 @@ def _stage_inputs(platform: str, variant: str, lanes: int, acc_w: int, clk_ns: f
     # ── Design-agnostic path ─────────────────────────────────────────────────
     design_name = design.name
     cfgdir = MAKE_DIR / platform / design_name
-    srcdir = MAKE_DIR / "src" / design_name
+    # F13: stage RTL into a content-addressed dir (src/<design>_<rtlhash8>/) so
+    # concurrent campaigns on the same design name but different RTL can't
+    # overwrite each other's source.  _config_mk points VERILOG_FILES here.
+    srcdir = MAKE_DIR / "src" / _staged_src_subdir(design)
     srcdir.mkdir(parents=True, exist_ok=True)
     cfgdir.mkdir(parents=True, exist_ok=True)
 
@@ -817,43 +883,53 @@ def run_physical(lanes: int, acc_w: int, clk_ns: float, platform: str = "nangate
             f"FLOW_HOME='{ORFS_DIR}/flow' WORK_HOME='{RUN_DIR}' "
             f"DESIGN_CONFIG='{gen_cfg}' FLOW_VARIANT='{var}'"
         )
-        # V10: use Popen + communicate(timeout) + start_new_session so we can
-        # kill the entire process group on TimeoutExpired (not just the bash wrapper).
-        proc = subprocess.Popen(
-            ["bash", "-c", make_cmd], cwd=str(MAKE_DIR),
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            start_new_session=True,
-        )
-        try:
-            stdout, stderr = proc.communicate(timeout=ORFS_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            # Kill the entire process group (yosys/openroad children included).
-            _killpg(proc)
-            proc.wait()
-            log_path = RUN_DIR / f"opt_{var}.log"
-            log_path.write_text(f"[TIMEOUT after {ORFS_TIMEOUT}s]\n")
-            # V10: return TIMEOUT status (never raise); do NOT cache so the config
-            # can be retried and the agent can update on it.
-            return {**base, "status": "TIMEOUT",
-                    "area_um2": None, "util_pct": None, "wns_ns": None,
-                    "tns_ns": None, "setup_viol": None, "power_mw": None,
-                    "fmax_mhz": None, "period_min_ns": None,
-                    "timing_met": None, "gds": None, "report": str(log_path)}
-        except BaseException:
-            # Any other failure during communicate() (decode error, OSError,
-            # KeyboardInterrupt, ...) — start_new_session=True detaches the
-            # child from our process group, so nothing else will reap the
-            # yosys/openroad grandchildren unless we kill them here too.
-            _killpg(proc)
-            proc.wait()
-            raise
+        # F13: hold an exclusive per-variant lock across the make invocation so
+        # two identical configs (e.g. two seeds sharing this EDA_RL_WORK) don't
+        # race on config_<var>.mk / results/<var>/.  When the lock is contended
+        # _variant_build_lock polls for the peer's GDS instead of double-building;
+        # have_lock=False + a re-checked existing GDS means "reuse the peer's".
+        with _variant_build_lock(var, gds) as have_lock:
+            if have_lock and not gds.exists():
+                # V10: use Popen + communicate(timeout) + start_new_session so we can
+                # kill the entire process group on TimeoutExpired (not just the bash wrapper).
+                proc = subprocess.Popen(
+                    ["bash", "-c", make_cmd], cwd=str(MAKE_DIR),
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                    start_new_session=True,
+                )
+                try:
+                    stdout, stderr = proc.communicate(timeout=ORFS_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    # Kill the entire process group (yosys/openroad children included).
+                    _killpg(proc)
+                    proc.wait()
+                    log_path = RUN_DIR / f"opt_{var}.log"
+                    log_path.write_text(f"[TIMEOUT after {ORFS_TIMEOUT}s]\n")
+                    # V10: return TIMEOUT status (never raise); do NOT cache so the config
+                    # can be retried and the agent can update on it.  (The lock is
+                    # released by the context manager on return.)
+                    return {**base, "status": "TIMEOUT",
+                            "area_um2": None, "util_pct": None, "wns_ns": None,
+                            "tns_ns": None, "setup_viol": None, "power_mw": None,
+                            "fmax_mhz": None, "period_min_ns": None,
+                            "timing_met": None, "gds": None, "report": str(log_path)}
+                except BaseException:
+                    # Any other failure during communicate() (decode error, OSError,
+                    # KeyboardInterrupt, ...) — start_new_session=True detaches the
+                    # child from our process group, so nothing else will reap the
+                    # yosys/openroad grandchildren unless we kill them here too.
+                    _killpg(proc)
+                    proc.wait()
+                    raise
 
-        # Persist the flow output so a failure is debuggable.
-        (RUN_DIR / f"opt_{var}.log").write_text(
-            (stdout or "") + "\n--- stderr ---\n" + (stderr or "")
-        )
-        if proc.returncode != 0:
-            flow_status = "FAIL"
+                # Persist the flow output so a failure is debuggable.
+                (RUN_DIR / f"opt_{var}.log").write_text(
+                    (stdout or "") + "\n--- stderr ---\n" + (stderr or "")
+                )
+                if proc.returncode != 0:
+                    flow_status = "FAIL"
+            # else: a concurrent peer built (or is building) this variant and its
+            # GDS now exists — fall through and parse the shared results.
 
     metrics = _parse_metrics(RUN_DIR, platform, var, clk_ns,
                              design_name=actual_design_name)
