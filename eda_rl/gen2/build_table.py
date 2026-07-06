@@ -713,8 +713,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--out",
-        default=str(_THIS_DIR.parent / "results" / "gen2" / "results_funnel.jsonl"),
-        help="Output JSONL file path",
+        default=None,
+        help="Output JSONL file path (default: results/gen2/results_funnel.jsonl; "
+             "under PHYSICAL_MOCK, a temp path unless --out is given explicitly, "
+             "so mock rows never land in the tracked results file — audit F17/R8)",
     )
     parser.add_argument(
         "--fidelity",
@@ -768,9 +770,22 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    # F17/R8: PHYSICAL_MOCK=1 build_table (a canonical self-test) must not append
+    # mock rows to the tracked results file.  When --out is not given explicitly,
+    # default to the tracked path normally, but to a temp path under mock mode.
+    if args.out is not None:
+        out_path = Path(args.out)
+    elif os.environ.get("PHYSICAL_MOCK"):
+        import tempfile
+        out_path = Path(tempfile.gettempdir()) / "eda_rl_build_table_mock.jsonl"
+        print(f"  [PHYSICAL_MOCK] --out not given; writing mock rows to {out_path} "
+              f"(not the tracked results/gen2/results_funnel.jsonl)")
+    else:
+        out_path = _THIS_DIR.parent / "results" / "gen2" / "results_funnel.jsonl"
+
     run_table_builder(
         space_path=Path(args.space),
-        out_path=Path(args.out),
+        out_path=out_path,
         target_fidelity=args.fidelity,
         limit=args.limit,
         subset=args.subset,

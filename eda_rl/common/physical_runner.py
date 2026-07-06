@@ -169,6 +169,37 @@ _physical_cache: dict[tuple, dict] = {}
 _synth_sta_cache: dict[tuple, dict] = {}
 
 
+# ── validate_config warning rate-limiter (audit F17/R8) ───────────────────────
+# A single sagar campaign emitted the same PLACE_DENSITY/LB_ADDON exclusivity
+# warning to stderr on ~1,400 episodes.  Print each DISTINCT warning once per
+# process; count repeats and summarise the suppressed counts at process exit.
+_seen_knob_warnings: dict[str, int] = {}
+_knob_warn_atexit_registered = False
+
+
+def _flush_knob_warning_counts() -> None:
+    import sys as _sys
+    for msg, n in _seen_knob_warnings.items():
+        if n > 1:
+            print(f"[physical_runner] knob warning (repeated {n}×, "
+                  f"{n - 1} suppressed after the first): {msg}", file=_sys.stderr)
+
+
+def _warn_knob_once(msg: str) -> None:
+    """Print a validate_config warning the first time it's seen; suppress repeats
+    (counted and summarised at exit)."""
+    import sys as _sys
+    global _knob_warn_atexit_registered
+    n = _seen_knob_warnings.get(msg, 0)
+    _seen_knob_warnings[msg] = n + 1
+    if n == 0:
+        print(f"[physical_runner] knob warning: {msg}", file=_sys.stderr)
+        if not _knob_warn_atexit_registered:
+            import atexit
+            atexit.register(_flush_knob_warning_counts)
+            _knob_warn_atexit_registered = True
+
+
 # ── Subprocess helpers (process-group-safe) ───────────────────────────────────
 
 def _killpg(proc: "subprocess.Popen") -> None:
@@ -408,6 +439,10 @@ def _parse_metrics(work: Path, platform: str, variant: str, clk_ns: float,
             ff = jd.get("finish__design__instance__count__class:sequential_cell")
             if sc is not None:
                 out["cell_count"] = int(sc)
+            # F17: a purely combinational design (e.g. likith) has no sequential
+            # cells, so 6_report.json omits this key — ff_count legitimately stays
+            # None (its initialised value), no warning.  The AGENTS.md "F3 carries
+            # a real FF count" invariant holds "when present".
             if ff is not None:
                 out["ff_count"] = int(ff)
         except (OSError, ValueError, TypeError):
@@ -595,10 +630,9 @@ def _config_mk(platform: str, variant: str, lanes: int, acc_w: int,
     if knob_values:
         try:
             from eda_rl.common.knobs import validate_config as _vc, KnobRegistry
-            import sys as _sys
             warnings = _vc(knob_values)
             for w in warnings:
-                print(f"[physical_runner] knob warning: {w}", file=_sys.stderr)
+                _warn_knob_once(w)   # F17/R8: rate-limit repeated warnings
             reg = KnobRegistry.load()
             # Only emit knobs that are not already emitted above (util/density/abc/vtp).
             # CLOCK_UNCERTAINTY/IO_DELAY are SDC-owned (written by _stage_inputs via

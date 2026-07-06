@@ -1,6 +1,6 @@
 """optimizer/common/knobs.py — design-agnostic ORFS knob registry.
 
-The original 28 knobs are transcribed from /tmp/knobs_research.yaml (the
+The original 24 knobs are transcribed from /tmp/knobs_research.yaml (the
 evidence-annotated research pass over ORFS variables.yaml and AutoTuner JSON
 configs).  3 more (CLOCK_UNCERTAINTY, IO_DELAY, GR_SEED) were added later to
 close an autotuner.json parity gap for a specific design (asap7, no merged
