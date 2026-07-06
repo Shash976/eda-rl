@@ -123,6 +123,35 @@ def _load_space(space_path: Path) -> dict:
     return space
 
 
+def _clock_grid(lo: float, hi: float) -> list[float]:
+    """Return a clock-period grid for the range [lo, hi], derived from the range.
+
+    Uses a step of (hi - lo) / 10 (≈ 11 points) rather than the old hardcoded
+    0.5 ns step (audit F6).  On sub-ns ranges (e.g. likith's [0.045, 0.070]) the
+    0.5 ns step produced only two points and put the *second* one (0.545)
+    outside the design's own declared range; deriving the step from the range
+    keeps every point in-range and gives a real grid.  Degenerate ranges
+    (lo == hi) yield a single point.  All returned points are asserted to lie
+    within [lo, hi].
+    """
+    lo, hi = float(lo), float(hi)
+    if hi < lo:
+        lo, hi = hi, lo
+    span = hi - lo
+    if span <= 0:
+        grid = [round(lo, 6)]
+    else:
+        step = span / 10.0
+        # at least 1 interval => at least 2 points for a non-degenerate range
+        n_int = max(int(round(span / step)), 1)
+        raw = [lo + i * step for i in range(n_int + 1)]
+        # clamp to guard against float drift past hi, round, and dedupe
+        grid = sorted({round(min(max(c, lo), hi), 6) for c in raw})
+    assert all(lo - 1e-9 <= c <= hi + 1e-9 for c in grid), \
+        f"_clock_grid produced out-of-range points {grid} for [{lo}, {hi}]"
+    return grid
+
+
 def _enumerate_grid(space: dict) -> list[dict]:
     """Generate all (lanes, acc_w, clk, recipe) combos.
 
@@ -538,8 +567,10 @@ def run_table_builder(
                 cspec = knob_space["clock_period_ns"]
                 if "range" in cspec:
                     lo, hi = cspec["range"]
-                    steps = max(int(round((hi - lo) / 0.5)), 1)
-                    space["clks"] = [round(lo + i * 0.5, 4) for i in range(steps + 1)]
+                    # Derive the grid step from the range (audit F6): a hardcoded
+                    # 0.5 ns step overshot sub-ns ranges (likith [0.045,0.070] ->
+                    # a second point at 0.545, outside the range).
+                    space["clks"] = _clock_grid(lo, hi)
             if "abc_recipe" in knob_space:
                 rspec = knob_space["abc_recipe"]
                 if "choices" in rspec:
@@ -765,6 +796,19 @@ def _selftest() -> None:
     }
     configs = _enumerate_grid(space)
     assert len(configs) == 2 * 2 * 2 * 1  # 8
+
+    # F6: clock grid derived from range stays in-range, even for sub-ns ranges.
+    likith_clks = _clock_grid(0.045, 0.070)
+    assert len(likith_clks) >= 2, f"expected >=2 clock points, got {likith_clks}"
+    assert all(0.045 <= c <= 0.070 for c in likith_clks), \
+        f"likith clock grid escapes [0.045, 0.070]: {likith_clks}"
+    assert min(likith_clks) == 0.045 and max(likith_clks) == 0.070, \
+        f"likith clock grid should span the full range, got {likith_clks}"
+    # degenerate range -> single point
+    assert _clock_grid(5.0, 5.0) == [5.0], _clock_grid(5.0, 5.0)
+    # nangate45-style range still yields a sane multi-point grid
+    n45_clks = _clock_grid(3.0, 8.0)
+    assert all(3.0 <= c <= 8.0 for c in n45_clks) and len(n45_clks) >= 2
 
     strat = _strategic_subset(space)
     # Strategic: (2 lanes × 2 acc_ws × 1 clk_nearest_4 × 1 recipe = 4) + clk sweep (2×1) = 6 - dedup
