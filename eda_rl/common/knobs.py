@@ -13,6 +13,26 @@ Tiers:
     3 — fine-tuning: CTS / timing-repair / routing params
     4 — macro-only: active only when design.has_macros is True
 
+Knob ontology (R6) — each Knob declares `affects`:
+    "netlist"     — synthesis/recipe/RTL-param axes (they change the gates)
+    "layout"      — floorplan/place/CTS/route axes (they change the chip)
+    "constraints" — SDC axes (CLOCK_UNCERTAINTY, IO_DELAY) that change the
+                    *measurement question* rather than the chip
+    "environment" — flow noise (GR_SEED) that does not change the chip
+
+Opt-in constraint/environment knobs (R6 + F7):
+    Knobs with affects in {"constraints", "environment"} — EXCEPT CLOCK_PERIOD,
+    which is the performance target and always on — do NOT enter a design's
+    search space automatically.  They are opt-in per design: they enter
+    space() only when the design YAML names them, either under `knobs.override`
+    or a new optional `knobs.enable: [NAME, ...]` list (presence in `override`
+    implies enable).  Rationale (audit F1/F7): these knobs relax the very SDC
+    the reward is measured against (IO_DELAY/CLOCK_UNCERTAINTY) or let the
+    optimizer cherry-pick lucky routing noise (GR_SEED); auto-adding them to
+    every tier-2+ design silently changed objective semantics for all existing
+    designs and enabled reward gaming.  A design that genuinely wants to tune
+    them (e.g. likith, which overrides all three) opts in via its YAML.
+
 Emit convention:
     Knob.emit_lines(value) → list[str] of "export NAME = value" strings
     ready to append to a config.mk fragment.
@@ -48,6 +68,17 @@ class Knob:
     default: Any
     range: tuple | None = None       # (lo, hi) for int/float
     choices: list | None = None      # for categorical
+    # Knob ontology (R6): what the knob actually changes.
+    #   "netlist"     — synthesis / recipe / RTL-parameter axes (change the gates)
+    #   "layout"      — floorplan / place / CTS / route axes (change the chip)
+    #   "constraints" — SDC axes that change the *measurement question*
+    #                   (CLOCK_UNCERTAINTY, IO_DELAY). CLOCK_PERIOD is the
+    #                   deliberate exception: it is the performance *target* and
+    #                   stays always-on.
+    #   "environment" — flow noise that does not change the chip (GR_SEED).
+    # "constraints"/"environment" knobs (except CLOCK_PERIOD) are OPT-IN in
+    # space() — see KnobRegistry.space() and the module docstring.
+    affects: str = "layout"
     # Internal emit template; {v} is replaced by the value.
     # Empty string "" means the caller handles emission (CLOCK_PERIOD / VERILOG_TOP_PARAMS /
     # CLOCK_UNCERTAINTY / IO_DELAY / GR_SEED).
@@ -214,6 +245,17 @@ class KnobRegistry:
         design = self._resolve_design(design)
         space: dict[str, dict] = {}
 
+        # Opt-in set for constraint/environment knobs (R6 + F7).  A design opts
+        # a constraint/environment knob into its space by naming it under
+        # knobs.override or the optional knobs.enable list; presence in either
+        # is enough (override implies enable).  CLOCK_PERIOD is exempt (it is
+        # always-on — the performance target, not a measurement-relaxing knob).
+        knob_cfg = getattr(design, "knobs", None) or {}
+        if not isinstance(knob_cfg, dict):
+            knob_cfg = {}
+        _opt_in: set[str] = set(knob_cfg.get("enable") or [])
+        _opt_in |= set((knob_cfg.get("override") or {}).keys())
+
         # 1. RTL parameter axes from design.params
         # Each param entry may carry 'rtl_param_name'; the search-space axis name
         # is the canonical param name (e.g. mac_lanes), NOT the RTL chparam name.
@@ -270,6 +312,12 @@ class KnobRegistry:
         for knob in self.active(max_tier, design):
             if knob.name in _SKIP:
                 continue
+            # Opt-in gate (R6 + F7): constraint/environment knobs enter the
+            # space only when the design opted them in (via knobs.override or
+            # knobs.enable).  CLOCK_PERIOD is already handled in step 2 / _SKIP,
+            # so it never reaches here.
+            if knob.affects in ("constraints", "environment") and knob.name not in _opt_in:
+                continue
             entry: dict = {"type": _SPACE_TYPE.get(knob.type, knob.type),
                            "default": knob.default}
             if knob.choices is not None:
@@ -284,7 +332,7 @@ class KnobRegistry:
         #    shared search_space_funnel.yaml.  Fixed/excluded axes are removed
         #    from the sampled space; their constant values are applied to the
         #    build by FunnelEnv._effective_orfs_knobs().
-        knob_cfg = getattr(design, "knobs", None) or {}
+        # (knob_cfg was normalized to a dict above.)
         if isinstance(knob_cfg, dict):
             for name in set(knob_cfg.get("exclude") or []):
                 space.pop(name, None)
@@ -429,6 +477,7 @@ def _build_knobs() -> list[Knob]:
 
         Knob(
             name="VERILOG_TOP_PARAMS",
+            affects="netlist",
             tier=1,
             stage="rtl",
             type="categorical",
@@ -454,6 +503,7 @@ def _build_knobs() -> list[Knob]:
 
         Knob(
             name="CLOCK_PERIOD",
+            affects="constraints",   # deliberate exception: always-on target, see space()
             tier=1,
             stage="sdc",
             type="pseudo_sdc",
@@ -481,6 +531,7 @@ def _build_knobs() -> list[Knob]:
 
         Knob(
             name="CLOCK_UNCERTAINTY",
+            affects="constraints",
             tier=2,
             stage="sdc",
             type="pseudo_sdc",
@@ -493,9 +544,13 @@ def _build_knobs() -> list[Knob]:
                 "AutoTuner pseudo-knob (_SDC_UNCERTAINTY) -> set_clock_uncertainty "
                 "in constraint.sdc. NOT a config.mk variable — written to the SDC "
                 "by physical_runner.py, same mechanism as CLOCK_PERIOD. "
-                "Not sampled unless a design's active knob space includes it "
-                "(tier 2+); when absent, no set_clock_uncertainty line is "
-                "emitted at all (original SDC behavior, unchanged)."
+                "OPT-IN (affects='constraints', R6/F7): even at --max-tier 2+ "
+                "this axis enters the search space ONLY when the design YAML "
+                "names it under knobs.override or knobs.enable — it relaxes the "
+                "very SDC the reward is measured against (audit F1), so it must "
+                "be a per-design opt-in decision. When absent, no "
+                "set_clock_uncertainty line is emitted at all (original SDC "
+                "behavior, unchanged)."
             ),
             evidence=(
                 "AutoTuner exposes this on some designs (e.g. asap7 blocks) as a "
@@ -506,6 +561,7 @@ def _build_knobs() -> list[Knob]:
 
         Knob(
             name="IO_DELAY",
+            affects="constraints",
             tier=2,
             stage="sdc",
             type="pseudo_sdc",
@@ -518,8 +574,12 @@ def _build_knobs() -> list[Knob]:
                 "AutoTuner pseudo-knob (_SDC_IO_DELAY) -> set_input_delay / "
                 "set_output_delay in constraint.sdc, replacing the fixed "
                 "clk_period*0.2 fraction the SDC otherwise uses. NOT a config.mk "
-                "variable. Not sampled unless a design's active knob space "
-                "includes it (tier 2+); when absent, the original "
+                "variable. OPT-IN (affects='constraints', R6/F7): enters the "
+                "search space ONLY when the design YAML names it under "
+                "knobs.override or knobs.enable — for combinational designs the "
+                "min period is largely io_delay_in + comb + io_delay_out, so "
+                "sampling it lets the optimizer game the reward by loosening "
+                "its own I/O budget (audit F1). When absent, the original "
                 "clk_period*0.2 fraction is used (unchanged)."
             ),
             evidence=(
@@ -531,6 +591,7 @@ def _build_knobs() -> list[Knob]:
 
         Knob(
             name="ABC_AREA",
+            affects="netlist",
             tier=1,
             stage="synth",
             type="categorical",
@@ -555,6 +616,7 @@ def _build_knobs() -> list[Knob]:
 
         Knob(
             name="CORE_UTILIZATION",
+            affects="layout",
             tier=1,
             stage="floorplan",
             # int, not float: ORFS emits CORE_UTILIZATION as an integer percentage
@@ -588,6 +650,7 @@ def _build_knobs() -> list[Knob]:
 
         Knob(
             name="CORE_ASPECT_RATIO",
+            affects="layout",
             tier=2,
             stage="floorplan",
             type="float",
@@ -609,6 +672,7 @@ def _build_knobs() -> list[Knob]:
 
         Knob(
             name="CORE_MARGIN",
+            affects="layout",
             tier=2,
             stage="floorplan",
             type="float",
@@ -629,6 +693,7 @@ def _build_knobs() -> list[Knob]:
 
         Knob(
             name="PLACE_DENSITY",
+            affects="layout",
             tier=2,
             stage="place",
             type="float",
@@ -651,6 +716,7 @@ def _build_knobs() -> list[Knob]:
 
         Knob(
             name="PLACE_DENSITY_LB_ADDON",
+            affects="layout",
             tier=2,
             stage="place",
             type="float",
@@ -674,6 +740,7 @@ def _build_knobs() -> list[Knob]:
 
         Knob(
             name="CELL_PAD_IN_SITES_GLOBAL_PLACEMENT",
+            affects="layout",
             tier=2,
             stage="place",
             type="int",
@@ -695,6 +762,7 @@ def _build_knobs() -> list[Knob]:
 
         Knob(
             name="CELL_PAD_IN_SITES_DETAIL_PLACEMENT",
+            affects="layout",
             tier=2,
             stage="place",
             type="int",
@@ -719,6 +787,7 @@ def _build_knobs() -> list[Knob]:
 
         Knob(
             name="CTS_CLUSTER_SIZE",
+            affects="layout",
             tier=3,
             stage="cts",
             type="int",
@@ -741,6 +810,7 @@ def _build_knobs() -> list[Knob]:
 
         Knob(
             name="CTS_CLUSTER_DIAMETER",
+            affects="layout",
             tier=3,
             stage="cts",
             type="float",
@@ -762,6 +832,7 @@ def _build_knobs() -> list[Knob]:
 
         Knob(
             name="TNS_END_PERCENT",
+            affects="layout",
             tier=3,
             stage="cts",
             type="float",
@@ -784,6 +855,7 @@ def _build_knobs() -> list[Knob]:
 
         Knob(
             name="SETUP_SLACK_MARGIN",
+            affects="layout",
             tier=3,
             stage="cts",
             type="float",
@@ -806,6 +878,7 @@ def _build_knobs() -> list[Knob]:
 
         Knob(
             name="ROUTING_LAYER_ADJUSTMENT",
+            affects="layout",
             tier=3,
             stage="grt",
             type="float",
@@ -829,6 +902,7 @@ def _build_knobs() -> list[Knob]:
 
         Knob(
             name="GR_SEED",
+            affects="environment",
             tier=3,
             stage="grt",
             type="pseudo_fastroute",
@@ -838,8 +912,11 @@ def _build_knobs() -> list[Knob]:
             notes=(
                 "AutoTuner equivalent: _FR_GR_SEED -> set_global_routing_random "
                 "-seed N, written into a per-variant fastroute.tcl (NOT a config.mk "
-                "variable). Not sampled unless a design's active knob space "
-                "includes it (tier 3+); when absent, no custom fastroute.tcl is "
+                "variable). OPT-IN (affects='environment', R6/F7): enters the "
+                "search space ONLY when the design YAML names it under "
+                "knobs.override or knobs.enable — the seed changes routing noise, "
+                "not the chip, so sampling it lets the optimizer cherry-pick a "
+                "lucky routing draw. When absent, no custom fastroute.tcl is "
                 "written and ORFS's platform-default fastroute.tcl is used "
                 "unchanged (original behavior)."
             ),
@@ -852,6 +929,7 @@ def _build_knobs() -> list[Knob]:
 
         Knob(
             name="RECOVER_POWER",
+            affects="layout",
             tier=3,
             stage="grt",
             type="float",
@@ -873,6 +951,7 @@ def _build_knobs() -> list[Knob]:
 
         Knob(
             name="DETAILED_ROUTE_END_ITERATION",
+            affects="layout",
             tier=3,
             stage="route",
             type="int",
@@ -894,6 +973,7 @@ def _build_knobs() -> list[Knob]:
 
         Knob(
             name="MIN_PLACE_STEP_COEF",
+            affects="layout",
             tier=3,
             stage="place",
             type="float",
@@ -916,6 +996,7 @@ def _build_knobs() -> list[Knob]:
 
         Knob(
             name="MAX_PLACE_STEP_COEF",
+            affects="layout",
             tier=3,
             stage="place",
             type="float",
@@ -946,6 +1027,7 @@ def _build_knobs() -> list[Knob]:
 
         Knob(
             name="MACRO_PLACE_HALO",
+            affects="layout",
             tier=4,
             stage="floorplan",
             type="float",
@@ -972,6 +1054,7 @@ def _build_knobs() -> list[Knob]:
 
         Knob(
             name="MACRO_BLOCKAGE_HALO",
+            affects="layout",
             tier=4,
             stage="floorplan",
             type="float",
@@ -990,6 +1073,7 @@ def _build_knobs() -> list[Knob]:
 
         Knob(
             name="RTLMP_MAX_LEVEL",
+            affects="layout",
             tier=4,
             stage="floorplan",
             type="int",
@@ -1012,6 +1096,7 @@ def _build_knobs() -> list[Knob]:
 
         Knob(
             name="RTLMP_WIRELENGTH_WT",
+            affects="layout",
             tier=4,
             stage="floorplan",
             type="float",
@@ -1033,6 +1118,7 @@ def _build_knobs() -> list[Knob]:
 
         Knob(
             name="RTLMP_BOUNDARY_WT",
+            affects="layout",
             tier=4,
             stage="floorplan",
             type="float",
@@ -1088,6 +1174,35 @@ if __name__ == "__main__":
         print("  space() sampling types for CLOCK_UNCERTAINTY/IO_DELAY/GR_SEED  PASS")
     except FileNotFoundError:
         print("  SKIP CLOCK_UNCERTAINTY/IO_DELAY/GR_SEED sampling-type test (likith YAML not found)")
+
+    # 1c. Opt-in gate for constraint/environment knobs (R6 + F7).
+    # CLOCK_UNCERTAINTY/IO_DELAY (affects=constraints) and GR_SEED
+    # (affects=environment) are opt-in: they enter a design's space ONLY when
+    # the YAML names them under knobs.override or knobs.enable.  CLOCK_PERIOD is
+    # the always-on exception and must be present regardless.
+    _OPTIN = {"CLOCK_UNCERTAINTY", "IO_DELAY", "GR_SEED"}
+    try:
+        # gcd @ tier 2: no override for the SDC knobs → they must be absent.
+        gcd_sp = reg.space(max_tier=2, design="gcd", platform="nangate45")
+        assert not (_OPTIN & set(gcd_sp)), \
+            f"gcd tier-2 space should NOT contain opt-in knobs, got: {_OPTIN & set(gcd_sp)}"
+        assert "clock_period_ns" in gcd_sp, "CLOCK_PERIOD (always-on) missing from gcd space"
+        print(f"  opt-in gate: gcd tier-2 excludes {sorted(_OPTIN)}  PASS")
+
+        # likith @ tier 3: overrides all three → opt-in, so all present.
+        lik_sp = reg.space(max_tier=3, design="likith", platform="asap7")
+        assert _OPTIN <= set(lik_sp), \
+            f"likith tier-3 space should contain all opt-in knobs (it overrides them), missing: {_OPTIN - set(lik_sp)}"
+        print(f"  opt-in gate: likith tier-3 includes {sorted(_OPTIN)} (overridden = opted-in)  PASS")
+
+        # sagar @ tier 2: never declared them (its autotuner.json had no such
+        # axes) → correctly absent.
+        sag_sp = reg.space(max_tier=2, design="sagar", platform="sky130hd")
+        assert not (_OPTIN & set(sag_sp)), \
+            f"sagar tier-2 space should NOT contain opt-in knobs, got: {_OPTIN & set(sag_sp)}"
+        print(f"  opt-in gate: sagar tier-2 excludes {sorted(_OPTIN)}  PASS")
+    except FileNotFoundError:
+        print("  SKIP opt-in gate test (gcd/likith/sagar YAML not found)")
 
     # 2. Tier filtering works
     tier1 = reg.active(max_tier=1, design=None)
