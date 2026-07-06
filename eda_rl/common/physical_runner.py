@@ -166,6 +166,53 @@ _physical_cache: dict[tuple, dict] = {}
 _synth_sta_cache: dict[tuple, dict] = {}
 
 
+# ── Subprocess helpers (process-group-safe) ───────────────────────────────────
+
+def _killpg(proc: "subprocess.Popen") -> None:
+    """SIGKILL the whole process group led by `proc` (best-effort).
+
+    `proc` must have been started with start_new_session=True so it leads its
+    own group; killing the group reaps tool grandchildren (yosys/openroad under
+    the `bash -c` wrapper) that a plain proc.kill() would leave detached.
+    """
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _run_capture(cmd: "list[str]", cwd: str, timeout: int) -> subprocess.CompletedProcess:
+    """Drop-in for `subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
+    timeout=timeout)` that kills the entire process group on timeout (or any
+    other communicate() failure).
+
+    A plain subprocess.run(timeout=…) only kills the direct child — the `bash`
+    wrapper — so a `yosys`/`openroad` grandchild keeps running detached and
+    accumulates over a long unattended campaign (audit F12).  This reuses the
+    exact Popen(start_new_session=True) + communicate(timeout) + os.killpg
+    pattern run_physical was hardened with in the second audit.
+
+    Return/exception semantics match subprocess.run: a CompletedProcess with
+    .returncode/.stdout/.stderr, and subprocess.TimeoutExpired re-raised on
+    timeout (so callers that let it propagate, or catch SubprocessError, are
+    unaffected).
+    """
+    proc = subprocess.Popen(
+        cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, start_new_session=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except BaseException:
+        # TimeoutExpired, decode error, OSError, KeyboardInterrupt, …: the child
+        # is in its own session, so nothing else will reap the tool grandchildren
+        # unless we kill the group here before propagating.
+        _killpg(proc)
+        proc.wait()
+        raise
+    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+
+
 def variant_name(lanes: int, acc_w: int, clk_ns: float,
                  util: int = 40, density: float = 0.60, abc: str | None = None,
                  abc_recipe: str | None = None,
@@ -781,10 +828,7 @@ def run_physical(lanes: int, acc_w: int, clk_ns: float, platform: str = "nangate
             stdout, stderr = proc.communicate(timeout=ORFS_TIMEOUT)
         except subprocess.TimeoutExpired:
             # Kill the entire process group (yosys/openroad children included).
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
+            _killpg(proc)
             proc.wait()
             log_path = RUN_DIR / f"opt_{var}.log"
             log_path.write_text(f"[TIMEOUT after {ORFS_TIMEOUT}s]\n")
@@ -800,10 +844,7 @@ def run_physical(lanes: int, acc_w: int, clk_ns: float, platform: str = "nangate
             # KeyboardInterrupt, ...) — start_new_session=True detaches the
             # child from our process group, so nothing else will reap the
             # yosys/openroad grandchildren unless we kill them here too.
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
+            _killpg(proc)
             proc.wait()
             raise
 
@@ -895,9 +936,9 @@ def run_elaborate(lanes: int, acc_w: int, platform: str = "nangate45") -> dict:
         "check -assert",
         "",
     ]))
-    p = subprocess.run(
+    p = _run_capture(
         ["bash", "-c", f"source '{env_sh}' && yosys '{ys}'"],
-        cwd=str(MAKE_DIR), capture_output=True, text=True, timeout=PROXY_TIMEOUT,
+        cwd=str(MAKE_DIR), timeout=PROXY_TIMEOUT,
     )
     (work / "elaborate.log").write_text((p.stdout or "") + "\n--- stderr ---\n" + (p.stderr or ""))
     result = {"ok": p.returncode == 0, "stage": "elaborate", "log": str(work / "elaborate.log")}
@@ -1094,9 +1135,9 @@ def run_synth_sta(lanes: int, acc_w: int, clk_ns: float, platform: str = "nangat
 
     # 1) synthesis (script FILE, not -p, to avoid shell-quoting issues; no -q,
     #    which would suppress the `stat` output we parse).
-    p1 = subprocess.run(
+    p1 = _run_capture(
         ["bash", "-c", f"source '{env_sh}' && yosys '{synth_ys}'"],
-        cwd=str(MAKE_DIR), capture_output=True, text=True, timeout=PROXY_TIMEOUT,
+        cwd=str(MAKE_DIR), timeout=PROXY_TIMEOUT,
     )
     (work / "synth.log").write_text((p1.stdout or "") + "\n--- stderr ---\n" + (p1.stderr or ""))
     if p1.returncode != 0 or not netlist.exists():
@@ -1148,9 +1189,9 @@ def run_synth_sta(lanes: int, acc_w: int, clk_ns: float, platform: str = "nangat
         )
 
     # 2) static timing (OpenROAD, pre-layout)
-    p2 = subprocess.run(
+    p2 = _run_capture(
         ["bash", "-c", f"source '{env_sh}' && openroad -no_init -exit '{sta_tcl}'"],
-        cwd=str(MAKE_DIR), capture_output=True, text=True, timeout=PROXY_TIMEOUT,
+        cwd=str(MAKE_DIR), timeout=PROXY_TIMEOUT,
     )
     sta_out = (p2.stdout or "")
     (work / "sta.log").write_text(sta_out + "\n--- stderr ---\n" + (p2.stderr or ""))
@@ -1276,9 +1317,11 @@ def _reference_sta(platform: str, design_name: str, variant: str, clk_ns: float,
     )
 
     try:
-        p = subprocess.run(
+        # audit F12: process-group-safe capture so a hung reference-STA openroad
+        # doesn't leak its group; TimeoutExpired (a SubprocessError) is caught here.
+        p = _run_capture(
             ["bash", "-c", f"source '{env_sh}' && openroad -no_init -exit '{sta_tcl}'"],
-            cwd=str(MAKE_DIR), capture_output=True, text=True, timeout=PROXY_TIMEOUT,
+            cwd=str(MAKE_DIR), timeout=PROXY_TIMEOUT,
         )
     except (subprocess.SubprocessError, OSError):
         return None
