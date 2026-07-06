@@ -267,6 +267,25 @@ def run_campaign(
     n_f3 = 0
     per_fidelity_counts: dict[str, int] = {f: 0 for f in _FIDELITY_ORDER}
 
+    # audit F15: a reset() failure (invalid config / constraint violation) costs
+    # zero budget, so a generator whose space systematically mismatches the
+    # table/constraints busy-loops forever with no output.  Abort after N
+    # consecutive failures.  Reset to 0 on any successful reset.
+    consecutive_reset_failures = 0
+    _MAX_CONSECUTIVE_RESET_FAILURES = 25
+
+    # audit F15: campaign metadata stamped onto every episode row so a log can be
+    # attributed to a (design, platform, sampler, promotion, tier, seed) after the
+    # fact — the two existing overnight logs could not be.
+    campaign_meta = {
+        "design":    design,
+        "platform":  platform,
+        "sampler":   sampler,
+        "promotion": promotion,
+        "max_tier":  max_tier,
+        "seed":      seed,
+    }
+
     if verbose:
         print(f"\n  Campaign {campaign_id}")
         print(f"  sampler={sampler} promotion={promotion} budget={budget_s/3600:.2f}h "
@@ -291,11 +310,23 @@ def run_campaign(
         except (ValueError, KeyError) as exc:
             # Invalid config (not in table, or constraint violation)
             gen.update(config, reward=-100.0, fidelity="invalid")
+            consecutive_reset_failures += 1
+            if consecutive_reset_failures >= _MAX_CONSECUTIVE_RESET_FAILURES:
+                print(f"  [ABORT] {consecutive_reset_failures} consecutive "
+                      f"env.reset failures (last: {exc!r}) — the candidate space "
+                      f"likely mismatches the table/constraints; stopping campaign.")
+                break
             continue
         except Exception as exc:   # noqa: BLE001
             gen.update(config, reward=-100.0, fidelity="invalid")
             print(f"  [WARN] env.reset failed: {exc}")
+            consecutive_reset_failures += 1
+            if consecutive_reset_failures >= _MAX_CONSECUTIVE_RESET_FAILURES:
+                print(f"  [ABORT] {consecutive_reset_failures} consecutive "
+                      f"env.reset failures (last: {exc!r}) — stopping campaign.")
+                break
             continue
+        consecutive_reset_failures = 0   # a good reset breaks any failure streak
 
         episode_reward_acc = 0.0
         episode_done = False
@@ -307,8 +338,12 @@ def run_campaign(
         episode_t0 = time.time()
 
         while not episode_done:
-            if env.spent_s + env._episode_spent_s >= budget_s:
-                # Over budget mid-episode
+            if env.spent_s >= budget_s:
+                # Over budget mid-episode.  env.spent_s already includes this
+                # episode's accumulated cost (FunnelEnv._charge adds every cost to
+                # both _spent_s and _episode_spent_s), so adding _episode_spent_s
+                # here double-counted the episode spend and stopped campaigns early
+                # (audit F15).
                 break
 
             action = promo.act(state)
@@ -381,6 +416,7 @@ def run_campaign(
         log_row = {
             "ts":            time.time(),
             "campaign_id":   campaign_id,
+            **campaign_meta,   # audit F15: design/platform/sampler/promotion/max_tier/seed
             "episode":       n_episodes,
             "config":        config,
             "actions":       episode_actions,
@@ -436,7 +472,20 @@ def run_campaign(
         "promotion":          promotion,
         "seed":               seed,
         "platform":           platform,
+        "design":             design,
+        "max_tier":           max_tier,
     }
+
+    # audit F15: persist the summary as a final self-describing row so a campaign
+    # log is complete on its own.  It is wrapped under "campaign_summary" (no
+    # top-level "config" key) so campaign_data.load_campaign_rows — which keeps
+    # only dict rows containing "config" — skips it, keeping report/dashboard
+    # backward-compatible with logs that lack it.
+    try:
+        with open(results_path, "a", encoding="utf-8") as fout:
+            fout.write(json.dumps({"campaign_summary": summary}) + "\n")
+    except OSError:
+        pass
 
     if verbose:
         print(f"\n  Summary")
