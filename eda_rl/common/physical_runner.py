@@ -622,14 +622,40 @@ def _stage_inputs(platform: str, variant: str, lanes: int, acc_w: int, clk_ns: f
 
     # GR_SEED (fastroute.tcl-owned pseudo-knob): absent -> no custom fastroute.tcl
     # is written, ORFS uses its own platform-default file (original behavior).
+    #
+    # audit F2: setting FASTROUTE_TCL makes ORFS *replace* its entire else-branch
+    # (floorplan.tcl:104-111), which is the ONLY place the sampled
+    # ROUTING_LAYER_ADJUSTMENT reaches the global router.  Copying the platform's
+    # fastroute.tcl verbatim (its previous behavior) reintroduces that file's
+    # hardcoded adjustment literal (asap7 0.25, sky130hd 0.2), silently pinning
+    # ROUTING_LAYER_ADJUSTMENT to a constant every episode that sampled GR_SEED.
+    # Instead we reproduce the platform file but replace the hardcoded literal in
+    # set_global_routing_layer_adjustment with $::env(ROUTING_LAYER_ADJUSTMENT)
+    # (ORFS always defines it -- default 0.5 in scripts/variables.yaml -- and the
+    # sampled value is emitted to config.mk), preserving the platform's -clock/
+    # -signal set_routing_layers lines.  Then append the seed line.
     fastroute_tcl_rel = None
     gr_seed = knob_values.get("GR_SEED") if knob_values else None
     if gr_seed is not None:
         base_fr = ORFS_DIR / "flow" / "platforms" / platform / "fastroute.tcl"
-        base_text = base_fr.read_text() if base_fr.exists() else ""
+        if base_fr.exists():
+            base_text = re.sub(
+                r"(set_global_routing_layer_adjustment\s+\S+)\s+[\d.]+",
+                r"\1 $::env(ROUTING_LAYER_ADJUSTMENT)",
+                base_fr.read_text(),
+            ).rstrip("\n")
+        else:
+            # No platform fastroute.tcl: reproduce ORFS's else-branch directly.
+            base_text = (
+                "set_global_routing_layer_adjustment "
+                "$::env(MIN_ROUTING_LAYER)-$::env(MAX_ROUTING_LAYER) "
+                "$::env(ROUTING_LAYER_ADJUSTMENT)\n"
+                "set_routing_layers -signal "
+                "$::env(MIN_ROUTING_LAYER)-$::env(MAX_ROUTING_LAYER)"
+            )
         gen_fr = cfgdir / f"fastroute_{variant}.tcl"
         gen_fr.write_text(
-            base_text.rstrip("\n") + "\n"
+            base_text + "\n"
             f"set_global_routing_random -seed {int(gr_seed)}\n"
         )
         fastroute_tcl_rel = f"{platform}/{design_name}/fastroute_{variant}.tcl"
