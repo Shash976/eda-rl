@@ -99,7 +99,7 @@ from eda_rl.common.constants import (
     SW_BASELINE_CYCLES,
     behavioral_cycles as _behavioral_cycles,
 )
-from eda_rl.gen1.cascade import _run_sim  # reuse the mock-aware Verilator wrapper
+from eda_rl.common.sim import _run_sim  # mock-aware Verilator wrapper (audit F16: was gen1.cascade)
 from eda_rl.common.physical_runner import run_synth_sta, run_physical
 from eda_rl.common.physical_reward import compute_physical_reward, compute_generic_reward
 

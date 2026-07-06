@@ -23,7 +23,7 @@ from __future__ import annotations
 import math
 import warnings
 
-from eda_rl.gen1.reward import SW_BASELINE_LATENCY_NS, acc_overflows
+from eda_rl.common.constants import SW_BASELINE_LATENCY_NS, acc_overflows  # audit F16: was gen1.reward
 # Single source of truth: cycle model constants come from constants.py.
 # Measured 2026-06-10 after V13 saturation-order fix.
 # Old values: _CYCLE_OVERHEAD=28000, _CYCLE_MAC_WORK=242000 (synthetic fit).

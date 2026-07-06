@@ -341,7 +341,7 @@ def _eval_f1(config: dict, design: "Any | None" = None) -> tuple[dict, str]:
             _F1_CACHE[lanes] = (obs_sim, "mock")
         else:
             try:
-                from eda_rl.gen1.runner import run_sim  # type: ignore[import]
+                from eda_rl.common.sim import run_sim  # audit F16: was gen1.runner
                 raw = run_sim(lanes, acc_width=32)   # acc_width=32 → guaranteed correct
                 obs_sim = {
                     "avg_cycles": float(raw.get("avg_cycles", behavioral_cycles(lanes))),

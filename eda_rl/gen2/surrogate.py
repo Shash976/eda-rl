@@ -604,8 +604,8 @@ class Surrogate:
         # ── TinyVAD composite (mirrors compute_physical_reward) ───────────────
         from eda_rl.common.constants import (
             SW_BASELINE_CYCLES, MAX_SPEEDUP_FULL, behavioral_cycles,
+            SW_BASELINE_CLOCK_NS,   # audit F16: was gen1.reward
         )
-        from eda_rl.gen1.reward import SW_BASELINE_CLOCK_NS
         from eda_rl.common.physical_reward import AREA_REF_UM2, POWER_REF_MW
 
         lanes = int(x.get("mac_lanes") or x.get("lanes") or 4)
