@@ -1058,10 +1058,26 @@ def run_synth_sta(lanes: int, acc_w: int, clk_ns: float, platform: str = "nangat
                 "area_um2": None, "fmax_mhz": None, "wns_ns": None, "tns_ns": None,
                 "timing_met": None, "power_mw": None}
 
-    # take the LAST stat (after opt_clean), not intermediate synth/abc stats
-    cells_all = re.findall(r"Number of cells:\s+(\d+)", p1.stdout)
+    # take the LAST stat (after opt_clean), not intermediate synth/abc stats.
+    # The installed yosys `stat` prints a tabular total line, one of:
+    #     36  231.472 cells     (with per-cell liberty area)
+    #     36            cells    (no liberty / pre-map stat)
+    # older yosys printed "Number of cells:  36".  Match both formats so the
+    # cell count is not silently None on the current toolchain (audit F3).
+    # Each `stat` block prints exactly one such total for its (flattened) top
+    # module; the LAST match is the post-opt_clean top-module total, never a
+    # sub-block (per-cell-type lines like "1  0.204  AND3x4..." don't end in
+    # "cells" so never match).
+    cell_matches = re.findall(
+        r"Number of cells:\s+(\d+)|^\s*(\d+)\s+(?:[\d.]+\s+)?cells\s*$",
+        p1.stdout, re.MULTILINE)
+    # each match is a 2-tuple (old-format group, new-format group); take the
+    # non-empty one from the last match.
+    cell_count = None
+    if cell_matches:
+        last = cell_matches[-1]
+        cell_count = int(last[0] or last[1])
     chip_all  = re.findall(r"Chip area for module.*?:\s+([\d.]+)", p1.stdout)
-    cell_count = int(cells_all[-1]) if cells_all else None
     cell_area  = float(chip_all[-1]) if chip_all else None
     est_area   = round(cell_area * _PLACE_INFLATION, 1) if cell_area else None
 
