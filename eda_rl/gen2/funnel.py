@@ -867,12 +867,24 @@ class FunnelEnv:
             eff[k] = v
         return eff
 
+    # ORFS knobs that rewrite the SDC (see designs.sdc_text / physical_runner
+    # _stage_inputs) and therefore DO change what the F2 pre-layout STA measures.
+    # The placement/routing knobs (CORE_UTILIZATION, PLACE_DENSITY, GR_SEED, …)
+    # still do not — the proxy has no floorplan/place/route.
+    _F2_SDC_KNOBS = frozenset({"CLOCK_UNCERTAINTY", "IO_DELAY"})
+
     def _run_f2(self) -> tuple[dict, str]:
         """F2: synth+STA proxy (run_synth_sta, mock-aware).
 
         Note: the proxy is yosys synth + pre-layout STA — it has no floorplan,
-        placement, CTS or routing, so the tier-2/3 ORFS knobs do not affect its
-        output and are intentionally not forwarded here.  They take effect at F3.
+        placement, CTS or routing, so the placement/routing tier-2/3 ORFS knobs
+        do not affect its output and are intentionally not forwarded here.  The
+        SDC-owned knobs (CLOCK_UNCERTAINTY / IO_DELAY) DO change the constraints
+        the STA is measured against, so they ARE forwarded (audit F8) — otherwise
+        F2 times against clk*0.2 io while F3 uses the sampled IO_DELAY, and for
+        combinational designs the two stages are timed under different rulers,
+        degrading the F2->F3 correlation the funnel's kill decisions depend on.
+        The F2 cache key already includes knob_values, so caching stays correct.
         """
         assert self._config is not None
         lanes  = int(self._config.get("mac_lanes", 4))
@@ -897,6 +909,15 @@ class FunnelEnv:
                 kwargs["design"] = self._design_spec
             except Exception:   # noqa: BLE001
                 pass   # design resolution failed; fall back to tinymac behaviour
+        # Forward only the SDC-owned knob subset so the F2 STA sees the same
+        # timing constraints the F3 build will (audit F8).  Placement/routing
+        # knobs stay out — the proxy can't use them.
+        if "knob_values" in sig.parameters:
+            eff = self._effective_orfs_knobs()
+            sdc_knobs = {k: v for k, v in eff.items()
+                         if k in self._F2_SDC_KNOBS and v is not None}
+            if sdc_knobs:
+                kwargs["knob_values"] = sdc_knobs
 
         try:
             result = run_synth_sta(lanes, acc_w, clk, self.platform, **kwargs)
