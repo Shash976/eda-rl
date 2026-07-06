@@ -56,6 +56,7 @@ import math
 import os
 import re
 import time
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -1028,6 +1029,16 @@ class FunnelEnv:
                 "cell_count":  result.get("cell_count"),
                 "ff_count":    result.get("ff_count"),
                 "gds":         result.get("gds"),
+                # audit F1: fixed-ruler reference-SDC metrics (io 0.2, no
+                # uncertainty).  _terminal_reward scores on these so the reward
+                # can't be gamed by the sampled IO_DELAY/CLOCK_UNCERTAINTY; the
+                # sampled-SDC wns/fmax above stay for flow visibility.  Absent
+                # (None) when the reference STA failed → reward falls back + warns.
+                "fmax_ref_mhz":     result.get("fmax_ref_mhz"),
+                "wns_ref_ns":       result.get("wns_ref_ns"),
+                "period_ref_ns":    result.get("period_ref_ns"),
+                "comb_delay_ns":    result.get("comb_delay_ns"),
+                "combinational_ref": result.get("combinational_ref"),
                 # Effective recipe used at F3 (may differ from config["abc_recipe"]
                 # because "plain" is not a valid full-flow recipe and is remapped to
                 # "orfs_speed").  Always carry this so the training corpus is honest.
@@ -1050,6 +1061,41 @@ class FunnelEnv:
 
     # ── Terminal reward computation ─────────────────────────────────────────────
 
+    def _reward_obs_with_ref(self, obs: dict) -> dict:
+        """Return obs with its timing metrics swapped for the fixed-ruler
+        reference-SDC values (audit F1).
+
+        The reference metrics (measured under io=0.2 fraction, no uncertainty, at
+        the same sampled clock) are immune to the sampled IO_DELAY/
+        CLOCK_UNCERTAINTY, so scoring on them removes the "relax my own
+        constraints → higher reward" gaming.  Area/power are physical and left
+        untouched.  When the reference STA didn't produce a speed number
+        (fmax_ref_mhz is None — e.g. it failed, or a legacy path), fall back to
+        the sampled-SDC obs with a one-time warning; a successful build is never
+        discarded.
+        """
+        fmax_ref = obs.get("fmax_ref_mhz")
+        if fmax_ref is None:
+            # Live build whose reference STA failed → warn (the reward is now
+            # gameable).  Table replay has no reference by construction (historical
+            # rows predate this metric) — stay silent there.
+            if self._table is None and obs.get("fmax_mhz") is not None:
+                warnings.warn(
+                    "F1 reference STA produced no fmax; scoring the terminal "
+                    "reward on the sampled-SDC metrics (gameable by "
+                    "IO_DELAY/CLOCK_UNCERTAINTY).",
+                    stacklevel=2,
+                )
+            return obs
+        ro = dict(obs)
+        ro["fmax_mhz"] = fmax_ref
+        ro["period_min_ns"] = obs.get("period_ref_ns", obs.get("period_min_ns"))
+        wns_ref = obs.get("wns_ref_ns")
+        if wns_ref is not None:
+            ro["wns_ns"] = wns_ref
+            ro["timing_met"] = (wns_ref >= 0.0)
+        return ro
+
     def _terminal_reward(self, obs: dict, status: str) -> float:
         """Compute the F3 terminal payoff using the ladder-consistent scorer.
 
@@ -1067,17 +1113,20 @@ class FunnelEnv:
         full_fail_penalty = float(penalties.get("full", -20.0))
 
         if status in ("ok", "mock", "mock-proxy"):
+            # audit F1: score on the fixed-ruler reference-SDC timing metrics so
+            # the reward can't be gamed by the sampled IO_DELAY/CLOCK_UNCERTAINTY.
+            reward_obs = self._reward_obs_with_ref(obs)
             if self._f1_enabled():
                 # TinyVAD design: speedup/accuracy/area composite (TinyMAC anchors).
                 sim_cycles = None
                 if self._f1_obs is not None:
                     sim_cycles = self._f1_obs.get("avg_cycles")
-                scored = compute_physical_reward(obs, self._reward_cfg,
+                scored = compute_physical_reward(reward_obs, self._reward_cfg,
                                                  cycles=sim_cycles)
             else:
                 # Generic design: pure PPA reward with per-design anchors (audit C1).
-                refs, weights = self._generic_reward_cfg(obs)
-                scored = compute_generic_reward(obs, weights=weights, refs=refs)
+                refs, weights = self._generic_reward_cfg(reward_obs)
+                scored = compute_generic_reward(reward_obs, weights=weights, refs=refs)
             return float(scored.get("reward", full_fail_penalty))
 
         if status == "table_miss":

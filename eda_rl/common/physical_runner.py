@@ -825,6 +825,26 @@ def run_physical(lanes: int, acc_w: int, clk_ns: float, platform: str = "nangate
     final_status = parse_status if parse_status != "ok" else flow_status
 
     result = {**base, "status": final_status, **metrics}
+
+    # audit F1 — "fixed ruler": re-time the final netlist under a reference SDC
+    # (io 0.2 fraction, no uncertainty) so the reward metrics can't be gamed by
+    # the sampled IO_DELAY / CLOCK_UNCERTAINTY.  Only on a successful build.
+    #   - design given  → run the reference STA; on failure leave the ref keys
+    #     absent so the caller (FunnelEnv._terminal_reward) warns and falls back
+    #     to the sampled metrics (never discards a successful build).
+    #   - design is None (legacy tinymac) → its sampled SDC already IS the
+    #     reference ruler (io 0.2, no uncertainty), so mirror the sampled metrics
+    #     into the ref keys — no extra STA, no warning.
+    if final_status == "ok":
+        ref = _reference_sta(platform, actual_design_name, var, clk_ns, eff_design)
+        if ref is None and eff_design is None:
+            ref = {"wns_ref_ns": metrics.get("wns_ns"),
+                   "fmax_ref_mhz": metrics.get("fmax_mhz"),
+                   "period_ref_ns": metrics.get("period_min_ns"),
+                   "comb_delay_ns": None, "combinational_ref": False}
+        if ref is not None:
+            result.update(ref)
+
     # V10: only cache successful results.
     if final_status == "ok":
         _physical_cache[cache_key] = result
@@ -1198,6 +1218,102 @@ def run_synth_sta(lanes: int, acc_w: int, clk_ns: float, platform: str = "nangat
     return result
 
 
+# ── Reward "fixed ruler": reference-SDC re-time of the final netlist (F1) ──────
+
+def _reference_sta(platform: str, design_name: str, variant: str, clk_ns: float,
+                   design: "Any") -> dict | None:
+    """Re-time the routed netlist under a REFERENCE SDC to get gaming-proof
+    reward metrics (audit F1).
+
+    The campaign samples IO_DELAY / CLOCK_UNCERTAINTY, which rewrite the SDC the
+    build's own wns/fmax are measured against — so "loosen the constraints" reads
+    as "faster chip" and the reported optimum is not a better chip.  To break
+    that, we re-time the final netlist (results/<plat>/<design>/<variant>/
+    6_final.v) with a *reference* SDC: the exact SDC the design gets with NO
+    constraint knobs (io delay = 0.2 x clock period, no uncertainty), at the same
+    sampled clock.  These reference metrics feed the reward; the sampled-SDC
+    metrics stay in the obs for flow visibility.
+
+    Speed metric:
+      - Sequential design → report_clock_min_period gives a real fmax/period;
+        use them directly (fmax_ref_mhz, period_ref_ns).
+      - Purely combinational design → report_clock_min_period returns fmax = inf
+        (no reg-to-reg path), so instead we take the max in->out path from
+        report_checks -path_delay max and record the pure logic delay
+        comb_delay_ns = (data arrival time) - (input external delay).  Subtracting
+        the reference io delay leaves the netlist's intrinsic critical-path delay,
+        independent of both the sampled io_delay AND the clock; fmax_ref_mhz is
+        its reciprocal (1000 / comb_delay_ns).  This is a real measurement, never
+        the 1000/clk constraint echo.
+
+    Returns {wns_ref_ns, fmax_ref_mhz, period_ref_ns, comb_delay_ns,
+    combinational_ref} or None if the netlist/tools/STA are unavailable (caller
+    then falls back to the sampled-SDC metrics — a successful build is never
+    discarded).
+    """
+    if design is None:
+        return None   # legacy tinymac SDC already IS the reference (io 0.2, no unc.)
+    netlist = RUN_DIR / "results" / platform / design_name / variant / "6_final.v"
+    lib_rels = _LIBERTY.get(platform)
+    env_sh = ORFS_DIR / "env.sh"
+    if not netlist.exists() or not lib_rels or platform not in _LEF or not env_sh.exists():
+        return None
+
+    time_unit = PLATFORM_TIME_UNIT.get(platform, 1.0)
+    libs = [ORFS_DIR / "flow" / rel for rel in lib_rels]
+    lefs = [ORFS_DIR / "flow" / rel for rel in _LEF[platform]]
+    top = design.top
+
+    work = RUN_DIR / "refsta" / variant
+    work.mkdir(parents=True, exist_ok=True)
+    # Reference SDC: no uncertainty, default 0.2 io fraction — the fixed ruler.
+    ref_sdc = work / "ref.sdc"
+    ref_sdc.write_text(design.sdc_text(platform, clk_ns * time_unit))
+    sta_tcl = work / "ref_sta.tcl"
+    sta_tcl.write_text(
+        _sta_script(lefs, libs, netlist, ref_sdc, top=top)
+        + "report_checks -path_delay max\n"
+    )
+
+    try:
+        p = subprocess.run(
+            ["bash", "-c", f"source '{env_sh}' && openroad -no_init -exit '{sta_tcl}'"],
+            cwd=str(MAKE_DIR), capture_output=True, text=True, timeout=PROXY_TIMEOUT,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    out = p.stdout or ""
+    (work / "ref_sta.log").write_text(out + "\n--- stderr ---\n" + (p.stderr or ""))
+
+    wns_raw = _last_float_on_line(out, "wns")
+    wns_ref = (wns_raw / time_unit) if wns_raw is not None else None
+
+    fmax_ref = period_ref = comb_delay_ns = None
+    combinational_ref = False
+    m = re.search(r"period_min\s*=\s*([\d.]+|inf).*?fmax\s*=\s*([\d.]+|inf)", out)
+    if m and m.group(1) != "inf" and m.group(2) != "inf" and float(m.group(1)) != 0.0:
+        period_ref = float(m.group(1)) / time_unit
+        fmax_ref = float(m.group(2))
+    else:
+        # Combinational: derive the honest speed metric from the critical in->out
+        # path.  data arrival time - input external delay = pure logic delay.
+        combinational_ref = True
+        m_arr = re.search(r"([\d.]+)\s+data arrival time", out)
+        m_in = re.search(r"([\d.]+)\s+[v^]\s+input external delay", out)
+        if m_arr:
+            arrival = float(m_arr.group(1))
+            input_ext = float(m_in.group(1)) if m_in else 0.0
+            comb_native = max(arrival - input_ext, 1e-9)
+            comb_delay_ns = comb_native / time_unit
+            period_ref = comb_delay_ns
+            if comb_delay_ns > 0:
+                fmax_ref = round(1000.0 / comb_delay_ns, 2)
+
+    return {"wns_ref_ns": wns_ref, "fmax_ref_mhz": fmax_ref,
+            "period_ref_ns": period_ref, "comb_delay_ns": comb_delay_ns,
+            "combinational_ref": combinational_ref}
+
+
 # ── Mock mode (no OpenROAD) ───────────────────────────────────────────────────
 
 def _mock_metrics(lanes: int, acc_w: int, clk_ns: float) -> dict:
@@ -1220,6 +1336,11 @@ def _mock_metrics(lanes: int, acc_w: int, clk_ns: float) -> dict:
         "setup_viol": 0 if met else 40,
         "power_mw": power, "fmax_mhz": fmax, "period_min_ns": period_min,
         "timing_met": met,
+        # audit F1: fabricate the fixed-ruler reference metrics so mock-mode
+        # self-tests exercise the same reward path as real runs.  Mock is
+        # TinyMAC-shaped (sequential), so the reference equals the sampled values.
+        "wns_ref_ns": wns, "fmax_ref_mhz": fmax, "period_ref_ns": period_min,
+        "comb_delay_ns": None, "combinational_ref": False,
         # cell_count: consumed by run_physical F3 path; cells: the key the
         # synth proxy (run_synth_sta) / FunnelEnv._run_f2 read at F2.
         "cell_count": cell_count, "ff_count": ff_count, "cells": cell_count,
