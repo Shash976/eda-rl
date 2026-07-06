@@ -910,6 +910,11 @@ class FunnelEnv:
                 "cell_count":  result.get("cells"),
                 "ff_count":    result.get("cells"),   # proxy has no separate FF count
                 "logic_levels": None,                 # not available from synth+STA
+                # audit F4: honest markers so the corpus distinguishes a measured
+                # min-period from "no clocked path" (fmax None) or a slack-inferred
+                # fallback.  None-safe: absent keys default to False for old rows.
+                "combinational":  result.get("combinational", False),
+                "fmax_inferred":  result.get("fmax_inferred", False),
             }
             return obs, status
         except Exception as exc:  # noqa: BLE001

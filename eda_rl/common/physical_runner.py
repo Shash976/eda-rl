@@ -1112,18 +1112,39 @@ def run_synth_sta(lanes: int, acc_w: int, clk_ns: float, platform: str = "nangat
     # V1: parse STA timing in the platform's native unit (ns for nangate45, ps for asap7).
     time_div = PLATFORM_TIME_UNIT.get(platform, 1.0)
     fmax = period_min = None
-    m = re.search(r"period_min\s*=\s*([\d.]+).*?fmax\s*=\s*([\d.]+)", sta_out)
+    combinational = False
+    fmax_inferred = False
+    # audit F4: report_clock_min_period prints "period_min = 0.00 fmax = inf" for
+    # a design with no reg-to-reg (or reg-to-clock) path — every combinational
+    # block, and any I/O-dominated one.  The old regex required both groups to be
+    # [\d.]+, so "inf" failed the match entirely and the slack fallback below
+    # silently substituted fmax = 1000/(clk-wns), i.e. a pure function of the
+    # sampled clock carrying ZERO design information.  Parse inf/0.00 explicitly
+    # and record fmax_mhz = None + combinational=True instead, so downstream
+    # consumers (and F1's reference STA) treat it as "no clocked-path speed",
+    # not a plausible-looking constraint echo.
+    m = re.search(r"period_min\s*=\s*([\d.]+|inf).*?fmax\s*=\s*([\d.]+|inf)", sta_out)
     if m:
-        period_min = float(m.group(1)) / time_div
-        fmax = float(m.group(2))
+        pmin_s, fmax_s = m.group(1), m.group(2)
+        if fmax_s == "inf" or pmin_s == "inf" or float(pmin_s) == 0.0:
+            combinational = True          # no clocked path → no min-period metric
+        else:
+            period_min = float(pmin_s) / time_div
+            fmax = float(fmax_s)
     wns_raw = _last_float_on_line(sta_out, "wns")
     tns_raw = _last_float_on_line(sta_out, "tns")
     wns = (wns_raw / time_div) if wns_raw is not None else None
     tns = (tns_raw / time_div) if tns_raw is not None else None
-    # Fallback fmax from slack if report_clock_min_period was unavailable.
-    if fmax is None and wns is not None and clk_ns - wns > 0:
+    # Fallback fmax from slack ONLY when report_clock_min_period gave a real
+    # clocked period but the parse missed it AND wns is a genuine violation
+    # figure (wns < 0).  Never fabricate a period for a combinational block
+    # (combinational=True) — that was the constraint-echo bug.  When it does
+    # fire, flag fmax_inferred so consumers can tell measured from inferred.
+    if fmax is None and not combinational and wns is not None and wns < 0.0 \
+            and clk_ns - wns > 0:
         period_min = round(clk_ns - wns, 3)
         fmax = round(1000.0 / period_min, 2)
+        fmax_inferred = True
 
     timing_met = (wns >= 0.0) if wns is not None else None
 
@@ -1135,6 +1156,8 @@ def run_synth_sta(lanes: int, acc_w: int, clk_ns: float, platform: str = "nangat
         "util_pct": None,
         "wns_ns": wns, "tns_ns": tns,
         "fmax_mhz": fmax, "period_min_ns": period_min,
+        "combinational": combinational,   # True → no reg-to-reg path (fmax is None)
+        "fmax_inferred": fmax_inferred,   # True → fmax from slack fallback, not measured
         "setup_viol": None, "power_mw": None,
         "timing_met": timing_met,
         "gds": None, "report": str(work / "sta.log"),
