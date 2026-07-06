@@ -59,7 +59,82 @@ _DESIGNS_DIR = Path(__file__).resolve().parent.parent / "designs"
 # name/top become path components and get embedded in shell strings downstream
 # (physical_runner.py _stage_inputs/run_physical/run_elaborate/run_synth_sta),
 # so they must be safe plain identifiers — no slashes, quotes, or shell metachars.
+# clock_port is interpolated into the generated SDC's `set clk_port_name <v>` /
+# `get_ports <v>` (TCL), so it is an identifier by construction and validated
+# with the same rule (audit F14).
 _SAFE_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+# knobs.fix / knobs.override.{range,choices,default} / params values flow into
+# the generated SDC (TCL) and config.mk `export NAME = value` lines, where make
+# would expand `$(shell …)` and TCL would evaluate `[...]` / `;` (audit F14).
+# Numeric YAML scalars are always safe; string scalars must be limited to a
+# conservative alphabet with no shell/TCL/make metacharacters.
+_SAFE_VALUE_RE = re.compile(r"[A-Za-z0-9_ .+-]+")
+
+
+def _check_yaml_value(field_label: str, value: Any, yaml_path: Any) -> None:
+    """Reject a knob/param YAML value that is an injection risk.
+
+    Numeric scalars (int/float/bool) always pass.  String scalars must match
+    _SAFE_VALUE_RE.  Lists/tuples are checked element-wise; nested dicts are
+    checked value-wise (with the key appended to the label).  Anything else
+    (e.g. a mapping-typed default the schema doesn't expect) is rejected.
+    """
+    if isinstance(value, bool) or isinstance(value, (int, float)):
+        return
+    if value is None:
+        return
+    if isinstance(value, str):
+        if not _SAFE_VALUE_RE.fullmatch(value):
+            raise ValueError(
+                f"DesignSpec.load: {field_label} value {value!r} is not "
+                f"injection-safe (must match {_SAFE_VALUE_RE.pattern!r}) in {yaml_path}"
+            )
+        return
+    if isinstance(value, (list, tuple)):
+        for i, item in enumerate(value):
+            _check_yaml_value(f"{field_label}[{i}]", item, yaml_path)
+        return
+    if isinstance(value, dict):
+        for k, v in value.items():
+            _check_yaml_value(f"{field_label}.{k}", v, yaml_path)
+        return
+    raise ValueError(
+        f"DesignSpec.load: {field_label} has unsupported value type "
+        f"{type(value).__name__} ({value!r}) in {yaml_path}"
+    )
+
+
+def _validate_design_values(raw: dict, yaml_path: Any) -> None:
+    """Validate all design-YAML knob/param values at load time (audit F14).
+
+    Covers: knobs.fix values, knobs.override {range/choices/default/low/high}
+    entries, and every params[...] choices/range/default/values entry.
+    """
+    knobs = raw.get("knobs") or {}
+    if isinstance(knobs, dict):
+        for name, val in (knobs.get("fix") or {}).items():
+            _check_yaml_value(f"knobs.fix.{name}", val, yaml_path)
+        override = knobs.get("override") or {}
+        if isinstance(override, dict):
+            for axis, ov in override.items():
+                if isinstance(ov, dict):
+                    for key in ("range", "choices", "default", "low", "high"):
+                        if key in ov:
+                            _check_yaml_value(f"knobs.override.{axis}.{key}",
+                                              ov[key], yaml_path)
+                else:
+                    _check_yaml_value(f"knobs.override.{axis}", ov, yaml_path)
+
+    params = raw.get("params") or {}
+    if isinstance(params, dict):
+        for pname, pspec in params.items():
+            if not isinstance(pspec, dict):
+                _check_yaml_value(f"params.{pname}", pspec, yaml_path)
+                continue
+            for key in ("choices", "range", "default", "values"):
+                if key in pspec:
+                    _check_yaml_value(f"params.{pname}.{key}", pspec[key], yaml_path)
 
 # SDC generation — generic; physical_runner.py applies PLATFORM_TIME_UNIT
 # conversion before writing so clock_value_native/uncertainty/io_delay are
@@ -186,16 +261,20 @@ class DesignSpec:
                     f"DesignSpec.load: required field '{required}' missing in {yaml_path}"
                 )
 
-        # name/top flow into filesystem paths and shell command strings in
-        # physical_runner.py, so reject anything that isn't a plain identifier
-        # (blocks path traversal via name and shell injection via quotes/metachars).
-        for field_name in ("name", "top"):
+        # name/top/clock_port flow into filesystem paths, shell command strings
+        # (physical_runner.py), and the generated SDC's TCL, so reject anything
+        # that isn't a plain identifier (blocks path traversal via name and
+        # shell/TCL injection via quotes/metachars). clock_port added per F14.
+        for field_name in ("name", "top", "clock_port"):
             value = str(raw[field_name])
             if not _SAFE_IDENT_RE.fullmatch(value):
                 raise ValueError(
                     f"DesignSpec.load: '{field_name}' must match "
                     f"{_SAFE_IDENT_RE.pattern!r} (got {value!r} in {yaml_path})"
                 )
+
+        # Validate design-YAML knob/param values (config.mk / SDC injection sinks).
+        _validate_design_values(raw, yaml_path)
 
         # Resolve RTL file paths: relative paths anchor to the YAML's own directory,
         # or to EDA_RL_DESIGN_ROOT when set (for external/voiceAI design trees).
@@ -334,6 +413,53 @@ if __name__ == "__main__":
     import sys
 
     print("=== designs.py self-test ===")
+
+    # 0. Injection-sink validation (F14) — run FIRST so it is exercised even if
+    # the tinymac RTL is un-vendored in this checkout (which aborts test 1).
+    import tempfile as _tf
+
+    def _write_yaml(body: str) -> str:
+        f = _tf.NamedTemporaryFile("w", suffix=".yaml", delete=False, encoding="utf-8")
+        f.write(body)
+        f.close()
+        return f.name
+
+    _base = (
+        "name: victim\n"
+        "top: victim\n"
+        "rtl_files: [victim.v]\n"
+    )
+    # 0a. malicious clock_port must raise
+    bad_clk = _write_yaml(_base + 'clock_port: "clk]; exec touch /tmp/pwned;#"\n')
+    try:
+        DesignSpec.load(bad_clk)
+        raise AssertionError("malicious clock_port was accepted (F14 regression)")
+    except ValueError as e:
+        assert "clock_port" in str(e), f"wrong error for clock_port: {e}"
+        print("  F14: malicious clock_port rejected  PASS")
+
+    # 0b. malicious knobs.override choice must raise
+    bad_choice = _write_yaml(
+        _base + "clock_port: clk\n"
+        "knobs:\n  override:\n    ABC_AREA:\n"
+        '      choices: ["0", "1; exec rm -rf /"]\n'
+    )
+    try:
+        DesignSpec.load(bad_choice)
+        raise AssertionError("malicious override choice was accepted (F14 regression)")
+    except ValueError as e:
+        assert "knobs.override" in str(e), f"wrong error for override choice: {e}"
+        print("  F14: malicious knobs.override choice rejected  PASS")
+
+    # 0c. a benign design with safe values still loads (no false positives)
+    ok_yaml = _write_yaml(
+        _base + "clock_port: clk\n"
+        "knobs:\n  fix: {CORE_UTILIZATION: 15}\n"
+        "  override:\n    PLACE_DENSITY_LB_ADDON: {range: [0.2, 0.4], default: 0.3}\n"
+    )
+    _ok = DesignSpec.load(ok_yaml)
+    assert _ok.clock_port == "clk"
+    print("  F14: benign knob/param values still load  PASS")
 
     # 1. tinymac_accel loads
     try:
