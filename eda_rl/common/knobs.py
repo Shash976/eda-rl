@@ -50,7 +50,6 @@ Emit convention:
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -118,29 +117,6 @@ class Knob:
             return [f"export MACRO_PLACE_HALO = {value} {value}  # x y in µm"]
 
         return [f"export {self.name} = {value}"]
-
-    # ── Validation helpers ────────────────────────────────────────────────────
-
-    def validate_value(self, value: Any) -> list[str]:
-        """Return a list of warning/error strings for `value` (empty = ok)."""
-        errs: list[str] = []
-        if self.type in ("int", "float") and self.range is not None:
-            lo, hi = self.range
-            try:
-                v = float(value)
-            except (TypeError, ValueError):
-                errs.append(f"{self.name}: cannot cast {value!r} to number")
-                return errs
-            if v < lo or v > hi:
-                errs.append(
-                    f"{self.name}={v} outside documented range [{lo}, {hi}]"
-                )
-        elif self.type == "categorical" and self.choices is not None:
-            if str(value) not in [str(c) for c in self.choices]:
-                errs.append(
-                    f"{self.name}={value!r} not in choices {self.choices}"
-                )
-        return errs
 
 
 # ── Registry ───────────────────────────────────────────────────────────────────

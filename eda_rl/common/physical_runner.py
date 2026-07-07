@@ -63,7 +63,6 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from eda_rl.common.recipe import (
-    RECIPES,
     config_mk_lines,
     recipe_suffix,
     resolve_recipe,

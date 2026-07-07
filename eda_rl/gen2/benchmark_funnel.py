@@ -44,15 +44,10 @@ Set PHYSICAL_MOCK=1 if running without ORFS (FunnelEnv will use mock metrics).
 from __future__ import annotations
 
 import argparse
-import json
 import math
-import os
 import random
 import statistics
 import sys
-import time
-from collections import defaultdict
-from itertools import product
 from pathlib import Path
 from typing import Any
 
@@ -97,10 +92,6 @@ from eda_rl.gen2.promotion_agent import (  # noqa: E402
     PromotionAgent,
     RandomPromotionAgent,
     STATE_DIM,
-    IDX_DEPTH_F0, IDX_DEPTH_F1, IDX_DEPTH_F2, IDX_DEPTH_F3,
-    IDX_F0_ACC, IDX_F1_ACC, IDX_F2_WNS, IDX_SURR_MU, IDX_SURR_SIG,
-    IDX_INCUMBENT, IDX_BUDGET_FRAC, IDX_F0_CYCLES, IDX_F1_CYCLES,
-    IDX_F2_AREA, IDX_F2_FF, IDX_F2_CELLS, IDX_F2_LEVELS,
 )
 
 # ── constants ─────────────────────────────────────────────────────────────────
@@ -478,7 +469,6 @@ def _make_agent(name: str, seed: int) -> Any | None:
     elif name == "ppo":
         try:
             from stable_baselines3 import PPO  # type: ignore[import]
-            import gym  # type: ignore[import]
             # PPO hook: wrap in a thin adapter that satisfies our act/update interface
             # (not trained here — serves as a wiring test stub)
             class _PPOAdapter:

@@ -54,30 +54,9 @@ import sys
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 
 # ── bootstrap: optimizer/ root on path ───────────────────────────────────────
 # [eda_rl] bootstrap removed (installed package): sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-# ── Defensive imports for concurrent-agent modules ────────────────────────────
-
-def _try_load_knob_registry():
-    """Try to load KnobRegistry; return None on ImportError."""
-    try:
-        from eda_rl.common.knobs import KnobRegistry  # noqa: F401
-        return KnobRegistry
-    except ImportError:
-        return None
-
-
-def _try_load_surrogate():
-    """Try to import Surrogate; return None on ImportError."""
-    try:
-        from eda_rl.gen2.surrogate import Surrogate  # noqa: F401
-        return Surrogate
-    except ImportError:
-        return None
-
 
 # ── Fallback space (4-axis tinymac space) ─────────────────────────────────────
 
@@ -608,7 +587,6 @@ class CandidateGenerator:
 if __name__ == "__main__":
     import sys
     import math
-    import tempfile
 
     print("=" * 60)
     print("CandidateGenerator self-test")

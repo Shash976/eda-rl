@@ -4,8 +4,11 @@
 # `always @(*)` — NO clock port on the module at all. Same virtual-clock
 # behavior as likith.yaml applies here (verified for this design too), so
 # `clock_port: clk` below works as a placeholder despite alu_4bit having no
-# clk pin. sagar's own hand-written designs/sagar/constraint.sdc (a virtual-
-# clock SDC, untracked) is NOT read by eda-rl — it generates its own SDC.
+# clk pin. eda-rl generates its own SDC from this spec. (sagar's original
+# hand-written virtual-clock constraint.sdc — the same idiom eda-rl's
+# generator produces implicitly — was removed with the rest of the raw
+# AutoTuner bundle in the third-audit cleanup; only autotuner.json is kept,
+# as the provenance record for the knob ranges below.)
 #
 # Platform: sky130hd — this design's real target.
 #
@@ -17,9 +20,8 @@
 # fmax 214.8 MHz, cell_count=80, real GDS produced).
 #
 # PLACE_DENSITY_LB_ADDON override: narrowed to match sagar/autotuner.json's
-# declared bounds [0.20,0.40] (the leftover ORFS-AutoTuner bundle in
-# designs/sagar/ this design was originally set up for — not read by eda-rl,
-# used here only as the source of truth for what should be tunable).
+# declared bounds [0.20,0.40] (not read by eda-rl — kept only as the
+# provenance record for what should be tunable).
 # sagar/autotuner.json's only other axis, _SDC_CLK_PERIOD, is already the
 # CLOCK_PERIOD knob below (native ns on sky130hd, no ps conversion needed).
 #

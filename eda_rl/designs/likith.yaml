@@ -21,11 +21,13 @@
 # fmax ~15 GHz, cell_count=46, real GDS produced).
 #
 # CLOCK_UNCERTAINTY / IO_DELAY / GR_SEED / ROUTING_LAYER_ADJUSTMENT overrides:
-# narrowed to match likith/autotuner.json's declared bounds — the leftover
-# ORFS-AutoTuner bundle (config.mk/autotuner.json/fastroute.tcl in
-# designs/likith/) this design was originally set up for. That bundle is NOT
-# read by eda-rl (no code parses config.mk/autotuner.json here); it's used
-# only as the source of truth for which parameters should be tunable.
+# narrowed to match likith/autotuner.json's declared bounds — the ORFS-
+# AutoTuner sweep spec this design was originally set up for. autotuner.json
+# is NOT read by eda-rl (no code parses it); it is kept in designs/likith/
+# purely as the provenance record for which parameters should be tunable and
+# over what ranges. (The rest of the raw AutoTuner bundle — config.mk /
+# fastroute.tcl — was removed in the third-audit cleanup: eda-rl never read
+# them and likith/config.mk referenced a constraint.sdc that never existed.)
 # asap7 SDC time values are picoseconds; DesignSpec clock/time ranges are
 # always nanoseconds (PLATFORM_TIME_UNIT converts downstream), so a ps bound
 # from autotuner.json becomes ps/1000 here.

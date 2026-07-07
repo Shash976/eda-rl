@@ -41,7 +41,6 @@ from pathlib import Path
 from typing import Any
 
 # ── bootstrap: make optimizer/ root importable ───────────────────────────────
-import pathlib as _pl
 # [eda_rl] bootstrap removed (installed package): sys.path.insert(0, str(_pl.Path(__file__).resolve().parents[1]))
 
 # Force UTF-8 stdout

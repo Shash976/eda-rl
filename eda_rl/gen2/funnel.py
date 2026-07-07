@@ -63,9 +63,6 @@ from typing import Any
 import numpy as np
 import yaml
 
-# Bootstrap: make optimizer/ root importable (gen2/ is one level below it)
-import pathlib as _pl, sys as _sys
-# [eda_rl] bootstrap removed: _sys.path.insert(0, str(_pl.Path(__file__).resolve().parents[1]))
 
 # ── Defensive imports for concurrent agents ──────────────────────────────────
 # recipe.py is being written by a concurrent agent; fall back gracefully.

@@ -34,11 +34,8 @@ import re
 import sys
 from pathlib import Path
 
-import numpy as np
 
 # Bootstrap: make optimizer/ root importable (gen2/ is one level below it)
-import pathlib as _pl
-import sys as _sys
 # [eda_rl] bootstrap removed: _sys.path.insert(0, str(_pl.Path(__file__).resolve().parents[1]))
 
 # ── Paths ──────────────────────────────────────────────────────────────────────

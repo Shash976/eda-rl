@@ -68,7 +68,6 @@ Usage
 from __future__ import annotations
 
 import math
-import re
 import warnings
 from pathlib import Path
 from typing import Any
@@ -232,44 +231,6 @@ def _config_view(flat: dict) -> dict:
 
 
 # ── Feature engineering ────────────────────────────────────────────────────────
-
-
-def _encode_config(x: dict) -> list[float]:
-    """LEGACY, unused: the fixed 8-element config feature vector.
-
-    Kept only for reference — the live path is Surrogate._build_feature_row,
-    which featurizes the full discovered axis schema (see _config_view). This
-    helper returns 8 elements (log2 lanes, acc_w, clk, abc_flag, plat_flag,
-    hash placeholder, util, density); the old docstring's "6-element" claim was
-    stale (audit F17).
-
-    Accepts either the optimizer-facing keys (mac_lanes / accumulator_width /
-    clock_period_ns / abc_recipe / platform) or the runner-facing keys
-    (lanes / acc_w / clk_ns / abc / platform).  Both styles are used in the
-    corpus so we normalise here.
-    """
-    lanes = int(x.get("mac_lanes") or x.get("lanes") or 4)
-    acc_w = int(x.get("accumulator_width") or x.get("acc_w") or 24)
-    clk   = float(x.get("clock_period_ns") or x.get("clk_ns") or 5.0)
-
-    # abc_recipe: any 'area' recipe → 1 (catches 'area' and 'orfs_area'); else 0
-    abc_raw = x.get("abc_recipe") or x.get("abc") or ""
-    abc_flag = 1.0 if "area" in str(abc_raw).lower() else 0.0
-
-    # platform: 'asap7' → 1; everything else (nangate45/sky130…) → 0
-    plat_raw = x.get("platform") or "nangate45"
-    plat_flag = 1.0 if str(plat_raw).lower() == "asap7" else 0.0
-
-    # util/density: floorplan/placement axes (frozen at 40/0.60 in the funnel
-    # space, but explicit features so matched builds don't alias — see EXP-F3).
-    util    = float(x.get("util", 40) or 40)
-    density = float(x.get("density", 0.60) or 0.60)
-
-    # rtl_hash: treated as a categorical context feature (integer-encoded later
-    # by the Surrogate which holds the hash→int mapping built during fit)
-    # We return a placeholder 0.0 here; _build_feature_row replaces it.
-    return [math.log2(max(lanes, 1)), float(acc_w), clk, abc_flag, plat_flag, 0.0,
-            util, density]
 
 
 def _encode_obs(obs: dict | None, means: dict) -> list[float]:

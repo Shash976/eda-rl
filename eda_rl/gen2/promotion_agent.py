@@ -59,7 +59,6 @@ FixedGateAgent mapping to cascade.py / cascade_reward.py gates:
 
 from __future__ import annotations
 
-import os
 import random
 from pathlib import Path
 
@@ -449,7 +448,7 @@ class RandomPromotionAgent:
 
 def _selftest() -> None:
     """Quick smoke test — runs in < 1 s, no external deps."""
-    import py_compile, tempfile, os
+    import tempfile, os
 
     rng = np.random.default_rng(42)
     dim = STATE_DIM
