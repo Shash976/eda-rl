@@ -24,6 +24,7 @@ _COMMANDS: dict[str, str] = {
     "dashboard":   "eda_rl.viz.dashboard:main",
     "build-table": "eda_rl.gen2.build_table:main",
     "benchmark":   "eda_rl.gen2.benchmark_funnel:main",
+    "doctor":      "eda_rl.gen2.doctor:main",
 }
 
 
@@ -38,6 +39,7 @@ def _usage() -> str:
         "dashboard":   "launch the live/interactive Optuna dashboard (needs [dashboard] extra)",
         "build-table": "pre-build an offline F0–F2 evaluation table (resumable)",
         "benchmark":   "compare promotion/candidate strategies on the table simulator",
+        "doctor":      "physics-sanity preflight for a design (parsers, knob ranges, util floor)",
     }
     for c in _COMMANDS:
         lines.append(f"  {c.ljust(width)}  {blurbs.get(c, '')}")
