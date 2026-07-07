@@ -1156,6 +1156,90 @@ def _sta_script(lefs: list[Path], libs: "list[Path]", netlist: Path, sdc: Path,
     )
 
 
+# ── Tool-output parsers (extracted for golden-log regression tests, R5) ────────
+#
+# These are the exact parsing rules run_synth_sta applies to real yosys/OpenSTA
+# output. They live as standalone functions so tests/test_parsers.py can feed
+# captured real-tool fixtures through them — the two silent parser deaths the
+# third audit found (F3: yosys stat format change; F4: 'fmax = inf') were both
+# invisible to mock-based self-tests, which fabricate exactly these fields.
+
+def _parse_synth_stat(stdout: str) -> tuple[int | None, float | None]:
+    """Parse (cell_count, cell_area_um2) from a yosys synth log.
+
+    Takes the LAST stat (after opt_clean), not intermediate synth/abc stats.
+    The installed yosys `stat` prints a tabular total line, one of:
+        36  231.472 cells     (with per-cell liberty area)
+        36            cells    (no liberty / pre-map stat)
+    older yosys printed "Number of cells:  36".  Match both formats so the
+    cell count is not silently None on the current toolchain (audit F3).
+    Each `stat` block prints exactly one such total for its (flattened) top
+    module; the LAST match is the post-opt_clean top-module total, never a
+    sub-block (per-cell-type lines like "1  0.204  AND3x4..." don't end in
+    "cells" so never match).
+    """
+    cell_matches = re.findall(
+        r"Number of cells:\s+(\d+)|^\s*(\d+)\s+(?:[\d.]+\s+)?cells\s*$",
+        stdout, re.MULTILINE)
+    # each match is a 2-tuple (old-format group, new-format group); take the
+    # non-empty one from the last match.
+    cell_count = None
+    if cell_matches:
+        last = cell_matches[-1]
+        cell_count = int(last[0] or last[1])
+    chip_all  = re.findall(r"Chip area for module.*?:\s+([\d.]+)", stdout)
+    cell_area = float(chip_all[-1]) if chip_all else None
+    return cell_count, cell_area
+
+
+def _parse_sta_timing(sta_out: str, time_div: float, clk_ns: float) -> dict:
+    """Parse pre-layout STA output into timing metrics (native unit → ns).
+
+    audit F4: report_clock_min_period prints "period_min = 0.00 fmax = inf" for
+    a design with no reg-to-reg (or reg-to-clock) path — every combinational
+    block, and any I/O-dominated one.  The old regex required both groups to be
+    [\\d.]+, so "inf" failed the match entirely and the slack fallback below
+    silently substituted fmax = 1000/(clk-wns), i.e. a pure function of the
+    sampled clock carrying ZERO design information.  Parse inf/0.00 explicitly
+    and record fmax_mhz = None + combinational=True instead, so downstream
+    consumers (and F1's reference STA) treat it as "no clocked-path speed",
+    not a plausible-looking constraint echo.
+
+    The slack fallback fires ONLY when report_clock_min_period gave no usable
+    period, the design is not combinational, AND wns is a genuine violation
+    figure (wns < 0); it flags fmax_inferred so consumers can tell measured
+    from inferred.
+    """
+    fmax = period_min = None
+    combinational = False
+    fmax_inferred = False
+    m = re.search(r"period_min\s*=\s*([\d.]+|inf).*?fmax\s*=\s*([\d.]+|inf)", sta_out)
+    if m:
+        pmin_s, fmax_s = m.group(1), m.group(2)
+        if fmax_s == "inf" or pmin_s == "inf" or float(pmin_s) == 0.0:
+            combinational = True          # no clocked path → no min-period metric
+        else:
+            period_min = float(pmin_s) / time_div
+            fmax = float(fmax_s)
+    wns_raw = _last_float_on_line(sta_out, "wns")
+    tns_raw = _last_float_on_line(sta_out, "tns")
+    wns = (wns_raw / time_div) if wns_raw is not None else None
+    tns = (tns_raw / time_div) if tns_raw is not None else None
+    if fmax is None and not combinational and wns is not None and wns < 0.0 \
+            and clk_ns - wns > 0:
+        period_min = round(clk_ns - wns, 3)
+        fmax = round(1000.0 / period_min, 2)
+        fmax_inferred = True
+
+    timing_met = (wns >= 0.0) if wns is not None else None
+    return {
+        "fmax_mhz": fmax, "period_min_ns": period_min,
+        "wns_ns": wns, "tns_ns": tns,
+        "combinational": combinational, "fmax_inferred": fmax_inferred,
+        "timing_met": timing_met,
+    }
+
+
 def run_synth_sta(lanes: int, acc_w: int, clk_ns: float, platform: str = "nangate45",
                   abc: str | None = None, abc_recipe: str | None = None,
                   design: "Any | None" = None,
@@ -1255,27 +1339,7 @@ def run_synth_sta(lanes: int, acc_w: int, clk_ns: float, platform: str = "nangat
                 "area_um2": None, "fmax_mhz": None, "wns_ns": None, "tns_ns": None,
                 "timing_met": None, "power_mw": None}
 
-    # take the LAST stat (after opt_clean), not intermediate synth/abc stats.
-    # The installed yosys `stat` prints a tabular total line, one of:
-    #     36  231.472 cells     (with per-cell liberty area)
-    #     36            cells    (no liberty / pre-map stat)
-    # older yosys printed "Number of cells:  36".  Match both formats so the
-    # cell count is not silently None on the current toolchain (audit F3).
-    # Each `stat` block prints exactly one such total for its (flattened) top
-    # module; the LAST match is the post-opt_clean top-module total, never a
-    # sub-block (per-cell-type lines like "1  0.204  AND3x4..." don't end in
-    # "cells" so never match).
-    cell_matches = re.findall(
-        r"Number of cells:\s+(\d+)|^\s*(\d+)\s+(?:[\d.]+\s+)?cells\s*$",
-        p1.stdout, re.MULTILINE)
-    # each match is a 2-tuple (old-format group, new-format group); take the
-    # non-empty one from the last match.
-    cell_count = None
-    if cell_matches:
-        last = cell_matches[-1]
-        cell_count = int(last[0] or last[1])
-    chip_all  = re.findall(r"Chip area for module.*?:\s+([\d.]+)", p1.stdout)
-    cell_area  = float(chip_all[-1]) if chip_all else None
+    cell_count, cell_area = _parse_synth_stat(p1.stdout)
     est_area   = round(cell_area * _PLACE_INFLATION, 1) if cell_area else None
 
     # Macro auto-detect: check for "$" instances in synth stat (ORFS macro pattern).
@@ -1308,42 +1372,7 @@ def run_synth_sta(lanes: int, acc_w: int, clk_ns: float, platform: str = "nangat
 
     # V1: parse STA timing in the platform's native unit (ns for nangate45, ps for asap7).
     time_div = PLATFORM_TIME_UNIT.get(platform, 1.0)
-    fmax = period_min = None
-    combinational = False
-    fmax_inferred = False
-    # audit F4: report_clock_min_period prints "period_min = 0.00 fmax = inf" for
-    # a design with no reg-to-reg (or reg-to-clock) path — every combinational
-    # block, and any I/O-dominated one.  The old regex required both groups to be
-    # [\d.]+, so "inf" failed the match entirely and the slack fallback below
-    # silently substituted fmax = 1000/(clk-wns), i.e. a pure function of the
-    # sampled clock carrying ZERO design information.  Parse inf/0.00 explicitly
-    # and record fmax_mhz = None + combinational=True instead, so downstream
-    # consumers (and F1's reference STA) treat it as "no clocked-path speed",
-    # not a plausible-looking constraint echo.
-    m = re.search(r"period_min\s*=\s*([\d.]+|inf).*?fmax\s*=\s*([\d.]+|inf)", sta_out)
-    if m:
-        pmin_s, fmax_s = m.group(1), m.group(2)
-        if fmax_s == "inf" or pmin_s == "inf" or float(pmin_s) == 0.0:
-            combinational = True          # no clocked path → no min-period metric
-        else:
-            period_min = float(pmin_s) / time_div
-            fmax = float(fmax_s)
-    wns_raw = _last_float_on_line(sta_out, "wns")
-    tns_raw = _last_float_on_line(sta_out, "tns")
-    wns = (wns_raw / time_div) if wns_raw is not None else None
-    tns = (tns_raw / time_div) if tns_raw is not None else None
-    # Fallback fmax from slack ONLY when report_clock_min_period gave a real
-    # clocked period but the parse missed it AND wns is a genuine violation
-    # figure (wns < 0).  Never fabricate a period for a combinational block
-    # (combinational=True) — that was the constraint-echo bug.  When it does
-    # fire, flag fmax_inferred so consumers can tell measured from inferred.
-    if fmax is None and not combinational and wns is not None and wns < 0.0 \
-            and clk_ns - wns > 0:
-        period_min = round(clk_ns - wns, 3)
-        fmax = round(1000.0 / period_min, 2)
-        fmax_inferred = True
-
-    timing_met = (wns >= 0.0) if wns is not None else None
+    timing = _parse_sta_timing(sta_out, time_div, clk_ns)
 
     result = {
         **base, "status": "ok", "stage": "proxy",
@@ -1351,12 +1380,12 @@ def run_synth_sta(lanes: int, acc_w: int, clk_ns: float, platform: str = "nangat
         "cell_area_um2": cell_area,
         "area_um2": est_area,            # die-area estimate (cell × inflation)
         "util_pct": None,
-        "wns_ns": wns, "tns_ns": tns,
-        "fmax_mhz": fmax, "period_min_ns": period_min,
-        "combinational": combinational,   # True → no reg-to-reg path (fmax is None)
-        "fmax_inferred": fmax_inferred,   # True → fmax from slack fallback, not measured
+        "wns_ns": timing["wns_ns"], "tns_ns": timing["tns_ns"],
+        "fmax_mhz": timing["fmax_mhz"], "period_min_ns": timing["period_min_ns"],
+        "combinational": timing["combinational"],   # True → no reg-to-reg path (fmax is None)
+        "fmax_inferred": timing["fmax_inferred"],   # True → fmax from slack fallback, not measured
         "setup_viol": None, "power_mw": None,
-        "timing_met": timing_met,
+        "timing_met": timing["timing_met"],
         "gds": None, "report": str(work / "sta.log"),
     }
     # Include macro auto-detect result if applicable

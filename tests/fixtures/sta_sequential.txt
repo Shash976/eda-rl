@@ -1,0 +1,14 @@
+OPENROAD: /opt/OpenROAD-flow-scripts/tools/OpenROAD
+OpenROAD 26Q2-1619-g9e1904a6f8 
+Features included (+) or not (-): +GPU +GUI +Python
+This program is licensed under the BSD-3 license. See the LICENSE file for details.
+Components of this program may be licensed under more restrictive licenses which must be honored.
+[INFO ODB-0227] LEF file: /opt/OpenROAD-flow-scripts/flow/platforms/nangate45/lef/NangateOpenCellLibrary.tech.lef, created 22 layers, 27 vias
+[INFO ODB-0227] LEF file: /opt/OpenROAD-flow-scripts/flow/platforms/nangate45/lef/NangateOpenCellLibrary.macro.lef, created 134 library cells
+[WARNING ORD-2056] The following 1 liberty cell(s) do not have LEF masters and will be marked as dont-use:
+  TAPCELL_X1
+core_clock period_min = 0.64 fmax = 1564.07
+wns max 0.00
+tns max 0.00
+
+--- stderr ---
