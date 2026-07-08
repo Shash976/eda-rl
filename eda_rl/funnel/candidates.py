@@ -26,8 +26,11 @@ Sampler modes
 
 grid_snap
 ---------
-Continuous axes (clock_period_ns) are snapped to 0.5 ns grid increments when
-grid_snap=True, so table-mode FunnelEnv lookups hit stored rows.
+When grid_snap=True, float axes that DECLARE a `_snap_step` are snapped to that
+grid so table-mode FunnelEnv lookups hit stored rows (e.g. `_fallback_space()`'s
+clock axis declares `_snap_step: 0.5`).  Float axes without a `_snap_step` are
+left continuous — an earlier version applied a hardcoded 0.5 ns step to every
+float axis, pinning sub-range axes to their lower bound (audit F6).
 
 Space dict schema (from KnobRegistry.space or _fallback_space)
 ---------------------------------------------------------------
@@ -51,30 +54,9 @@ import sys
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 
-# ── bootstrap: optimizer/ root on path ───────────────────────────────────────
+# ── bootstrap (historical; removed for the installed package) ───────────────────────────────────────
 # [eda_rl] bootstrap removed (installed package): sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-# ── Defensive imports for concurrent-agent modules ────────────────────────────
-
-def _try_load_knob_registry():
-    """Try to load KnobRegistry; return None on ImportError."""
-    try:
-        from eda_rl.common.knobs import KnobRegistry  # noqa: F401
-        return KnobRegistry
-    except ImportError:
-        return None
-
-
-def _try_load_surrogate():
-    """Try to import Surrogate; return None on ImportError."""
-    try:
-        from eda_rl.gen2.surrogate import Surrogate  # noqa: F401
-        return Surrogate
-    except ImportError:
-        return None
-
 
 # ── Fallback space (4-axis tinymac space) ─────────────────────────────────────
 
@@ -112,8 +94,6 @@ def _fallback_space() -> dict:
 
 # ── Grid-snap helper ──────────────────────────────────────────────────────────
 
-_CLOCK_SNAP_STEP = 0.5   # ns — matches table_grid in search_space_funnel.yaml
-
 
 def _snap_float(value: float, step: float, lo: float, hi: float) -> float:
     """Snap a continuous value to the nearest multiple of step within [lo, hi]."""
@@ -123,13 +103,22 @@ def _snap_float(value: float, step: float, lo: float, hi: float) -> float:
 
 
 def _snap_config(config: dict, space: dict) -> dict:
-    """Return a copy of config with continuous axes snapped to the grid."""
+    """Return a copy of config with grid-declaring float axes snapped.
+
+    Snap ONLY axes that explicitly declare a ``_snap_step`` (audit F6).  A float
+    axis with no ``_snap_step`` is left untouched — the previous behaviour applied
+    a hardcoded 0.5 ns default step to *every* float axis, which pinned sub-range
+    axes (e.g. likith's IO_DELAY [0.0005, 0.002] or clock_period_ns [0.045, 0.070])
+    to their lower bound whenever grid_snap was on.  `_fallback_space()`'s clock
+    axis still declares ``_snap_step: 0.5`` so tinymac table-mode lookups keep
+    hitting stored rows.
+    """
     out = dict(config)
     for name, spec in space.items():
-        if spec.get("type") in ("float",) and name in out:
-            step = spec.get("_snap_step", _CLOCK_SNAP_STEP)
+        if spec.get("type") == "float" and name in out and "_snap_step" in spec:
+            step = float(spec["_snap_step"])
             lo, hi = spec.get("range", [3.0, 8.0])
-            out[name] = _snap_float(float(out[name]), step, lo, hi)
+            out[name] = _snap_float(float(out[name]), step, float(lo), float(hi))
     return out
 
 
@@ -151,7 +140,7 @@ class CandidateGenerator:
     ----------
     space      : axis-spec dict (from KnobRegistry.space or _fallback_space()).
     sampler    : "tpe" | "surrogate_ucb" | "random".
-    surrogate  : optional fitted Surrogate instance (gen2.surrogate.Surrogate).
+    surrogate  : optional fitted Surrogate instance (funnel.surrogate.Surrogate).
                  Required for sampler="surrogate_ucb"; ignored for others.
     seed       : RNG seed (ensures deterministic campaigns).
     kappa      : UCB exploration coefficient μ + κ·σ (surrogate_ucb only).
@@ -598,7 +587,6 @@ class CandidateGenerator:
 if __name__ == "__main__":
     import sys
     import math
-    import tempfile
 
     print("=" * 60)
     print("CandidateGenerator self-test")
@@ -694,10 +682,10 @@ if __name__ == "__main__":
 
     # ── TEST 5: surrogate_ucb path with real saved surrogate ──────────────────
     print("\n--- TEST 5: surrogate_ucb with real surrogate (surrogate_n45.joblib) ---")
-    _surr_path = Path(__file__).resolve().parents[1] / "results" / "gen2" / "surrogate_n45.joblib"
+    _surr_path = Path(__file__).resolve().parents[1] / "results" / "funnel" / "surrogate_n45.joblib"
     if _surr_path.exists():
         try:
-            from eda_rl.gen2.surrogate import Surrogate
+            from eda_rl.funnel.surrogate import Surrogate
             surr = Surrogate.load(_surr_path)
             gen5 = CandidateGenerator(space, sampler="surrogate_ucb",
                                       surrogate=surr, seed=0, kappa=1.0, grid_snap=True)
@@ -725,6 +713,28 @@ if __name__ == "__main__":
         else:
             gen6.update(cfg, reward=-40.0, fidelity="F1")
     print(f"  Random sampler: {len(cfgs_rand)} suggestions, kill-memo size: {len(gen6._killed)}: PASS")
+
+    # ── TEST 7: _snap_config leaves non-_snap_step float axes untouched (F6) ──
+    print("\n--- TEST 7: _snap_config passthrough for axes without _snap_step (F6) ---")
+    # A likith-style asap7 space: sub-ns clock range + SDC/place axes, none of
+    # which declare a _snap_step. Before the F6 fix, _snap_config pinned every
+    # one of these to its lower bound via a hardcoded 0.5 ns default step.
+    likith_space = {
+        "clock_period_ns": {"type": "float", "range": [0.045, 0.070], "default": 0.050},
+        "IO_DELAY": {"type": "float", "range": [0.0005, 0.002], "default": 0.001},
+        "PLACE_DENSITY_LB_ADDON": {"type": "float", "range": [0.0, 0.20], "default": 0.0},
+    }
+    probe = {"clock_period_ns": 0.062, "IO_DELAY": 0.0018, "PLACE_DENSITY_LB_ADDON": 0.15}
+    snapped = _snap_config(probe, likith_space)
+    assert snapped == probe, \
+        f"_snap_config must not touch axes lacking _snap_step; got {snapped} from {probe}"
+    # And a declared _snap_step axis IS still snapped.
+    fb = _fallback_space()
+    snapped_clk = _snap_config({"clock_period_ns": 5.2, **{k: fb[k]["default"]
+                               for k in ("mac_lanes", "accumulator_width", "abc_recipe")}}, fb)
+    assert snapped_clk["clock_period_ns"] == 5.0, \
+        f"declared _snap_step clock axis should snap 5.2->5.0, got {snapped_clk['clock_period_ns']}"
+    print("  _snap_config: sub-range likith axes pass through, tinymac clock still snaps  PASS")
 
     print("\n" + "=" * 60)
     print("All CandidateGenerator self-tests PASSED")

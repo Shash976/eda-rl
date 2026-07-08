@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""run_funnel_optimizer.py — live campaign driver for the gen2 funnel optimizer.
+"""run_funnel_optimizer.py — live campaign driver for the funnel optimizer.
 
 Gen2 counterpart of gen1/run_physical_optimizer.py.  Drives a loop of:
   1. CandidateGenerator.suggest() → next config
@@ -8,26 +8,25 @@ Gen2 counterpart of gen1/run_physical_optimizer.py.  Drives a loop of:
   4. CandidateGenerator.update(config, terminal_reward, fidelity)
   5. PromotionAgent.update per step (online LinUCB update)
 
-Logs one JSONL line per episode to optimizer/campaigns/<design>/<platform>/results_funnel_campaigns.jsonl.
+Logs one JSONL line per episode to eda_rl/campaigns/<design>/<platform>/results_funnel_campaigns.jsonl.
 Prints a running incumbent line and a summary on exit.
 
 CLI
 ---
-  python3 optimizer/gen2/run_funnel_optimizer.py \\
+  python3 eda-rl optimize \\
       --design tinymac_accel --platform nangate45 \\
       --budget-hours 4 \\
       --max-tier 1 \\
       --sampler tpe|surrogate_ucb|random \\
       --promotion fixed|linucb|random \\
       --seed 0 \\
-      --table optimizer/results/gen2/results_funnel.jsonl  # omit for live mode
-      --surrogate optimizer/results/gen2/surrogate_n45.joblib   # default: auto-detect
+      --table eda_rl/results/funnel/results_funnel.jsonl  # omit for live mode
+      --surrogate eda_rl/results/funnel/surrogate_n45.joblib   # default: auto-detect
 
 Table mode (--table given): replays logged observations, charges recorded cost
 against a simulated wall-clock budget.  PHYSICAL_MOCK=1 activates mock metrics
 for live mode (no real ORFS calls).
 
-Entry point is also available via the compat shim optimizer/run_funnel_optimizer.py.
 """
 
 from __future__ import annotations
@@ -40,8 +39,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-# ── bootstrap: make optimizer/ root importable ───────────────────────────────
-import pathlib as _pl
+# ── bootstrap (historical; package is installed) ───────────────────────────────
 # [eda_rl] bootstrap removed (installed package): sys.path.insert(0, str(_pl.Path(__file__).resolve().parents[1]))
 
 # Force UTF-8 stdout
@@ -53,21 +51,21 @@ except Exception:
 # ── imports (all defensive with clear error messages) ─────────────────────────
 
 try:
-    from eda_rl.gen2.funnel import FunnelEnv, load_table
+    from eda_rl.funnel.env import FunnelEnv, load_table
     _FUNNEL_OK = True
 except Exception as _e:
     _FUNNEL_OK = False
     _FUNNEL_ERR = str(_e)
 
 try:
-    from eda_rl.gen2.candidates import CandidateGenerator, _fallback_space
+    from eda_rl.funnel.candidates import CandidateGenerator, _fallback_space
     _CAND_OK = True
 except Exception as _e:
     _CAND_OK = False
     _CAND_ERR = str(_e)
 
 try:
-    from eda_rl.gen2.promotion_agent import (
+    from eda_rl.funnel.promotion_agent import (
         FixedGateAgent,
         PromotionAgent,
         RandomPromotionAgent,
@@ -82,7 +80,7 @@ except Exception as _e:
 
 _OPT_ROOT = Path(__file__).resolve().parents[1]
 _CAMPAIGNS_ROOT = _OPT_ROOT / "campaigns"
-_DEFAULT_SURROGATE = _OPT_ROOT / "results" / "gen2" / "surrogate_n45.joblib"
+_DEFAULT_SURROGATE = _OPT_ROOT / "results" / "funnel" / "surrogate_n45.joblib"
 _DEFAULT_SPACE_YAML = Path(__file__).resolve().parent / "search_space_funnel.yaml"
 
 # Fidelity labels in promotion order
@@ -99,12 +97,36 @@ def _load_surrogate(path: str | Path | None) -> Any | None:
     if not p.exists():
         return None
     try:
-        from eda_rl.gen2.surrogate import Surrogate
+        from eda_rl.funnel.surrogate import Surrogate
         s = Surrogate.load(p)
         return s
     except Exception as exc:   # noqa: BLE001
         print(f"  [WARNING] could not load surrogate from {p}: {exc}")
         return None
+
+
+def _surrogate_covers(surrogate: Any, space: dict) -> bool:
+    """True if the fitted surrogate's config-axis schema covers this space.
+
+    Probes with one representative config drawn from the space (defaults /
+    first choices / range lows). An unfitted surrogate passes — it predicts
+    nothing either way and stays useful as a shaping no-op.
+    """
+    if not getattr(surrogate, "_fitted", False):
+        return True
+    cfg: dict = {}
+    for axis, spec in space.items():
+        if "default" in spec:
+            cfg[axis] = spec["default"]
+        elif spec.get("choices"):
+            cfg[axis] = spec["choices"][0]
+        elif spec.get("range"):
+            cfg[axis] = spec["range"][0]
+    try:
+        surrogate.predict_reward_stats(cfg, None, reward_kind="generic", refs={})
+        return True
+    except Exception:  # noqa: BLE001 — schema-coverage refusal (or any predict failure)
+        return False
 
 
 # ── helper: build space dict ──────────────────────────────────────────────────
@@ -195,21 +217,32 @@ def run_campaign(
     results_path.parent.mkdir(parents=True, exist_ok=True)
     campaign_id = f"campaign_{seed}_{int(t0)}"
 
+    # ── build space ────────────────────────────────────────────────────────────
+    space = _build_space(design, platform, max_tier, space_yaml=space_yaml)
+    if verbose:
+        print(f"  Space: {len(space)} axes: {list(space.keys())}")
+
     # ── load surrogate ─────────────────────────────────────────────────────────
     # Auto-detect default surrogate if not specified
     if surrogate_path is None and _DEFAULT_SURROGATE.exists():
         surrogate_path = _DEFAULT_SURROGATE
     surrogate = _load_surrogate(surrogate_path)
+    if surrogate is not None and not _surrogate_covers(surrogate, space):
+        # A fitted surrogate whose config-axis schema doesn't cover this
+        # design's space would raise on every predict — the coverage guard
+        # catches each call, so it silently contributes 0.0 everywhere and
+        # surrogate_ucb degenerates to arbitrary ordering. Drop it loudly
+        # instead of announcing "Surrogate loaded".
+        if verbose:
+            print(f"  [WARNING] surrogate at {surrogate_path} does not cover this "
+                  f"design's config axes — ignoring it. Refit with: eda-rl "
+                  f"fit-surrogate on campaigns of this design.")
+        surrogate = None
     if verbose and surrogate is not None:
         print(f"  Surrogate loaded from {surrogate_path} "
               f"(fitted={surrogate._fitted}, n_rows={surrogate._n_rows})")
     elif verbose:
         print(f"  No surrogate (UCB scoring disabled)")
-
-    # ── build space ────────────────────────────────────────────────────────────
-    space = _build_space(design, platform, max_tier, space_yaml=space_yaml)
-    if verbose:
-        print(f"  Space: {len(space)} axes: {list(space.keys())}")
 
     # ── load table (if given) ──────────────────────────────────────────────────
     table = None
@@ -267,6 +300,25 @@ def run_campaign(
     n_f3 = 0
     per_fidelity_counts: dict[str, int] = {f: 0 for f in _FIDELITY_ORDER}
 
+    # audit F15: a reset() failure (invalid config / constraint violation) costs
+    # zero budget, so a generator whose space systematically mismatches the
+    # table/constraints busy-loops forever with no output.  Abort after N
+    # consecutive failures.  Reset to 0 on any successful reset.
+    consecutive_reset_failures = 0
+    _MAX_CONSECUTIVE_RESET_FAILURES = 25
+
+    # audit F15: campaign metadata stamped onto every episode row so a log can be
+    # attributed to a (design, platform, sampler, promotion, tier, seed) after the
+    # fact — the two existing overnight logs could not be.
+    campaign_meta = {
+        "design":    design,
+        "platform":  platform,
+        "sampler":   sampler,
+        "promotion": promotion,
+        "max_tier":  max_tier,
+        "seed":      seed,
+    }
+
     if verbose:
         print(f"\n  Campaign {campaign_id}")
         print(f"  sampler={sampler} promotion={promotion} budget={budget_s/3600:.2f}h "
@@ -291,11 +343,23 @@ def run_campaign(
         except (ValueError, KeyError) as exc:
             # Invalid config (not in table, or constraint violation)
             gen.update(config, reward=-100.0, fidelity="invalid")
+            consecutive_reset_failures += 1
+            if consecutive_reset_failures >= _MAX_CONSECUTIVE_RESET_FAILURES:
+                print(f"  [ABORT] {consecutive_reset_failures} consecutive "
+                      f"env.reset failures (last: {exc!r}) — the candidate space "
+                      f"likely mismatches the table/constraints; stopping campaign.")
+                break
             continue
         except Exception as exc:   # noqa: BLE001
             gen.update(config, reward=-100.0, fidelity="invalid")
             print(f"  [WARN] env.reset failed: {exc}")
+            consecutive_reset_failures += 1
+            if consecutive_reset_failures >= _MAX_CONSECUTIVE_RESET_FAILURES:
+                print(f"  [ABORT] {consecutive_reset_failures} consecutive "
+                      f"env.reset failures (last: {exc!r}) — stopping campaign.")
+                break
             continue
+        consecutive_reset_failures = 0   # a good reset breaks any failure streak
 
         episode_reward_acc = 0.0
         episode_done = False
@@ -307,8 +371,12 @@ def run_campaign(
         episode_t0 = time.time()
 
         while not episode_done:
-            if env.spent_s + env._episode_spent_s >= budget_s:
-                # Over budget mid-episode
+            if env.spent_s >= budget_s:
+                # Over budget mid-episode.  env.spent_s already includes this
+                # episode's accumulated cost (FunnelEnv._charge adds every cost to
+                # both _spent_s and _episode_spent_s), so adding _episode_spent_s
+                # here double-counted the episode spend and stopped campaigns early
+                # (audit F15).
                 break
 
             action = promo.act(state)
@@ -381,6 +449,7 @@ def run_campaign(
         log_row = {
             "ts":            time.time(),
             "campaign_id":   campaign_id,
+            **campaign_meta,   # audit F15: design/platform/sampler/promotion/max_tier/seed
             "episode":       n_episodes,
             "config":        config,
             "actions":       episode_actions,
@@ -436,7 +505,20 @@ def run_campaign(
         "promotion":          promotion,
         "seed":               seed,
         "platform":           platform,
+        "design":             design,
+        "max_tier":           max_tier,
     }
+
+    # audit F15: persist the summary as a final self-describing row so a campaign
+    # log is complete on its own.  It is wrapped under "campaign_summary" (no
+    # top-level "config" key) so campaign_data.load_campaign_rows — which keeps
+    # only dict rows containing "config" — skips it, keeping report/dashboard
+    # backward-compatible with logs that lack it.
+    try:
+        with open(results_path, "a", encoding="utf-8") as fout:
+            fout.write(json.dumps({"campaign_summary": summary}) + "\n")
+    except OSError:
+        pass
 
     if verbose:
         print(f"\n  Summary")

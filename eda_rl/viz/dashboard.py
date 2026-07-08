@@ -8,13 +8,13 @@ you watch reward / param-importance / slice / parallel-coordinate update as
 run_funnel_optimizer.py runs.
 
     # one-shot snapshot of the latest campaign, opens http://127.0.0.1:8080/
-    python3 optimizer/viz/dashboard.py
+    eda-rl dashboard
 
     # follow a live run (in another terminal, while the optimizer writes the log)
-    python3 optimizer/viz/dashboard.py --live --log tinymac_accel_run1.jsonl
+    eda-rl dashboard --live --log tinymac_accel_run1.jsonl
 
     # just rebuild the study file without launching the server
-    python3 optimizer/viz/dashboard.py --no-serve --storage /tmp/funnel.db
+    eda-rl dashboard --no-serve --storage /tmp/funnel.db
 
 Storage default is a JournalStorage file next to the log. optuna-dashboard reads
 it live; deleting it forces a clean rebuild (or pass --rebuild).

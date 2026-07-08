@@ -8,7 +8,7 @@ cycle, and acc_sat = saturate(acc + psum) is latched — once per chunk, not onc
 per individual product.
 
 Sweep command that produced these numbers:
-    python3 optimizer/measure_real.py
+    python3 legacy/measure_real.py
     (extended to LANES ∈ {1,2,4,8,16,32}, averaging all 64 inference vectors)
 
 Public contract (other modules import exactly these names):
@@ -28,6 +28,33 @@ from __future__ import annotations
 # This is unaffected by the accelerator saturation-order fix.
 SW_BASELINE_CYCLES: int = 11_196_638
 
+# SW baseline clock / latency, used to convert cycle counts → real-time speedup
+# (reward.real_speedup, physical_reward).  Moved here from gen1/reward.py so
+# funnel/common no longer import gen1 for these measured constants (audit F16);
+# gen1/reward.py keeps its own identical copies (frozen history).
+SW_BASELINE_CLOCK_NS: float = 10.0                              # 100 MHz
+SW_BASELINE_LATENCY_NS: float = SW_BASELINE_CYCLES * SW_BASELINE_CLOCK_NS
+
+
+# ── TinyVAD accumulator-overflow predicate (moved from gen1/reward.py, F16) ────
+# TinyVAD worst-case signed accumulator magnitude:
+#   Conv0: K=200 (in_ch=40 × kern=5), max |product| = 128×128 = 16384
+#   Max |acc| = 200 × 16384 = 3,276,800
+_TINYVAD_MAX_ACC = 3_276_800
+_INT_MAX = {16: 32_767, 24: 8_388_607, 32: 2_147_483_647}
+
+
+def acc_overflows(config: dict) -> bool:
+    """Fast proxy check: True if acc_width is analytically too narrow for TinyVAD.
+
+    The sim will also catch this (accuracy < 1.0), but this lets agents/rewards
+    skip obviously bad configs without launching a subprocess.  Identical to the
+    gen1/reward.py predicate it was moved from (audit F16 — decouple funnel/common
+    from gen1); gen1 keeps its own copy.
+    """
+    acc_w = config.get("accumulator_width", 32)
+    return _TINYVAD_MAX_ACC > _INT_MAX.get(acc_w, _INT_MAX[32])
+
 # ── Measured accelerator cycles per inference ─────────────────────────────────
 # Sweep: LANES ∈ {1,2,4,8,16,32}, ACC_W=32 (acc_w does not affect cycle count),
 # 64 test vectors each, averaged.  Measured 2026-06-10 after V13 fix.
@@ -35,7 +62,7 @@ SW_BASELINE_CYCLES: int = 11_196_638
 # Cycle model is output-stationary with ACCEL_CH_OVERHEAD=2 (bias load + requant):
 #   latency = n_outputs × (ceil(K / LANES) + 2)
 #
-# Sanity anchors from docs/07_rl_pipeline_design.md (measured on same machine):
+# Sanity anchors from legacy/docs/07_rl_pipeline_design.md (measured on same machine):
 #   8 lanes ≈ 61,399  →  measured 61,400  ✓ (within 1 cycle)
 #  16 lanes ≈ 46,669  →  measured 46,670  ✓ (within 1 cycle)
 AVG_CYCLES: dict[int, int] = {

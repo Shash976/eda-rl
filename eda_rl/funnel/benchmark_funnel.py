@@ -26,7 +26,7 @@ Honesty rules (from Phase 4 doc):
       precedent).  We just run it and report.
 
 Usage:
-    python3 optimizer/benchmark_funnel.py [options]
+    eda-rl benchmark [options]
 
 Options:
     --seeds N          number of seeds                    (default: 20)
@@ -44,15 +44,10 @@ Set PHYSICAL_MOCK=1 if running without ORFS (FunnelEnv will use mock metrics).
 from __future__ import annotations
 
 import argparse
-import json
 import math
-import os
 import random
 import statistics
 import sys
-import time
-from collections import defaultdict
-from itertools import product
 from pathlib import Path
 from typing import Any
 
@@ -61,7 +56,7 @@ import numpy as np
 # ── CandidateGenerator (optional — absent before candidates.py lands) ─────────
 _CAND_AVAILABLE = False
 try:
-    from eda_rl.gen2.candidates import CandidateGenerator, _fallback_space
+    from eda_rl.funnel.candidates import CandidateGenerator, _fallback_space
     _CAND_AVAILABLE = True
 except Exception:
     CandidateGenerator = None   # type: ignore[assignment,misc]
@@ -85,22 +80,18 @@ _FUNNEL_AVAILABLE = False
 _FUNNEL_IMPORT_ERROR: str = ""
 
 try:
-    from eda_rl.gen2.funnel import FunnelEnv, load_table  # type: ignore[import]
+    from eda_rl.funnel.env import FunnelEnv, load_table  # type: ignore[import]
     _FUNNEL_AVAILABLE = True
 except Exception as _e:
     _FUNNEL_IMPORT_ERROR = str(_e)
 
 # ── promotion agent imports ────────────────────────────────────────────────────
 
-from eda_rl.gen2.promotion_agent import (  # noqa: E402
+from eda_rl.funnel.promotion_agent import (  # noqa: E402
     FixedGateAgent,
     PromotionAgent,
     RandomPromotionAgent,
     STATE_DIM,
-    IDX_DEPTH_F0, IDX_DEPTH_F1, IDX_DEPTH_F2, IDX_DEPTH_F3,
-    IDX_F0_ACC, IDX_F1_ACC, IDX_F2_WNS, IDX_SURR_MU, IDX_SURR_SIG,
-    IDX_INCUMBENT, IDX_BUDGET_FRAC, IDX_F0_CYCLES, IDX_F1_CYCLES,
-    IDX_F2_AREA, IDX_F2_FF, IDX_F2_CELLS, IDX_F2_LEVELS,
 )
 
 # ── constants ─────────────────────────────────────────────────────────────────
@@ -366,7 +357,7 @@ def _run_campaign(
                     except Exception:
                         break
                     # Snap to table-present configs: only yield if in the table
-                    from eda_rl.gen2.funnel import _config_key as _ck
+                    from eda_rl.funnel.env import _config_key as _ck
                     key = _ck(cfg)
                     if key in table and key not in _seen:
                         _seen.add(key)
@@ -420,16 +411,20 @@ def _run_campaign(
             simulated_s += episode_cost
 
             # Only count terminal F3 rewards toward the incumbent.
-            # episode_reward is the FunnelEnv terminal reward (including shaping);
-            # for the benchmark metric we use it directly since this is the same
-            # reward that agents are optimizing.
+            # Score with the PURE terminal reward (info["terminal_reward"]), the
+            # same signal the live driver tells Optuna and tracks best on.  The
+            # accumulated shaped sum (episode_reward) is path- and budget-
+            # dependent — an agent that promotes through F1+F2 pays more shaping
+            # cost than one that commits straight to F3 for the same chip — so
+            # scoring it against the pure-terminal table optimum systematically
+            # penalized promote-through policies.
             fid_reached = info.get("fidelity", "?") if episode_done else "?"
             is_table_miss = bool(info.get("table_miss"))
             # A real F3 commit (not a table_miss) is the only thing that updates
             # the incumbent / counts toward the optimum (audit EXP-F6): a
             # table_miss carries no terminal data and must not be scored.
             if fid_reached == "F3" and episode_done and not is_table_miss:
-                final_reward = float(episode_reward)
+                final_reward = float(info.get("terminal_reward", episode_reward))
 
                 # Feed back to CandidateGenerator (F3-only tell rule)
                 if _cand_gen is not None:
@@ -478,7 +473,6 @@ def _make_agent(name: str, seed: int) -> Any | None:
     elif name == "ppo":
         try:
             from stable_baselines3 import PPO  # type: ignore[import]
-            import gym  # type: ignore[import]
             # PPO hook: wrap in a thin adapter that satisfies our act/update interface
             # (not trained here — serves as a wiring test stub)
             class _PPOAdapter:
@@ -547,7 +541,7 @@ def run_benchmark(
     # returned -20 and silently became the "optimum" on an F3-less table — the
     # benchmark then "measured" agents against a -20 failure floor and the
     # guard below never fired.  We now skip them and require ≥1 real F3 row.
-    from eda_rl.gen2.funnel import _config_key as _ck
+    from eda_rl.funnel.env import _config_key as _ck
     import tempfile as _tmpfile
     f3_rewards: list[float] = []
     n_table_miss = 0
@@ -577,7 +571,7 @@ def run_benchmark(
             f"Benchmark table has 0 real F3 rows across {len(grid_configs)} "
             "scanned configs — the optimum is undefined and no verdict can be "
             "rendered. Point --table at a file with real F3/ok rows (e.g. a "
-            "campaign log under optimizer/campaigns/), pass --include-campaigns, "
+            "campaign log under eda_rl/campaigns/), pass --include-campaigns, "
             "or build F3 rows first. (See audit EXP-F1.)"
         )
     table_optimum = max(f3_rewards)
@@ -860,7 +854,7 @@ def _merge_tables(paths: list[Path]) -> dict:
 
 
 def _campaign_jsonl_paths() -> list[Path]:
-    """All campaign logs under optimizer/campaigns/<design>/<platform>/*.jsonl."""
+    """All campaign logs under eda_rl/campaigns/<design>/<platform>/*.jsonl."""
     camp = _OPT_DIR / "campaigns"
     return sorted(camp.rglob("*.jsonl")) if camp.is_dir() else []
 
@@ -929,11 +923,11 @@ def main() -> None:
     parser.add_argument("--selftest", action="store_true",
                         help="Run synthetic-table selftest and exit")
     parser.add_argument("--table",
-                        default=str(_THIS_DIR.parent / "results" / "gen2" / "results_funnel.jsonl"),
+                        default=str(_THIS_DIR.parent / "results" / "funnel" / "results_funnel.jsonl"),
                         help="Path(s) to results_funnel.jsonl table(s); comma-separated to merge")
     parser.add_argument("--include-campaigns", action="store_true",
                         dest="include_campaigns",
-                        help="Also merge all real F3 rows from optimizer/campaigns/**/*.jsonl")
+                        help="Also merge all real F3 rows from eda_rl/campaigns/**/*.jsonl")
     parser.add_argument("--target-pct", type=float, default=0.95,
                         dest="target_pct",
                         help="Fraction of optimum considered 'found'")
@@ -944,7 +938,7 @@ def main() -> None:
                             "(default, keeps existing results comparable); "
                             "tpe = Optuna TPE-backed CandidateGenerator; "
                             "surrogate_ucb = surrogate UCB (falls back to tpe without surrogate). "
-                            "Non-shuffled modes require gen2/candidates.py."
+                            "Non-shuffled modes require funnel/candidates.py."
                         ))
 
     args = parser.parse_args()
@@ -964,7 +958,7 @@ def main() -> None:
     missing = [p for p in table_paths if not p.exists()]
     if missing:
         print(f"Table file(s) not found: {[str(p) for p in missing]}")
-        print("Run: python3 optimizer/build_table.py --subset strategic")
+        print("Run: eda-rl build-table --subset strategic")
         print("Or use --selftest / --include-campaigns.")
         sys.exit(1)
     if not table_paths:

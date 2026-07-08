@@ -51,16 +51,18 @@ DESIGN-AGNOSTIC EXTENSION (V12):
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import os
 import re
 import shutil
 import signal
 import subprocess
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from eda_rl.common.recipe import (
-    RECIPES,
     config_mk_lines,
     recipe_suffix,
     resolve_recipe,
@@ -94,11 +96,32 @@ ORFS_DIR     = Path(os.environ.get("ORFS_DIR", "/opt/OpenROAD-flow-scripts"))
 ORFS_TIMEOUT = int(os.environ.get("ORFS_TIMEOUT", "2400"))   # seconds; P&R is slow
 PROXY_TIMEOUT = int(os.environ.get("PROXY_TIMEOUT", "300"))  # synth+STA is fast
 
-# Single std-cell liberty per platform, for the fast synth+STA proxy.
-# (asap7 ships many gzipped per-cell-type libs — not wired for the proxy.)
-_LIBERTY = {
-    "nangate45": "platforms/nangate45/lib/NangateOpenCellLibrary_typical.lib",
-    "sky130hd":  "platforms/sky130hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib",
+# Std-cell liberty file(s) per platform, for the fast synth+STA proxy.
+# nangate45/sky130hd each ship one merged .lib; asap7 has no merged liberty —
+# its cells are split across per-cell-type NLDM libs (4 gzipped + the plain
+# SEQ lib) that must all be loaded. yosys' abc/stat and OpenSTA's read_liberty
+# accept repeated -liberty flags (and read .gz natively), so we pass the whole
+# list, mirroring ORFS' synth_preamble.tcl `foreach lib $LIB_FILES`.
+# asap7 corner: ORFS' asap7/config.mk defaults CORNER ?= BC (best = FF) and
+# PRIMARY_VT = RVT (tag R), so we use the RVT/FF set — matching what the full
+# F3 flow synthesises with.
+_LIBERTY: dict[str, list[str]] = {
+    "nangate45": ["platforms/nangate45/lib/NangateOpenCellLibrary_typical.lib"],
+    "sky130hd":  ["platforms/sky130hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib"],
+    "asap7": [
+        "platforms/asap7/lib/NLDM/asap7sc7p5t_AO_RVT_FF_nldm_211120.lib.gz",
+        "platforms/asap7/lib/NLDM/asap7sc7p5t_INVBUF_RVT_FF_nldm_220122.lib.gz",
+        "platforms/asap7/lib/NLDM/asap7sc7p5t_OA_RVT_FF_nldm_211120.lib.gz",
+        "platforms/asap7/lib/NLDM/asap7sc7p5t_SIMPLE_RVT_FF_nldm_211120.lib.gz",
+        "platforms/asap7/lib/NLDM/asap7sc7p5t_SEQ_RVT_FF_nldm_220123.lib",
+    ],
+}
+# yosys' `dfflibmap` accepts only ONE liberty (see ORFS synth.tcl: "dfflibmap
+# only supports one liberty file"). For split-lib platforms the sequential
+# cells live in the SEQ lib; single-lib platforms map DFFs from their one lib.
+# Absent an entry, run_synth_sta falls back to the platform's first _LIBERTY.
+_DFF_LIB: dict[str, str] = {
+    "asap7": "platforms/asap7/lib/NLDM/asap7sc7p5t_SEQ_RVT_FF_nldm_220123.lib",
 }
 # Tech + std-cell LEF (OpenROAD's link_design needs a technology, not just
 # liberty).  Curated — deliberately excludes the SRAM/fakeram macro LEFs.
@@ -107,6 +130,10 @@ _LEF = {
                   "platforms/nangate45/lef/NangateOpenCellLibrary.macro.lef"],
     "sky130hd":  ["platforms/sky130hd/lef/sky130_fd_sc_hd.tlef",
                   "platforms/sky130hd/lef/sky130_fd_sc_hd_merged.lef"],
+    # asap7: tech LEF + primary-VT (R) std-cell LEF, per asap7/config.mk
+    # (TECH_LEF, SC_LEF with PRIMARY_VT_TAG=R).
+    "asap7": ["platforms/asap7/lef/asap7_tech_1x_201209.lef",
+              "platforms/asap7/lef/asap7sc7p5t_28_R_1x_220121a.lef"],
 }
 # Synth cell area → estimated post-P&R "Design area" inflation (CTS/repair
 # buffers). Calibrated on nangate45 LANES=4: 19738 / 14589 ≈ 1.35.
@@ -139,6 +166,140 @@ def _rtl_hash() -> str:
 # FAIL, or PARSE_FAIL so a transient build failure doesn't poison future calls.
 _physical_cache: dict[tuple, dict] = {}
 _synth_sta_cache: dict[tuple, dict] = {}
+
+
+# ── validate_config warning rate-limiter (audit F17/R8) ───────────────────────
+# A single sagar campaign emitted the same PLACE_DENSITY/LB_ADDON exclusivity
+# warning to stderr on ~1,400 episodes.  Print each DISTINCT warning once per
+# process; count repeats and summarise the suppressed counts at process exit.
+_seen_knob_warnings: dict[str, int] = {}
+_knob_warn_atexit_registered = False
+
+
+def _flush_knob_warning_counts() -> None:
+    import sys as _sys
+    for msg, n in _seen_knob_warnings.items():
+        if n > 1:
+            print(f"[physical_runner] knob warning (repeated {n}×, "
+                  f"{n - 1} suppressed after the first): {msg}", file=_sys.stderr)
+
+
+def _warn_knob_once(msg: str) -> None:
+    """Print a validate_config warning the first time it's seen; suppress repeats
+    (counted and summarised at exit)."""
+    import sys as _sys
+    global _knob_warn_atexit_registered
+    n = _seen_knob_warnings.get(msg, 0)
+    _seen_knob_warnings[msg] = n + 1
+    if n == 0:
+        print(f"[physical_runner] knob warning: {msg}", file=_sys.stderr)
+        if not _knob_warn_atexit_registered:
+            import atexit
+            atexit.register(_flush_knob_warning_counts)
+            _knob_warn_atexit_registered = True
+
+
+# ── Subprocess helpers (process-group-safe) ───────────────────────────────────
+
+def _killpg(proc: "subprocess.Popen") -> None:
+    """SIGKILL the whole process group led by `proc` (best-effort).
+
+    `proc` must have been started with start_new_session=True so it leads its
+    own group; killing the group reaps tool grandchildren (yosys/openroad under
+    the `bash -c` wrapper) that a plain proc.kill() would leave detached.
+    """
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _run_capture(cmd: "list[str]", cwd: str, timeout: int) -> subprocess.CompletedProcess:
+    """Drop-in for `subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
+    timeout=timeout)` that kills the entire process group on timeout (or any
+    other communicate() failure).
+
+    A plain subprocess.run(timeout=…) only kills the direct child — the `bash`
+    wrapper — so a `yosys`/`openroad` grandchild keeps running detached and
+    accumulates over a long unattended campaign (audit F12).  This reuses the
+    exact Popen(start_new_session=True) + communicate(timeout) + os.killpg
+    pattern run_physical was hardened with in the second audit.
+
+    Return/exception semantics match subprocess.run: a CompletedProcess with
+    .returncode/.stdout/.stderr, and subprocess.TimeoutExpired re-raised on
+    timeout (so callers that let it propagate, or catch SubprocessError, are
+    unaffected).
+    """
+    proc = subprocess.Popen(
+        cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, start_new_session=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except BaseException:
+        # TimeoutExpired, decode error, OSError, KeyboardInterrupt, …: the child
+        # is in its own session, so nothing else will reap the tool grandchildren
+        # unless we kill the group here before propagating.
+        _killpg(proc)
+        proc.wait()
+        raise
+    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+
+
+def _staged_src_subdir(design: "Any") -> str:
+    """Content-addressed RTL staging subdir under src/ (audit F13).
+
+    Staging into ``src/<design>_<rtlhash8>/`` (not the shared ``src/<design>/``)
+    makes the staged source immutable per RTL-content hash.  Before this, two
+    campaigns on the same design name but different RTL content (an edited working
+    tree vs an older checkout sharing one EDA_RL_WORK) both wrote
+    ``src/<design>/<file>``; campaign B's copy would poison campaign A's next
+    build, which then synthesised B's RTL into a variant dir whose name claims
+    A's hash — a permanently poisoned cache.  The variant name already embeds the
+    same ``design.rtl_hash()``, so the staging dir and the results dir stay in
+    lockstep.  (Legacy design=None tinymac path keeps the flat ``src/<DESIGN>/``.)
+    """
+    return f"{design.name}_{design.rtl_hash()}"
+
+
+@contextmanager
+def _variant_build_lock(var: str, gds: "Path"):
+    """Exclusive per-variant build lock around the ORFS make invocation (F13).
+
+    Yields True if we acquired the lock (the caller should build), or False if
+    another process already holds it — meaning an identical config from another
+    seed/campaign sharing this EDA_RL_WORK is building the same variant, whose
+    ``config_<var>.mk`` / ``results/<plat>/<design>/<var>/`` paths we'd otherwise
+    race on.  When the lock is contended we DON'T double-build: we poll (every
+    2 s, up to ORFS_TIMEOUT) until either the result GDS appears (reuse it) or the
+    other builder releases the lock (it finished or failed — then we take the lock
+    and build).  Non-blocking throughout, so a stuck peer can't wedge us forever.
+    """
+    lock_dir = RUN_DIR / "locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_fh = open(lock_dir / f"{var}.lock", "w")
+    have_lock = False
+    try:
+        try:
+            fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            have_lock = True
+        except OSError:
+            # Held by another process building this exact variant — wait it out.
+            deadline = time.time() + ORFS_TIMEOUT
+            while time.time() < deadline:
+                if gds.exists():
+                    break                       # peer produced the GDS → reuse
+                try:
+                    fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    have_lock = True
+                    break                       # peer released → we build
+                except OSError:
+                    time.sleep(2.0)
+        yield have_lock
+    finally:
+        if have_lock:
+            fcntl.flock(lock_fh, fcntl.LOCK_UN)
+        lock_fh.close()
 
 
 def variant_name(lanes: int, acc_w: int, clk_ns: float,
@@ -277,6 +438,10 @@ def _parse_metrics(work: Path, platform: str, variant: str, clk_ns: float,
             ff = jd.get("finish__design__instance__count__class:sequential_cell")
             if sc is not None:
                 out["cell_count"] = int(sc)
+            # F17: a purely combinational design (e.g. likith) has no sequential
+            # cells, so 6_report.json omits this key — ff_count legitimately stays
+            # None (its initialised value), no warning.  The AGENTS.md "F3 carries
+            # a real FF count" invariant holds "when present".
             if ff is not None:
                 out["ff_count"] = int(ff)
         except (OSError, ValueError, TypeError):
@@ -354,7 +519,8 @@ def _config_mk(platform: str, variant: str, lanes: int, acc_w: int,
                util: int = 40, density: float = 0.60, abc: str | None = None,
                abc_recipe: str | None = None,
                design: "Any | None" = None,
-               knob_values: "dict | None" = None) -> str:
+               knob_values: "dict | None" = None,
+               fastroute_tcl_rel: "str | None" = None) -> str:
     """Generate the per-variant ORFS config.mk content.
 
     When `design` is None, falls back to the legacy hardcoded tinymac_accel
@@ -365,6 +531,11 @@ def _config_mk(platform: str, variant: str, lanes: int, acc_w: int,
       - VERILOG_TOP_PARAMS is built from design.params ∩ config (lanes/acc_w
         are passed as top-level args for backward compat; the design bridge
         assembles the full string).
+      - fastroute_tcl_rel: relative path (DESIGN_HOME-relative content already
+        included) to a per-variant fastroute.tcl written by _stage_inputs when
+        the GR_SEED knob is active; emits FASTROUTE_TCL. None (the GR_SEED
+        knob absent/not sampled) omits the export entirely, so ORFS falls back
+        to its own platform-default fastroute.tcl — today's behavior.
       - knob_values: additional ORFS knob k→v pairs emitted after the standard
         lines.  validate_config() is called first; any errors are printed as
         warnings but do not abort (let the flow fail naturally for hard conflicts).
@@ -405,14 +576,18 @@ def _config_mk(platform: str, variant: str, lanes: int, acc_w: int,
     # For external absolute paths (e.g. gcd from ORFS), we must use the
     # absolute path directly since we copy to src/<design>/<filename>.
     rtl_fnames = [Path(f).name for f in design.rtl_files]
+    # F13: point VERILOG_FILES at the content-addressed staging dir that
+    # _stage_inputs copied into (src/<design>_<rtlhash8>/), never the shared
+    # src/<design>/ that a concurrent differing-RTL campaign could overwrite.
+    src_sub = _staged_src_subdir(design)
     if len(rtl_fnames) == 1:
         vfile_lines = (
-            f"export VERILOG_FILES = $(DESIGN_HOME)/src/{design_name}/{rtl_fnames[0]}\n"
+            f"export VERILOG_FILES = $(DESIGN_HOME)/src/{src_sub}/{rtl_fnames[0]}\n"
         )
     else:
-        first = f"$(DESIGN_HOME)/src/{design_name}/{rtl_fnames[0]}"
+        first = f"$(DESIGN_HOME)/src/{src_sub}/{rtl_fnames[0]}"
         rest  = " \\\n".join(
-            f"                       $(DESIGN_HOME)/src/{design_name}/{fn}"
+            f"                       $(DESIGN_HOME)/src/{src_sub}/{fn}"
             for fn in rtl_fnames[1:]
         )
         vfile_lines = f"export VERILOG_FILES = {first} \\\n{rest}\n"
@@ -454,14 +629,17 @@ def _config_mk(platform: str, variant: str, lanes: int, acc_w: int,
     if knob_values:
         try:
             from eda_rl.common.knobs import validate_config as _vc, KnobRegistry
-            import sys as _sys
             warnings = _vc(knob_values)
             for w in warnings:
-                print(f"[physical_runner] knob warning: {w}", file=_sys.stderr)
+                _warn_knob_once(w)   # F17/R8: rate-limit repeated warnings
             reg = KnobRegistry.load()
-            # Only emit knobs that are not already emitted above (util/density/abc/vtp)
+            # Only emit knobs that are not already emitted above (util/density/abc/vtp).
+            # CLOCK_UNCERTAINTY/IO_DELAY are SDC-owned (written by _stage_inputs via
+            # design.sdc_text()); GR_SEED is fastroute.tcl-owned (written by
+            # _stage_inputs directly) — none belong in config.mk.
             _SKIP_EMIT = {"CORE_UTILIZATION", "PLACE_DENSITY", "VERILOG_TOP_PARAMS",
-                          "ABC_AREA", "CLOCK_PERIOD"}
+                          "ABC_AREA", "CLOCK_PERIOD", "CLOCK_UNCERTAINTY", "IO_DELAY",
+                          "GR_SEED"}
             for kname, kval in knob_values.items():
                 if kname in _SKIP_EMIT:
                     continue
@@ -472,6 +650,11 @@ def _config_mk(platform: str, variant: str, lanes: int, acc_w: int,
                 # Unknown knob names are silently dropped (future-proofing)
         except ImportError:
             pass  # knobs.py not yet available; skip knob emission
+
+    fastroute_line = (
+        f"export FASTROUTE_TCL = $(DESIGN_HOME)/{fastroute_tcl_rel}\n"
+        if fastroute_tcl_rel is not None else ""
+    )
 
     return (
         "export DESIGN_HOME = .\n"
@@ -487,6 +670,7 @@ def _config_mk(platform: str, variant: str, lanes: int, acc_w: int,
         f"export PLATFORM    = {platform}\n"
         f"{vfile_lines}"
         f"export SDC_FILE      = $(DESIGN_HOME)/{platform}/{design_name}/constraint_{variant}.sdc\n"
+        f"{fastroute_line}"
         f"export CORE_UTILIZATION      = {util}\n"
         f"export PLACE_DENSITY          = {density}\n"
         f"{abc_lines}"
@@ -543,7 +727,10 @@ def _stage_inputs(platform: str, variant: str, lanes: int, acc_w: int, clk_ns: f
     # ── Design-agnostic path ─────────────────────────────────────────────────
     design_name = design.name
     cfgdir = MAKE_DIR / platform / design_name
-    srcdir = MAKE_DIR / "src" / design_name
+    # F13: stage RTL into a content-addressed dir (src/<design>_<rtlhash8>/) so
+    # concurrent campaigns on the same design name but different RTL can't
+    # overwrite each other's source.  _config_mk points VERILOG_FILES here.
+    srcdir = MAKE_DIR / "src" / _staged_src_subdir(design)
     srcdir.mkdir(parents=True, exist_ok=True)
     cfgdir.mkdir(parents=True, exist_ok=True)
 
@@ -561,14 +748,69 @@ def _stage_inputs(platform: str, variant: str, lanes: int, acc_w: int, clk_ns: f
     time_unit = PLATFORM_TIME_UNIT.get(platform, 1.0)
     sdc_clk_value = clk_ns * time_unit
 
+    # CLOCK_UNCERTAINTY/IO_DELAY (SDC-owned pseudo-knobs): convert ns -> native
+    # unit the same way clk_ns is, above. Absent from knob_values (e.g. tier <2,
+    # or a design that doesn't opt in) -> None -> sdc_text() reproduces the
+    # original SDC unchanged (no uncertainty line; clk_period*0.2 io delay).
+    uncertainty_native = None
+    io_delay_native = None
+    if knob_values:
+        if knob_values.get("CLOCK_UNCERTAINTY") is not None:
+            uncertainty_native = float(knob_values["CLOCK_UNCERTAINTY"]) * time_unit
+        if knob_values.get("IO_DELAY") is not None:
+            io_delay_native = float(knob_values["IO_DELAY"]) * time_unit
+
     # Generate SDC from DesignSpec template
     gen_sdc = cfgdir / f"constraint_{variant}.sdc"
-    gen_sdc.write_text(design.sdc_text(platform, sdc_clk_value))
+    gen_sdc.write_text(design.sdc_text(platform, sdc_clk_value,
+                                        uncertainty=uncertainty_native,
+                                        io_delay=io_delay_native))
+
+    # GR_SEED (fastroute.tcl-owned pseudo-knob): absent -> no custom fastroute.tcl
+    # is written, ORFS uses its own platform-default file (original behavior).
+    #
+    # audit F2: setting FASTROUTE_TCL makes ORFS *replace* its entire else-branch
+    # (floorplan.tcl:104-111), which is the ONLY place the sampled
+    # ROUTING_LAYER_ADJUSTMENT reaches the global router.  Copying the platform's
+    # fastroute.tcl verbatim (its previous behavior) reintroduces that file's
+    # hardcoded adjustment literal (asap7 0.25, sky130hd 0.2), silently pinning
+    # ROUTING_LAYER_ADJUSTMENT to a constant every episode that sampled GR_SEED.
+    # Instead we reproduce the platform file but replace the hardcoded literal in
+    # set_global_routing_layer_adjustment with $::env(ROUTING_LAYER_ADJUSTMENT)
+    # (ORFS always defines it -- default 0.5 in scripts/variables.yaml -- and the
+    # sampled value is emitted to config.mk), preserving the platform's -clock/
+    # -signal set_routing_layers lines.  Then append the seed line.
+    fastroute_tcl_rel = None
+    gr_seed = knob_values.get("GR_SEED") if knob_values else None
+    if gr_seed is not None:
+        base_fr = ORFS_DIR / "flow" / "platforms" / platform / "fastroute.tcl"
+        if base_fr.exists():
+            base_text = re.sub(
+                r"(set_global_routing_layer_adjustment\s+\S+)\s+[\d.]+",
+                r"\1 $::env(ROUTING_LAYER_ADJUSTMENT)",
+                base_fr.read_text(),
+            ).rstrip("\n")
+        else:
+            # No platform fastroute.tcl: reproduce ORFS's else-branch directly.
+            base_text = (
+                "set_global_routing_layer_adjustment "
+                "$::env(MIN_ROUTING_LAYER)-$::env(MAX_ROUTING_LAYER) "
+                "$::env(ROUTING_LAYER_ADJUSTMENT)\n"
+                "set_routing_layers -signal "
+                "$::env(MIN_ROUTING_LAYER)-$::env(MAX_ROUTING_LAYER)"
+            )
+        gen_fr = cfgdir / f"fastroute_{variant}.tcl"
+        gen_fr.write_text(
+            base_text + "\n"
+            f"set_global_routing_random -seed {int(gr_seed)}\n"
+        )
+        fastroute_tcl_rel = f"{platform}/{design_name}/fastroute_{variant}.tcl"
 
     gen_cfg = cfgdir / f"config_{variant}.mk"
     gen_cfg.write_text(_config_mk(platform, variant, lanes, acc_w,
                                    util, density, abc, abc_recipe,
-                                   design=design, knob_values=knob_values))
+                                   design=design, knob_values=knob_values,
+                                   fastroute_tcl_rel=fastroute_tcl_rel))
     return gen_cfg
 
 
@@ -674,49 +916,53 @@ def run_physical(lanes: int, acc_w: int, clk_ns: float, platform: str = "nangate
             f"FLOW_HOME='{ORFS_DIR}/flow' WORK_HOME='{RUN_DIR}' "
             f"DESIGN_CONFIG='{gen_cfg}' FLOW_VARIANT='{var}'"
         )
-        # V10: use Popen + communicate(timeout) + start_new_session so we can
-        # kill the entire process group on TimeoutExpired (not just the bash wrapper).
-        proc = subprocess.Popen(
-            ["bash", "-c", make_cmd], cwd=str(MAKE_DIR),
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            start_new_session=True,
-        )
-        try:
-            stdout, stderr = proc.communicate(timeout=ORFS_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            # Kill the entire process group (yosys/openroad children included).
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
-            proc.wait()
-            log_path = RUN_DIR / f"opt_{var}.log"
-            log_path.write_text(f"[TIMEOUT after {ORFS_TIMEOUT}s]\n")
-            # V10: return TIMEOUT status (never raise); do NOT cache so the config
-            # can be retried and the agent can update on it.
-            return {**base, "status": "TIMEOUT",
-                    "area_um2": None, "util_pct": None, "wns_ns": None,
-                    "tns_ns": None, "setup_viol": None, "power_mw": None,
-                    "fmax_mhz": None, "period_min_ns": None,
-                    "timing_met": None, "gds": None, "report": str(log_path)}
-        except BaseException:
-            # Any other failure during communicate() (decode error, OSError,
-            # KeyboardInterrupt, ...) — start_new_session=True detaches the
-            # child from our process group, so nothing else will reap the
-            # yosys/openroad grandchildren unless we kill them here too.
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
-            proc.wait()
-            raise
+        # F13: hold an exclusive per-variant lock across the make invocation so
+        # two identical configs (e.g. two seeds sharing this EDA_RL_WORK) don't
+        # race on config_<var>.mk / results/<var>/.  When the lock is contended
+        # _variant_build_lock polls for the peer's GDS instead of double-building;
+        # have_lock=False + a re-checked existing GDS means "reuse the peer's".
+        with _variant_build_lock(var, gds) as have_lock:
+            if have_lock and not gds.exists():
+                # V10: use Popen + communicate(timeout) + start_new_session so we can
+                # kill the entire process group on TimeoutExpired (not just the bash wrapper).
+                proc = subprocess.Popen(
+                    ["bash", "-c", make_cmd], cwd=str(MAKE_DIR),
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                    start_new_session=True,
+                )
+                try:
+                    stdout, stderr = proc.communicate(timeout=ORFS_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    # Kill the entire process group (yosys/openroad children included).
+                    _killpg(proc)
+                    proc.wait()
+                    log_path = RUN_DIR / f"opt_{var}.log"
+                    log_path.write_text(f"[TIMEOUT after {ORFS_TIMEOUT}s]\n")
+                    # V10: return TIMEOUT status (never raise); do NOT cache so the config
+                    # can be retried and the agent can update on it.  (The lock is
+                    # released by the context manager on return.)
+                    return {**base, "status": "TIMEOUT",
+                            "area_um2": None, "util_pct": None, "wns_ns": None,
+                            "tns_ns": None, "setup_viol": None, "power_mw": None,
+                            "fmax_mhz": None, "period_min_ns": None,
+                            "timing_met": None, "gds": None, "report": str(log_path)}
+                except BaseException:
+                    # Any other failure during communicate() (decode error, OSError,
+                    # KeyboardInterrupt, ...) — start_new_session=True detaches the
+                    # child from our process group, so nothing else will reap the
+                    # yosys/openroad grandchildren unless we kill them here too.
+                    _killpg(proc)
+                    proc.wait()
+                    raise
 
-        # Persist the flow output so a failure is debuggable.
-        (RUN_DIR / f"opt_{var}.log").write_text(
-            (stdout or "") + "\n--- stderr ---\n" + (stderr or "")
-        )
-        if proc.returncode != 0:
-            flow_status = "FAIL"
+                # Persist the flow output so a failure is debuggable.
+                (RUN_DIR / f"opt_{var}.log").write_text(
+                    (stdout or "") + "\n--- stderr ---\n" + (stderr or "")
+                )
+                if proc.returncode != 0:
+                    flow_status = "FAIL"
+            # else: a concurrent peer built (or is building) this variant and its
+            # GDS now exists — fall through and parse the shared results.
 
     metrics = _parse_metrics(RUN_DIR, platform, var, clk_ns,
                              design_name=actual_design_name)
@@ -729,6 +975,26 @@ def run_physical(lanes: int, acc_w: int, clk_ns: float, platform: str = "nangate
     final_status = parse_status if parse_status != "ok" else flow_status
 
     result = {**base, "status": final_status, **metrics}
+
+    # audit F1 — "fixed ruler": re-time the final netlist under a reference SDC
+    # (io 0.2 fraction, no uncertainty) so the reward metrics can't be gamed by
+    # the sampled IO_DELAY / CLOCK_UNCERTAINTY.  Only on a successful build.
+    #   - design given  → run the reference STA; on failure leave the ref keys
+    #     absent so the caller (FunnelEnv._terminal_reward) warns and falls back
+    #     to the sampled metrics (never discards a successful build).
+    #   - design is None (legacy tinymac) → its sampled SDC already IS the
+    #     reference ruler (io 0.2, no uncertainty), so mirror the sampled metrics
+    #     into the ref keys — no extra STA, no warning.
+    if final_status == "ok":
+        ref = _reference_sta(platform, actual_design_name, var, clk_ns, eff_design)
+        if ref is None and eff_design is None:
+            ref = {"wns_ref_ns": metrics.get("wns_ns"),
+                   "fmax_ref_mhz": metrics.get("fmax_mhz"),
+                   "period_ref_ns": metrics.get("period_min_ns"),
+                   "comb_delay_ns": None, "combinational_ref": False}
+        if ref is not None:
+            result.update(ref)
+
     # V10: only cache successful results.
     if final_status == "ok":
         _physical_cache[cache_key] = result
@@ -779,9 +1045,9 @@ def run_elaborate(lanes: int, acc_w: int, platform: str = "nangate45") -> dict:
         "check -assert",
         "",
     ]))
-    p = subprocess.run(
+    p = _run_capture(
         ["bash", "-c", f"source '{env_sh}' && yosys '{ys}'"],
-        cwd=str(MAKE_DIR), capture_output=True, text=True, timeout=PROXY_TIMEOUT,
+        cwd=str(MAKE_DIR), timeout=PROXY_TIMEOUT,
     )
     (work / "elaborate.log").write_text((p.stdout or "") + "\n--- stderr ---\n" + (p.stderr or ""))
     result = {"ok": p.returncode == 0, "stage": "elaborate", "log": str(work / "elaborate.log")}
@@ -792,10 +1058,11 @@ def run_elaborate(lanes: int, acc_w: int, platform: str = "nangate45") -> dict:
 
 # ── Fast proxy: Yosys synthesis + OpenROAD STA (no place & route) ──────────────
 
-def _yosys_synth_script(lanes: int, acc_w: int, lib: Path, netlist: Path,
+def _yosys_synth_script(lanes: int, acc_w: int, libs: "list[Path]", netlist: Path,
                         abc_recipe: str = "orfs_speed", platform: str = "nangate45",
                         clk_ns: float | None = None, work_dir: Path | None = None,
-                        design: "Any | None" = None) -> str:
+                        design: "Any | None" = None,
+                        dff_lib: "Path | None" = None) -> str:
     """Return a Yosys synthesis script string.
 
     Stage-B recipe extension: the abc command is now recipe-aware.
@@ -819,6 +1086,11 @@ def _yosys_synth_script(lanes: int, acc_w: int, lib: Path, netlist: Path,
     """
     resolved = resolve_recipe(abc_recipe)
 
+    # Repeated `-liberty <path>` args for the multi-command yosys flow. abc and
+    # stat accept many; dfflibmap accepts exactly one (the DFF/SEQ lib).
+    lib_flags = " ".join(f"-liberty {one}" for one in libs)
+    dff = dff_lib if dff_lib is not None else libs[0]
+
     if design is None:
         # Legacy tinymac path
         rtl = " ".join(str(RTL_DIR / f) for f in RTL_FILES)
@@ -841,28 +1113,28 @@ def _yosys_synth_script(lanes: int, acc_w: int, lib: Path, netlist: Path,
                 chparam_lines.append(f"chparam -set ACC_W {acc_w} {top}")
 
     if resolved == "plain":
-        abc_cmd = f"abc -liberty {lib}"
+        abc_cmd = f"abc {lib_flags}"
     else:
         # Write the abc.constr file so -constr has a real target.
-        constr_dir = work_dir if work_dir is not None else lib.parent
+        constr_dir = work_dir if work_dir is not None else dff.parent
         constr_path = write_abc_constr(constr_dir, platform)
-        abc_cmd = yosys_abc_line(resolved, platform, clk_ns, lib,
+        abc_cmd = yosys_abc_line(resolved, platform, clk_ns, list(libs),
                                  constr_path=constr_path)
 
     return "\n".join([
         f"read_verilog -sv {rtl}",
         *chparam_lines,
         f"synth -top {top} -flatten",
-        f"dfflibmap -liberty {lib}",
+        f"dfflibmap -liberty {dff}",
         abc_cmd,
         "opt_clean -purge",
-        f"stat -liberty {lib}",
+        f"stat {lib_flags}",
         f"write_verilog -noattr {netlist}",
         "",
     ])
 
 
-def _sta_script(lefs: list[Path], lib: Path, netlist: Path, sdc: Path,
+def _sta_script(lefs: list[Path], libs: "list[Path]", netlist: Path, sdc: Path,
                 top: str = DESIGN) -> str:
     # Pre-layout STA in OpenROAD: cell delays only (optimistic, no net RC), but
     # fast and — unlike the routed flow — target-clock-independent, so Fmax is a
@@ -870,9 +1142,10 @@ def _sta_script(lefs: list[Path], lib: Path, netlist: Path, sdc: Path,
     # so read the tech + std-cell LEF first.  report_clock_min_period prints the
     # same "period_min = X fmax = Y" line the full-flow parser already handles.
     lef_lines = "".join(f"read_lef {lef}\n" for lef in lefs)
+    lib_lines = "".join(f"read_liberty {one}\n" for one in libs)
     return (
         lef_lines
-        + f"read_liberty {lib}\n"
+        + lib_lines
         + f"read_verilog {netlist}\n"
         + f"link_design {top}\n"
         + f"read_sdc {sdc}\n"
@@ -880,6 +1153,90 @@ def _sta_script(lefs: list[Path], lib: Path, netlist: Path, sdc: Path,
         + "report_wns\n"
         + "report_tns\n"
     )
+
+
+# ── Tool-output parsers (extracted for golden-log regression tests, R5) ────────
+#
+# These are the exact parsing rules run_synth_sta applies to real yosys/OpenSTA
+# output. They live as standalone functions so tests/test_parsers.py can feed
+# captured real-tool fixtures through them — the two silent parser deaths the
+# third audit found (F3: yosys stat format change; F4: 'fmax = inf') were both
+# invisible to mock-based self-tests, which fabricate exactly these fields.
+
+def _parse_synth_stat(stdout: str) -> tuple[int | None, float | None]:
+    """Parse (cell_count, cell_area_um2) from a yosys synth log.
+
+    Takes the LAST stat (after opt_clean), not intermediate synth/abc stats.
+    The installed yosys `stat` prints a tabular total line, one of:
+        36  231.472 cells     (with per-cell liberty area)
+        36            cells    (no liberty / pre-map stat)
+    older yosys printed "Number of cells:  36".  Match both formats so the
+    cell count is not silently None on the current toolchain (audit F3).
+    Each `stat` block prints exactly one such total for its (flattened) top
+    module; the LAST match is the post-opt_clean top-module total, never a
+    sub-block (per-cell-type lines like "1  0.204  AND3x4..." don't end in
+    "cells" so never match).
+    """
+    cell_matches = re.findall(
+        r"Number of cells:\s+(\d+)|^\s*(\d+)\s+(?:[\d.]+\s+)?cells\s*$",
+        stdout, re.MULTILINE)
+    # each match is a 2-tuple (old-format group, new-format group); take the
+    # non-empty one from the last match.
+    cell_count = None
+    if cell_matches:
+        last = cell_matches[-1]
+        cell_count = int(last[0] or last[1])
+    chip_all  = re.findall(r"Chip area for module.*?:\s+([\d.]+)", stdout)
+    cell_area = float(chip_all[-1]) if chip_all else None
+    return cell_count, cell_area
+
+
+def _parse_sta_timing(sta_out: str, time_div: float, clk_ns: float) -> dict:
+    """Parse pre-layout STA output into timing metrics (native unit → ns).
+
+    audit F4: report_clock_min_period prints "period_min = 0.00 fmax = inf" for
+    a design with no reg-to-reg (or reg-to-clock) path — every combinational
+    block, and any I/O-dominated one.  The old regex required both groups to be
+    [\\d.]+, so "inf" failed the match entirely and the slack fallback below
+    silently substituted fmax = 1000/(clk-wns), i.e. a pure function of the
+    sampled clock carrying ZERO design information.  Parse inf/0.00 explicitly
+    and record fmax_mhz = None + combinational=True instead, so downstream
+    consumers (and F1's reference STA) treat it as "no clocked-path speed",
+    not a plausible-looking constraint echo.
+
+    The slack fallback fires ONLY when report_clock_min_period gave no usable
+    period, the design is not combinational, AND wns is a genuine violation
+    figure (wns < 0); it flags fmax_inferred so consumers can tell measured
+    from inferred.
+    """
+    fmax = period_min = None
+    combinational = False
+    fmax_inferred = False
+    m = re.search(r"period_min\s*=\s*([\d.]+|inf).*?fmax\s*=\s*([\d.]+|inf)", sta_out)
+    if m:
+        pmin_s, fmax_s = m.group(1), m.group(2)
+        if fmax_s == "inf" or pmin_s == "inf" or float(pmin_s) == 0.0:
+            combinational = True          # no clocked path → no min-period metric
+        else:
+            period_min = float(pmin_s) / time_div
+            fmax = float(fmax_s)
+    wns_raw = _last_float_on_line(sta_out, "wns")
+    tns_raw = _last_float_on_line(sta_out, "tns")
+    wns = (wns_raw / time_div) if wns_raw is not None else None
+    tns = (tns_raw / time_div) if tns_raw is not None else None
+    if fmax is None and not combinational and wns is not None and wns < 0.0 \
+            and clk_ns - wns > 0:
+        period_min = round(clk_ns - wns, 3)
+        fmax = round(1000.0 / period_min, 2)
+        fmax_inferred = True
+
+    timing_met = (wns >= 0.0) if wns is not None else None
+    return {
+        "fmax_mhz": fmax, "period_min_ns": period_min,
+        "wns_ns": wns, "tns_ns": tns,
+        "combinational": combinational, "fmax_inferred": fmax_inferred,
+        "timing_met": timing_met,
+    }
 
 
 def run_synth_sta(lanes: int, acc_w: int, clk_ns: float, platform: str = "nangate45",
@@ -938,10 +1295,13 @@ def run_synth_sta(lanes: int, acc_w: int, clk_ns: float, platform: str = "nangat
         raise FileNotFoundError(
             f"ORFS not found at {ORFS_DIR} (set ORFS_DIR, or PHYSICAL_MOCK=1 to test offline)"
         )
-    lib_rel = _LIBERTY.get(platform)
-    if lib_rel is None or platform not in _LEF:
-        raise ValueError(f"no proxy lib/lef for platform '{platform}' (try nangate45 / sky130hd)")
-    lib  = ORFS_DIR / "flow" / lib_rel
+    lib_rels = _LIBERTY.get(platform)
+    if not lib_rels or platform not in _LEF:
+        raise ValueError(f"no proxy lib/lef for platform '{platform}' "
+                         f"(try nangate45 / sky130hd / asap7)")
+    libs = [ORFS_DIR / "flow" / rel for rel in lib_rels]
+    dff_rel = _DFF_LIB.get(platform)
+    dff_lib = (ORFS_DIR / "flow" / dff_rel) if dff_rel else libs[0]
     lefs = [ORFS_DIR / "flow" / rel for rel in _LEF[platform]]
 
     gen_cfg = _stage_inputs(platform, var, lanes, acc_w, clk_ns,
@@ -959,17 +1319,18 @@ def run_synth_sta(lanes: int, acc_w: int, clk_ns: float, platform: str = "nangat
 
     # Pass recipe, platform, clk_ns, design, and work_dir so the constr file is written
     # inside the proxy work directory (same isolation as the full flow).
-    synth_ys.write_text(_yosys_synth_script(lanes, acc_w, lib, netlist,
+    synth_ys.write_text(_yosys_synth_script(lanes, acc_w, libs, netlist,
                                             abc_recipe=resolved_recipe,
                                             platform=platform, clk_ns=clk_ns,
-                                            work_dir=work, design=eff_design))
-    sta_tcl.write_text(_sta_script(lefs, lib, netlist, sdc, top=top_module))
+                                            work_dir=work, design=eff_design,
+                                            dff_lib=dff_lib))
+    sta_tcl.write_text(_sta_script(lefs, libs, netlist, sdc, top=top_module))
 
     # 1) synthesis (script FILE, not -p, to avoid shell-quoting issues; no -q,
     #    which would suppress the `stat` output we parse).
-    p1 = subprocess.run(
+    p1 = _run_capture(
         ["bash", "-c", f"source '{env_sh}' && yosys '{synth_ys}'"],
-        cwd=str(MAKE_DIR), capture_output=True, text=True, timeout=PROXY_TIMEOUT,
+        cwd=str(MAKE_DIR), timeout=PROXY_TIMEOUT,
     )
     (work / "synth.log").write_text((p1.stdout or "") + "\n--- stderr ---\n" + (p1.stderr or ""))
     if p1.returncode != 0 or not netlist.exists():
@@ -977,11 +1338,7 @@ def run_synth_sta(lanes: int, acc_w: int, clk_ns: float, platform: str = "nangat
                 "area_um2": None, "fmax_mhz": None, "wns_ns": None, "tns_ns": None,
                 "timing_met": None, "power_mw": None}
 
-    # take the LAST stat (after opt_clean), not intermediate synth/abc stats
-    cells_all = re.findall(r"Number of cells:\s+(\d+)", p1.stdout)
-    chip_all  = re.findall(r"Chip area for module.*?:\s+([\d.]+)", p1.stdout)
-    cell_count = int(cells_all[-1]) if cells_all else None
-    cell_area  = float(chip_all[-1]) if chip_all else None
+    cell_count, cell_area = _parse_synth_stat(p1.stdout)
     est_area   = round(cell_area * _PLACE_INFLATION, 1) if cell_area else None
 
     # Macro auto-detect: check for "$" instances in synth stat (ORFS macro pattern).
@@ -1005,30 +1362,16 @@ def run_synth_sta(lanes: int, acc_w: int, clk_ns: float, platform: str = "nangat
         )
 
     # 2) static timing (OpenROAD, pre-layout)
-    p2 = subprocess.run(
+    p2 = _run_capture(
         ["bash", "-c", f"source '{env_sh}' && openroad -no_init -exit '{sta_tcl}'"],
-        cwd=str(MAKE_DIR), capture_output=True, text=True, timeout=PROXY_TIMEOUT,
+        cwd=str(MAKE_DIR), timeout=PROXY_TIMEOUT,
     )
     sta_out = (p2.stdout or "")
     (work / "sta.log").write_text(sta_out + "\n--- stderr ---\n" + (p2.stderr or ""))
 
     # V1: parse STA timing in the platform's native unit (ns for nangate45, ps for asap7).
     time_div = PLATFORM_TIME_UNIT.get(platform, 1.0)
-    fmax = period_min = None
-    m = re.search(r"period_min\s*=\s*([\d.]+).*?fmax\s*=\s*([\d.]+)", sta_out)
-    if m:
-        period_min = float(m.group(1)) / time_div
-        fmax = float(m.group(2))
-    wns_raw = _last_float_on_line(sta_out, "wns")
-    tns_raw = _last_float_on_line(sta_out, "tns")
-    wns = (wns_raw / time_div) if wns_raw is not None else None
-    tns = (tns_raw / time_div) if tns_raw is not None else None
-    # Fallback fmax from slack if report_clock_min_period was unavailable.
-    if fmax is None and wns is not None and clk_ns - wns > 0:
-        period_min = round(clk_ns - wns, 3)
-        fmax = round(1000.0 / period_min, 2)
-
-    timing_met = (wns >= 0.0) if wns is not None else None
+    timing = _parse_sta_timing(sta_out, time_div, clk_ns)
 
     result = {
         **base, "status": "ok", "stage": "proxy",
@@ -1036,10 +1379,12 @@ def run_synth_sta(lanes: int, acc_w: int, clk_ns: float, platform: str = "nangat
         "cell_area_um2": cell_area,
         "area_um2": est_area,            # die-area estimate (cell × inflation)
         "util_pct": None,
-        "wns_ns": wns, "tns_ns": tns,
-        "fmax_mhz": fmax, "period_min_ns": period_min,
+        "wns_ns": timing["wns_ns"], "tns_ns": timing["tns_ns"],
+        "fmax_mhz": timing["fmax_mhz"], "period_min_ns": timing["period_min_ns"],
+        "combinational": timing["combinational"],   # True → no reg-to-reg path (fmax is None)
+        "fmax_inferred": timing["fmax_inferred"],   # True → fmax from slack fallback, not measured
         "setup_viol": None, "power_mw": None,
-        "timing_met": timing_met,
+        "timing_met": timing["timing_met"],
         "gds": None, "report": str(work / "sta.log"),
     }
     # Include macro auto-detect result if applicable
@@ -1050,6 +1395,104 @@ def run_synth_sta(lanes: int, acc_w: int, clk_ns: float, platform: str = "nangat
     if result["status"] == "ok":
         _synth_sta_cache[cache_key] = result
     return result
+
+
+# ── Reward "fixed ruler": reference-SDC re-time of the final netlist (F1) ──────
+
+def _reference_sta(platform: str, design_name: str, variant: str, clk_ns: float,
+                   design: "Any") -> dict | None:
+    """Re-time the routed netlist under a REFERENCE SDC to get gaming-proof
+    reward metrics (audit F1).
+
+    The campaign samples IO_DELAY / CLOCK_UNCERTAINTY, which rewrite the SDC the
+    build's own wns/fmax are measured against — so "loosen the constraints" reads
+    as "faster chip" and the reported optimum is not a better chip.  To break
+    that, we re-time the final netlist (results/<plat>/<design>/<variant>/
+    6_final.v) with a *reference* SDC: the exact SDC the design gets with NO
+    constraint knobs (io delay = 0.2 x clock period, no uncertainty), at the same
+    sampled clock.  These reference metrics feed the reward; the sampled-SDC
+    metrics stay in the obs for flow visibility.
+
+    Speed metric:
+      - Sequential design → report_clock_min_period gives a real fmax/period;
+        use them directly (fmax_ref_mhz, period_ref_ns).
+      - Purely combinational design → report_clock_min_period returns fmax = inf
+        (no reg-to-reg path), so instead we take the max in->out path from
+        report_checks -path_delay max and record the pure logic delay
+        comb_delay_ns = (data arrival time) - (input external delay).  Subtracting
+        the reference io delay leaves the netlist's intrinsic critical-path delay,
+        independent of both the sampled io_delay AND the clock; fmax_ref_mhz is
+        its reciprocal (1000 / comb_delay_ns).  This is a real measurement, never
+        the 1000/clk constraint echo.
+
+    Returns {wns_ref_ns, fmax_ref_mhz, period_ref_ns, comb_delay_ns,
+    combinational_ref} or None if the netlist/tools/STA are unavailable (caller
+    then falls back to the sampled-SDC metrics — a successful build is never
+    discarded).
+    """
+    if design is None:
+        return None   # legacy tinymac SDC already IS the reference (io 0.2, no unc.)
+    netlist = RUN_DIR / "results" / platform / design_name / variant / "6_final.v"
+    lib_rels = _LIBERTY.get(platform)
+    env_sh = ORFS_DIR / "env.sh"
+    if not netlist.exists() or not lib_rels or platform not in _LEF or not env_sh.exists():
+        return None
+
+    time_unit = PLATFORM_TIME_UNIT.get(platform, 1.0)
+    libs = [ORFS_DIR / "flow" / rel for rel in lib_rels]
+    lefs = [ORFS_DIR / "flow" / rel for rel in _LEF[platform]]
+    top = design.top
+
+    work = RUN_DIR / "refsta" / variant
+    work.mkdir(parents=True, exist_ok=True)
+    # Reference SDC: no uncertainty, default 0.2 io fraction — the fixed ruler.
+    ref_sdc = work / "ref.sdc"
+    ref_sdc.write_text(design.sdc_text(platform, clk_ns * time_unit))
+    sta_tcl = work / "ref_sta.tcl"
+    sta_tcl.write_text(
+        _sta_script(lefs, libs, netlist, ref_sdc, top=top)
+        + "report_checks -path_delay max\n"
+    )
+
+    try:
+        # audit F12: process-group-safe capture so a hung reference-STA openroad
+        # doesn't leak its group; TimeoutExpired (a SubprocessError) is caught here.
+        p = _run_capture(
+            ["bash", "-c", f"source '{env_sh}' && openroad -no_init -exit '{sta_tcl}'"],
+            cwd=str(MAKE_DIR), timeout=PROXY_TIMEOUT,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    out = p.stdout or ""
+    (work / "ref_sta.log").write_text(out + "\n--- stderr ---\n" + (p.stderr or ""))
+
+    wns_raw = _last_float_on_line(out, "wns")
+    wns_ref = (wns_raw / time_unit) if wns_raw is not None else None
+
+    fmax_ref = period_ref = comb_delay_ns = None
+    combinational_ref = False
+    m = re.search(r"period_min\s*=\s*([\d.]+|inf).*?fmax\s*=\s*([\d.]+|inf)", out)
+    if m and m.group(1) != "inf" and m.group(2) != "inf" and float(m.group(1)) != 0.0:
+        period_ref = float(m.group(1)) / time_unit
+        fmax_ref = float(m.group(2))
+    else:
+        # Combinational: derive the honest speed metric from the critical in->out
+        # path.  data arrival time - input external delay = pure logic delay.
+        combinational_ref = True
+        m_arr = re.search(r"([\d.]+)\s+data arrival time", out)
+        m_in = re.search(r"([\d.]+)\s+[v^]\s+input external delay", out)
+        if m_arr:
+            arrival = float(m_arr.group(1))
+            input_ext = float(m_in.group(1)) if m_in else 0.0
+            comb_native = max(arrival - input_ext, 1e-9)
+            comb_delay_ns = comb_native / time_unit
+            period_ref = comb_delay_ns
+            if comb_delay_ns > 0:
+                fmax_ref = round(1000.0 / comb_delay_ns, 2)
+
+    return {"wns_ref_ns": wns_ref, "fmax_ref_mhz": fmax_ref,
+            "period_ref_ns": period_ref, "comb_delay_ns": comb_delay_ns,
+            "combinational_ref": combinational_ref}
 
 
 # ── Mock mode (no OpenROAD) ───────────────────────────────────────────────────
@@ -1074,6 +1517,11 @@ def _mock_metrics(lanes: int, acc_w: int, clk_ns: float) -> dict:
         "setup_viol": 0 if met else 40,
         "power_mw": power, "fmax_mhz": fmax, "period_min_ns": period_min,
         "timing_met": met,
+        # audit F1: fabricate the fixed-ruler reference metrics so mock-mode
+        # self-tests exercise the same reward path as real runs.  Mock is
+        # TinyMAC-shaped (sequential), so the reference equals the sampled values.
+        "wns_ref_ns": wns, "fmax_ref_mhz": fmax, "period_ref_ns": period_min,
+        "comb_delay_ns": None, "combinational_ref": False,
         # cell_count: consumed by run_physical F3 path; cells: the key the
         # synth proxy (run_synth_sta) / FunnelEnv._run_f2 read at F2.
         "cell_count": cell_count, "ff_count": ff_count, "cells": cell_count,

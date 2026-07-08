@@ -14,16 +14,16 @@ This script:
 6. Runs sanity predictions:
      - area(L1) < area(L32)          [LANES dominates area, must hold]
      - sigma larger for OOD config (asap7 platform or extreme clk) than in-dist
-7. Saves the fitted model to optimizer/surrogate_n45.joblib.
+7. Saves the fitted model to eda_rl/results/funnel/surrogate_n45.joblib.
 
 NOTE: physical_runner.py is being edited concurrently.  We vendor the same
 report-parsing regexes here rather than importing to avoid transient import
 failures.  The regexes are intentionally identical to physical_runner._parse_metrics.
 
 Run with:
-    python3 optimizer/fit_surrogate.py
+    eda-rl fit-surrogate
 or via:
-    python3 optimizer/surrogate.py  (delegates here)
+    python -m eda_rl.funnel.surrogate  (delegates here)
 """
 
 from __future__ import annotations
@@ -34,17 +34,14 @@ import re
 import sys
 from pathlib import Path
 
-import numpy as np
 
-# Bootstrap: make optimizer/ root importable (gen2/ is one level below it)
-import pathlib as _pl
-import sys as _sys
+# Package root (funnel/ is one level below eda_rl/)
 # [eda_rl] bootstrap removed: _sys.path.insert(0, str(_pl.Path(__file__).resolve().parents[1]))
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 
 _REPO     = Path(__file__).resolve().parent.parent.parent
-_OPTIMIZER = Path(__file__).resolve().parent.parent       # optimizer/
+_OPTIMIZER = Path(__file__).resolve().parent.parent       # eda_rl/
 _RUN_DIR  = _REPO / "physical" / "orfs" / "runs"
 _RPT_DIR  = _RUN_DIR / "reports" / "nangate45" / "tinymac_accel"
 _LOG_DIR  = _RUN_DIR / "logs"    / "nangate45" / "tinymac_accel"
@@ -53,7 +50,7 @@ _PROXY_DIR = _RUN_DIR / "proxy"
 _MAKE_DIR = _REPO / "physical" / "orfs" / "make"
 # Where live campaigns now log per-fidelity rows: campaigns/<design>/<platform>/*.jsonl
 _CAMPAIGN_DIR = _OPTIMIZER / "campaigns"
-_OUT_MODEL = Path(__file__).resolve().parent.parent / "results" / "gen2" / "surrogate_n45.joblib"
+_OUT_MODEL = Path(__file__).resolve().parent.parent / "results" / "funnel" / "surrogate_n45.joblib"
 
 # ── Vendored regexes from physical_runner.py (identical; keep in sync) ────────
 # Source: physical_runner._parse_metrics, checked 2026-06-11
@@ -447,7 +444,7 @@ def main():
     import argparse
     from collections import Counter
 
-    from eda_rl.gen2.surrogate import Surrogate
+    from eda_rl.funnel.surrogate import Surrogate
 
     ap = argparse.ArgumentParser(description="Fit + CP3-validate the PPA surrogate.")
     ap.add_argument("--design", default=None,
@@ -535,9 +532,15 @@ def main():
     # ── 4. Sanity predictions ─────────────────────────────────────────────────
     print("\n[4] Sanity predictions:")
 
+    # The audit-F5 coverage guard requires sanity configs to fully specify the
+    # fitted axis schema (this corpus varies util/density/abc), so declare the
+    # funnel-frozen defaults explicitly instead of relying on silent fallbacks.
+    _BASE = {"util": 40, "density": 0.60, "abc_recipe": "orfs_speed"}
+
+
     # a) area(L1) < area(L32) — should always hold (LANES is the #1 area driver)
-    pred_L1  = s.predict({"lanes": 1,  "acc_w": 24, "clk_ns": 5.0})
-    pred_L32 = s.predict({"lanes": 32, "acc_w": 24, "clk_ns": 5.0})
+    pred_L1  = s.predict({**_BASE, "lanes": 1,  "acc_w": 24, "clk_ns": 5.0})
+    pred_L32 = s.predict({**_BASE, "lanes": 32, "acc_w": 24, "clk_ns": 5.0})
     mu_L1,  sig_L1  = pred_L1["area_um2"]
     mu_L32, sig_L32 = pred_L32["area_um2"]
     sane_area = mu_L1 < mu_L32
@@ -546,8 +549,8 @@ def main():
     print(f"    area(L1) < area(L32): {'PASS' if sane_area else 'FAIL'}")
 
     # b) sigma larger for OOD config (asap7 platform → never seen)
-    pred_ood = s.predict({"lanes": 4, "acc_w": 24, "clk_ns": 0.6, "platform": "asap7"})
-    pred_ind = s.predict({"lanes": 4, "acc_w": 24, "clk_ns": 5.0, "platform": "nangate45"})
+    pred_ood = s.predict({**_BASE, "lanes": 4, "acc_w": 24, "clk_ns": 0.6, "platform": "asap7"})
+    pred_ind = s.predict({**_BASE, "lanes": 4, "acc_w": 24, "clk_ns": 5.0, "platform": "nangate45"})
     mu_ood_a,  sig_ood_a  = pred_ood["area_um2"]
     mu_ind_a,  sig_ind_a  = pred_ind["area_um2"]
     # Note: sigma OOD vs in-dist comparison is heuristic for GBT
@@ -560,8 +563,8 @@ def main():
     print(f"    uncertainty must be flagged at the architecture level, not here.")
 
     # c) Reward stats for two reference configs
-    pred_r_opt  = s.predict_reward_stats({"lanes": 4,  "acc_w": 24, "clk_ns": 5.0})
-    pred_r_slow = s.predict_reward_stats({"lanes": 1,  "acc_w": 24, "clk_ns": 10.0})
+    pred_r_opt  = s.predict_reward_stats({**_BASE, "lanes": 4,  "acc_w": 24, "clk_ns": 5.0})
+    pred_r_slow = s.predict_reward_stats({**_BASE, "lanes": 1,  "acc_w": 24, "clk_ns": 10.0})
     print(f"\n    reward(L4,  A24, clk5)  = {pred_r_opt[0]:+.3f} ± {pred_r_opt[1]:.3f}")
     print(f"    reward(L1,  A24, clk10) = {pred_r_slow[0]:+.3f} ± {pred_r_slow[1]:.3f}")
     print(f"    reward(opt) > reward(slow): {'PASS' if pred_r_opt[0] > pred_r_slow[0] else 'FAIL'}")
@@ -569,8 +572,8 @@ def main():
     # d) F2-conditioned prediction vs x-only for a variant with known proxy
     # Pick L4_A24_c2p0 which has both proxy and F3 data
     obs_sample = {"proxy_area_um2": 14456.0, "proxy_wns_ns": -4.83}
-    pred_xonly = s.predict({"lanes": 4, "acc_w": 24, "clk_ns": 2.0})
-    pred_xobs  = s.predict({"lanes": 4, "acc_w": 24, "clk_ns": 2.0}, obs=obs_sample)
+    pred_xonly = s.predict({**_BASE, "lanes": 4, "acc_w": 24, "clk_ns": 2.0})
+    pred_xobs  = s.predict({**_BASE, "lanes": 4, "acc_w": 24, "clk_ns": 2.0}, obs=obs_sample)
     mu_xo,  sig_xo  = pred_xonly["area_um2"]
     mu_xob, sig_xob = pred_xobs["area_um2"]
     print(f"\n    area(L4,A24,c2 | x only) = {mu_xo:.0f} ± {sig_xo:.0f} µm²")

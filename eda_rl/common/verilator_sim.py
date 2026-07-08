@@ -1,4 +1,7 @@
-"""runner.py — run one Verilator simulation trial and return parsed metrics.
+"""verilator_sim.py — run one Verilator simulation trial and return parsed metrics.
+
+(Formerly gen1/runner.py — the one live piece rescued when gen1 retired to
+legacy/: it drives the TinyVAD Verilator harness the F1 fidelity gate needs.)
 
 Key design decisions
 --------------------
@@ -33,7 +36,7 @@ FIRMWARE = _REPO / "firmware" / "picorv32_baremetal" / "firmware.bin"
 SIM_TIMEOUT = 120   # seconds
 
 # Stage-3 pure-SW per-inference baseline: import from constants.py (single source).
-# Re-measure via measure_real.py whenever the model, test vectors, or firmware changes.
+# Re-measure via legacy/measure_real.py whenever the model, test vectors, or firmware changes.
 from eda_rl.common.constants import SW_BASELINE_CYCLES  # noqa: E402 (after path setup)
 
 
