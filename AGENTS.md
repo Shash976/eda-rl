@@ -2,11 +2,11 @@
 
 Read this first, top to bottom. It is four things: (1) what this project is,
 (2) how to operate it, (3) the invariants you must not silently re-break, and
-(4) the history of how it broke before — three audit rounds' worth — so you
-recognize the failure patterns before repeating them. For depth: `docs/08`
-(funnel operator guide), `docs/07` (RL rationale), `AUDIT_FINDINGS.md` +
-`RECOMMENDATIONS.md` (the third audit, in full), and `git log` (every fix is
-an atomic commit whose body explains what and why).
+(4) the history of how it broke before — four audit rounds' worth — so you
+recognize the failure patterns before repeating them. For depth:
+`docs/rl_system.md` (the RL machinery + role of every file — the one current
+doc), `legacy/audits/` (the third audit's findings/recommendations, in full),
+and `git log` (every fix is an atomic commit whose body explains what and why).
 
 **The single most important lesson from this repo's history:** its self-tests
 check structure, not behavior under real tools. Three separate silent-
@@ -24,7 +24,7 @@ it at an OpenROAD-flow-scripts (ORFS) install, and it searches flow
 configurations trading off **area / Fmax / power**, promoting promising
 candidates through cheap fidelity gates (legality → behavioral sim → synth+STA
 proxy → full place-and-route) and learning where to spend the synthesis
-budget. The open research question (docs/08, RECOMMENDATIONS.md R2): does a
+budget. The open research question (docs/rl_system.md §4, audit R2): does a
 *learned* promotion policy actually beat fixed gates at spending that budget?
 Honest status: not yet demonstrated — and the corpora that could answer it
 must be regenerated post-measurement-fixes before any conclusion is drawn.
@@ -39,10 +39,10 @@ Worked example designs (`eda_rl/designs/`):
 | `likith` (`id`) | tiny combinational decoder | asap7 | generic reward + asap7 F2 proxy + opt-in constraint knobs; PDN-floor lesson |
 | `sagar` (`alu4b`) | tiny combinational 4-bit ALU | sky130hd | generic reward + sky130hd path; PDN-floor lesson |
 
-`gen1/` is the superseded first-generation system — **kept only for history;
-do not spend time on it**. gen2/common no longer import it (the shared
-constants/sim wrapper live in `common/`); the only remaining reach into gen1
-is the lazy TinyVAD Verilator harness behind `common/sim.py`.
+The superseded first-generation system lives in **repo-root `legacy/`** —
+outside the installed package, imported by nothing, frozen verbatim (see
+`legacy/README.md`). Its one live piece, the TinyVAD Verilator driver, was
+rescued to `common/verilator_sim.py`. Do not spend time under `legacy/`.
 
 ## Operating it
 
@@ -64,6 +64,7 @@ eda-rl benchmark --seeds 20                    # promotion-policy table benchmar
 eda-rl dashboard --log <campaign jsonl> --port 8080   # live Optuna view; pass --log
                                                # explicitly when >1 campaign runs (the
                                                # default picks the most recently written log)
+eda-rl fit-surrogate                           # mine campaign logs, fit + CV the surrogate
 
 # No ORFS? prefix any command with PHYSICAL_MOCK=1 (synthetic metrics).
 ```
@@ -73,17 +74,17 @@ results_funnel_campaigns.jsonl` — one design+platform per file, so concurrent
 campaigns on different designs are safe (and same-design concurrency is safe
 too: RTL staging is content-addressed, variants are flock-serialized).
 
-**Self-tests — run after touching gen2/common (all must pass):**
+**Self-tests — run after touching funnel/common (all must pass):**
 
 ```bash
-PHYSICAL_MOCK=1 python -m eda_rl.gen2.funnel
-python -m eda_rl.gen2.promotion_agent
-python -m eda_rl.gen2.candidates
-python -m eda_rl.gen2.benchmark_funnel --selftest
+PHYSICAL_MOCK=1 python -m eda_rl.funnel.env
+python -m eda_rl.funnel.promotion_agent
+python -m eda_rl.funnel.candidates
+python -m eda_rl.funnel.benchmark_funnel --selftest
 python -m eda_rl.common.knobs
 python3 tests/test_parsers.py                  # golden-log parser tests (REAL tool output)
 PHYSICAL_MOCK=1 eda-rl doctor --design gcd --platform nangate45
-PHYSICAL_MOCK=1 python -m eda_rl.gen2.build_table --subset strategic --limit 5  # auto-writes to a temp path under mock
+PHYSICAL_MOCK=1 python -m eda_rl.funnel.build_table --subset strategic --limit 5  # auto-writes to a temp path under mock
 ```
 
 These are necessary, not sufficient. `PHYSICAL_MOCK` metrics are TinyMAC-
@@ -98,33 +99,32 @@ also run one real campaign episode and eyeball the numbers.
 ```
 eda_rl/
   cli.py            # `eda-rl` entry point → dispatches to subcommand main()s
-  gen1/             # 1st gen (frozen history — skip it)
-  gen2/             # THE FUNNEL (active system) — see below
+  funnel/           # THE FUNNEL (active system) — see below
   common/           # shared plumbing (runner, rewards, designs, knobs, sim, constants)
   viz/              # report.py (static HTML), dashboard.py (live Optuna), campaign_data.py
   designs/          # per-design DesignSpec YAMLs + vendored RTL (gcd/, likith/, sagar/)
   campaigns/        # committed example campaign logs
   results/          # offline tables (jsonl)
 tests/              # golden-log parser tests + real-output fixtures
-docs/               # 04 (gen1), 07 (RL rationale), 08 (funnel operator guide)
-AUDIT_FINDINGS.md   # third audit, 17 findings with evidence + fix plans
-RECOMMENDATIONS.md  # third audit, 9 forward-looking recommendations
+docs/rl_system.md   # THE doc: how the RL works + role of every file
+legacy/             # frozen history, outside the package: gen1/, dead modules,
+                    # superseded docs 04/07/08, audits/ (third-audit records)
 ```
 
-### gen2 — the funnel
+### funnel/ — the active system
 
 | File | Role |
 |---|---|
-| `funnel.py` | `FunnelEnv` — gym-style env over fidelity gates **F0 validate+cycle model → F1 behavioral sim (TinyVAD only) → F2 synth+STA proxy → F3 full ORFS flow**. `reset(config)` runs F0; `step(action)` with `{kill, re-proxy, promote, commit}`; terminal on kill/after F3. Live or table mode. Logs every `(config, fidelity, obs)` row. |
+| `env.py` | `FunnelEnv` — gym-style env over fidelity gates **F0 validate+cycle model → F1 behavioral sim (TinyVAD only) → F2 synth+STA proxy → F3 full ORFS flow**. `reset(config)` runs F0; `step(action)` with `{kill, re-proxy, promote, commit}`; terminal on kill/after F3. Live or table mode. Logs every `(config, fidelity, obs)` row. |
 | `state_spec.py` | **Single source of truth** for the 22-dim state vector (`IDX_*`, normalization, `unrun = 0.0`). Everything imports from here. |
 | `candidates.py` | `CandidateGenerator` — Optuna TPE / surrogate-UCB / random. F3-only tell rule; kill-memo for non-F3 outcomes. |
 | `surrogate.py` | Per-metric quantile-GBT surrogate (area/period/power), conditioned on F2 obs. Learns the config-axis schema from its corpus; refuses cross-design predictions. |
 | `promotion_agent.py` | `PromotionAgent` (LinUCB), `FixedGateAgent` (baseline, clock-relative kill), `RandomPromotionAgent`. |
-| `run_funnel_optimizer.py` | Live campaign driver (`eda-rl optimize`). |
+| `run_funnel_optimizer.py` | Live campaign driver (`eda-rl optimize`). Probes any auto-loaded surrogate against the campaign design's space; drops it loudly on schema mismatch. |
 | `build_table.py` | Resumable offline F0–F2 table builder. |
-| `benchmark_funnel.py` | Table-simulator benchmark: random vs fixed vs LinUCB. |
+| `benchmark_funnel.py` | Table-simulator benchmark: random vs fixed vs LinUCB. Scores the **pure terminal reward** (`info["terminal_reward"]`), never the shaped accumulator. |
 | `collect_best.py` | `eda-rl collect` — harvest best F3 builds. |
-| `fit_surrogate.py` | Mine campaign logs, fit + CV-validate the surrogate. |
+| `fit_surrogate.py` | `eda-rl fit-surrogate` — mine campaign logs, fit + CV-validate the surrogate. |
 | `doctor.py` | `eda-rl doctor` — per-design preflight (parsers, knob-range coherence, PDN util floor). |
 
 ### common — shared
@@ -134,13 +134,14 @@ mock metrics, all report parsing — the extracted `_parse_synth_stat` /
 `_parse_sta_timing` / `_parse_metrics` are what `tests/test_parsers.py`
 covers, plus the F1 reference-STA `_reference_sta`), `physical_reward.py`
 (`compute_physical_reward` = TinyVAD composite, `compute_generic_reward` =
-pure PPA), `cascade_reward.py` (monotone failure ladder), `designs.py`
+pure PPA), `designs.py`
 (`DesignSpec.load`, SDC generation, injection validation), `knobs.py`
 (`KnobRegistry`: **27 ORFS knobs in 4 tiers** — the original 24 plus opt-in
 `CLOCK_UNCERTAINTY`/`IO_DELAY`/`GR_SEED`; every knob carries an `affects` tag:
 `netlist | layout | constraints | environment`), `constants.py` (measured
 cycle model, TinyVAD SW-baseline constants, `acc_overflows`), `sim.py`
-(mock-aware behavioral-sim wrapper), `recipe.py` (ABC recipe axis).
+(mock-aware behavioral-sim wrapper) + `verilator_sim.py` (the real TinyVAD
+Verilator driver, rescued from gen1), `recipe.py` (ABC recipe axis).
 
 ## How a new design gets optimized (the part people get wrong)
 
@@ -196,8 +197,23 @@ cycle model, TinyVAD SW-baseline constants, `acc_overflows`), `sim.py`
   (speedup/accuracy composite); generic designs → `compute_generic_reward`
   (PPA; refs auto-anchor from the first F3 build or the YAML `reward:`
   block). Never hardcode TinyMAC constants for all designs.
-- **Reward bookkeeping.** The driver uses `info["terminal_reward"]` (pure
-  terminal PPA), not the shaped per-step accumulator, for TPE/best/log.
+- **Reward bookkeeping.** Everything outside the promotion bandit uses
+  `info["terminal_reward"]` (pure terminal PPA), not the shaped per-step
+  accumulator: the driver for TPE/best/log, and the benchmark for scoring
+  and its TPE tell. (The shaped sum is path-dependent — promote-through
+  policies pay F1+F2+F3 cost, commit pays only F3 — so scoring it against a
+  pure-terminal optimum penalized fixed/LinUCB by ~5% at small budgets; this
+  exact bug shipped once.)
+- **Surrogate-Δ shaping prior is captured pre-stage.** In `env.py
+  _run_stage`, `prior_mu` must be read *before* the stage runs — the stage
+  mutates `_f2_obs`, and a prior taken afterwards equals the posterior,
+  silently zeroing the shaping term for every step (this exact bug shipped
+  once, too).
+- **The report is design-aware.** `viz/report.py` renders TinyMAC's
+  hand-picked baseline, SW-speedup KPI, Lanes/Acc_W columns, and knob-tier
+  table only when `_is_tinymac_campaign()`; generic designs anchor
+  before/after deltas to their own earliest F3 build. Never reintroduce an
+  unconditional TinyMAC reference.
 
 ### Knobs & search space
 - **Knob ontology is load-bearing.** `affects: constraints|environment`
@@ -226,7 +242,7 @@ cycle model, TinyVAD SW-baseline constants, `acc_overflows`), `sim.py`
   rewards feed Optuna; kills/proxies/table-misses go to the skip-memo.
 
 ### State & learning
-- **State vector is owned by `gen2/state_spec.py`.** 22 dims, `unrun=0.0`.
+- **State vector is owned by `funnel/state_spec.py`.** 22 dims, `unrun=0.0`.
   Generic designs: clock (slot [2]) normalizes per-design
   `(clk−lo)/(hi−lo)`; WNS (slot [10]) normalizes by the actual clock
   period; slot [4] is a 3-level platform ordinal (0.0 nangate45 /
@@ -276,7 +292,7 @@ cycle model, TinyVAD SW-baseline constants, `acc_overflows`), `sim.py`
 
 ## History: how this repo broke, and what fixed it
 
-Three audit rounds, each an atomic-commit series (see `git log`); the pattern
+Four audit rounds, each an atomic-commit series (see `git log`); the pattern
 each time was *silent* corruption — nothing crashed, numbers just stopped
 meaning what everyone thought they meant.
 
@@ -292,7 +308,7 @@ surrogate scoring every design with TinyVAD math. Established input
 validation, design threading, the table-miss skip-memo, reward-kind-aware
 UCB, pre-make config rejection, and process-group cleanup in `run_physical`.
 
-**Round 3** (2026-07-06, `AUDIT_FINDINGS.md`, 17 findings + this branch): the
+**Round 3** (2026-07-06, `legacy/audits/AUDIT_FINDINGS.md`, 17 findings): the
 measurement layer itself. The optimizer was *gaming its own reward* through
 sampled SDC constraints (F1); a knob fix had silently disconnected another
 knob (F2); the F2 cell parser had been dead since a yosys upgrade (F3); F2
@@ -301,10 +317,26 @@ almost every axis campaigns actually vary (F5); the "fixed gates" baseline
 was inert on fast platforms (F11). Fixed measurement (reference-ruler reward,
 honest parsers, knob ontology + opt-in), state normalization, operational
 hardening, and added `eda-rl doctor` + golden-log tests. Two framing
-consequences stand (see `RECOMMENDATIONS.md`): the pre-fix likith/sagar
-campaign corpora are **unusable for learning conclusions** and must be
-re-run (R1), and the LinUCB-vs-fixed question has a recommended reframing as
-a surrogate-driven expected-improvement-per-cost rule (R2).
+consequences stand (see `legacy/audits/RECOMMENDATIONS.md`): the pre-fix
+likith/sagar campaign corpora are **unusable for learning conclusions** and
+must be re-run (R1), and the LinUCB-vs-fixed question has a recommended
+reframing as a surrogate-driven expected-improvement-per-cost rule (R2).
+
+**Round 4** (2026-07-08, the restructure audit + this branch): the learning
+signal itself, plus the repo shape. gen1 was retired wholesale to repo-root
+`legacy/` (the Verilator driver rescued to `common/verilator_sim.py`; four
+dead modules and the stale docs went with it), `gen2/` became `funnel/`
+(`funnel.py` → `env.py`), and `fit_surrogate` was wired into the CLI. Two
+confirmed RL-signal bugs were fixed: the surrogate-Δ shaping term was
+identically zero (prior captured after the stage had already mutated the obs
+it conditions on) and the benchmark scored the path-dependent shaped
+accumulator against a pure-terminal optimum (penalizing promote-through
+policies ~5% at small budgets). `viz/report.py` stopped fabricating TinyMAC
+baselines/speedups for generic-design campaigns. Known-but-unchanged
+learning-signal weaknesses (budget cost ~100× under-scaled, kill pinned at 0,
+no terminal credit to earlier promotes) are documented in
+`docs/rl_system.md` §5 — do not "fix" them casually; they change every
+historical number and the corpora need the R1 re-run first.
 
 **Discoveries from the likith/sagar onboarding session** (verified on real
 tools; the reason several invariants above exist):
@@ -347,7 +379,7 @@ seconds).
   `Done by an AI agent` line instead of a co-author trailer.
 - **Don't commit run artifacts.** Per-fidelity traces (`funnel_*.jsonl`) are
   gitignored; only small example campaign logs under `campaigns/` are
-  committed. `eda_rl/results/gen2/*.joblib` is gitignored.
+  committed. `eda_rl/results/funnel/*.joblib` is gitignored.
 - A non-TinyMAC design needs RTL resolvable on the machine (gcd/likith/sagar
   RTL is vendored; aes/tinymac RTL is not).
 - Keep this file true. Every audit round found stale claims here being
