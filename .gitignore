@@ -13,7 +13,7 @@ eda_rl_runs/
 # also catch a work dir created at the repo root by older defaults
 runs/
 
-# ─── Regenerable model snapshots — rebuilt by gen2/fit_surrogate.py ────────────
+# ─── Regenerable model snapshots — rebuilt by eda-rl fit-surrogate ────────────
 *.joblib
 
 # ─── Generated reports / dashboards (rebuilt from results/*.jsonl) ─────────────

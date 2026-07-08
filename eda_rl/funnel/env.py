@@ -1,7 +1,7 @@
-"""funnel.py — FunnelEnv: gym-style environment exposing per-stage observations
+"""env.py — FunnelEnv: gym-style environment exposing per-stage observations
 and accepting promotion *actions* over the multi-fidelity evaluation funnel.
 
-Architecture (see docs/07_rl_pipeline_design.md Phase 4):
+Architecture (see docs/rl_system.md):
 
     F0  validate + analytic cycle model        cost ≈ 0 s    (always runs on reset)
     F1  behavioral Verilator sim               cost ≈ 5 s
@@ -18,7 +18,9 @@ generator / promotion policy) drives the episode via step(action):
 
 After F3 completes the episode is always done=True.
 
-State vector (22-dim float32, PINNED):
+State vector (22-dim float32, PINNED — state_spec.py is the single source of
+truth; the sketch below is the tinymac/legacy normalization, see state_spec.py
+for the generic-design variants of slots [2]/[4]/[10]):
     [0]  log2(lanes)/5
     [1]  (acc_w − 16)/16
     [2]  (clk − 3)/5           # nangate45 normalisation; asap7: (clk−0.3)/1.2
@@ -42,7 +44,7 @@ State vector (22-dim float32, PINNED):
 Logging: every (config, fidelity, obs) row is appended to results_funnel.jsonl:
     {"ts", "config", "fidelity", "obs", "cost_s", "platform", "status"}
 
-Live mode (table=None): calls cascade.py's existing tool wrappers for F1/F2/F3.
+Live mode (table=None): drives common.sim (F1) and common.physical_runner (F2/F3).
 Table mode (table=dict): replays observations from the table, charges recorded
     cost against the budget — no real tools.  Use load_table(path) to build the
     dict from an existing results_funnel.jsonl.
@@ -56,15 +58,13 @@ import math
 import os
 import re
 import time
+import warnings
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import yaml
 
-# Bootstrap: make optimizer/ root importable (gen2/ is one level below it)
-import pathlib as _pl, sys as _sys
-# [eda_rl] bootstrap removed: _sys.path.insert(0, str(_pl.Path(__file__).resolve().parents[1]))
 
 # ── Defensive imports for concurrent agents ──────────────────────────────────
 # recipe.py is being written by a concurrent agent; fall back gracefully.
@@ -86,7 +86,7 @@ except ImportError:
 
 # surrogate.py is being written by a concurrent agent; fall back gracefully.
 try:
-    from eda_rl.gen2.surrogate import Surrogate  # noqa: F401  (type hint only)
+    from eda_rl.funnel.surrogate import Surrogate  # noqa: F401  (type hint only)
     _SURROGATE_AVAILABLE = True
 except ImportError:
     _SURROGATE_AVAILABLE = False
@@ -98,7 +98,7 @@ from eda_rl.common.constants import (
     SW_BASELINE_CYCLES,
     behavioral_cycles as _behavioral_cycles,
 )
-from eda_rl.gen1.cascade import _run_sim  # reuse the mock-aware Verilator wrapper
+from eda_rl.common.sim import _run_sim  # mock-aware Verilator wrapper (audit F16: was gen1.cascade)
 from eda_rl.common.physical_runner import run_synth_sta, run_physical
 from eda_rl.common.physical_reward import compute_physical_reward, compute_generic_reward
 
@@ -134,13 +134,24 @@ FIDELITY_COST_S: dict[str, float] = {
 # Ordered fidelity list (F4 is asap7 and not used in the standard promote chain)
 _FIDELITY_ORDER = ["F0", "F1", "F2", "F3"]
 
-# Platform normalisations for state dim [2] (clock)
+# Legacy platform normalisations for state dim [2] (clock).  Used only for the
+# TinyVAD / no-design / clock-range-missing fallback path — generic designs
+# normalise per their own declared clock_range_ns (F10, see _build_state).
 _CLK_NORM: dict[str, tuple[float, float]] = {
     "nangate45": (3.0, 5.0),   # (offset, scale): (clk - 3.0) / 5.0
     "asap7":     (0.3, 1.2),   # (clk - 0.3) / 1.2
 }
 
-from eda_rl.gen2.state_spec import STATE_DIM as _STATE_DIM  # canonical 22-dim spec
+# Platform ordinal for state dim [4] (F10): a 3-level ordinal within the fixed
+# 22-dim contract, replacing the old binary asap7-vs-rest flag that encoded
+# sky130hd as nangate45.  nangate45/asap7 keep 0.0/1.0 (tinymac unchanged).
+_PLATFORM_ORDINAL: dict[str, float] = {
+    "nangate45": 0.0,
+    "sky130hd":  0.5,
+    "asap7":     1.0,
+}
+
+from eda_rl.funnel.state_spec import STATE_DIM as _STATE_DIM  # canonical 22-dim spec
 
 
 # ── Table helpers ──────────────────────────────────────────────────────────────
@@ -327,22 +338,54 @@ def _build_state(
     depth: int,                         # 0=F0, 1=F1, 2=F2, 3=F3
     surrogate_reward_kind: str = "tinyvad",
     surrogate_refs: dict | None = None,
+    design: Any | None = None,
 ) -> np.ndarray:
     lanes  = int(config.get("mac_lanes", 1))        # 1 = sentinel for generic designs
     acc_w  = int(config.get("accumulator_width", 24))  # 24 = default for generic designs
     clk    = float(config["clock_period_ns"])
     recipe = config.get("abc_recipe", "plain")
 
-    clk_offset, clk_scale = _CLK_NORM.get(platform, (3.0, 5.0))
-    plat_flag = 1.0 if platform == "asap7" else 0.0
     recipe_idx = _RECIPE_IDX.get(recipe, 2)
+
+    # Clock (state[2]) and WNS (state[10]) normalisation (F10).
+    #   Generic (non-TinyVAD) designs: normalise per the design's OWN declared
+    #   clock range — (clk-lo)/(hi-lo) — so narrow / sub-ns platforms (asap7,
+    #   sky130hd) span the full [0,1] scale instead of ~2% of a fixed nangate45
+    #   ruler, and normalise WNS by the actual clock period (wns/clk) so the
+    #   FixedGate clock-relative kill rule (F11) is computable from state[10].
+    #   TinyVAD / legacy / no-design path: keep the fixed platform table
+    #   (_CLK_NORM) and the fixed /5-ns WNS ruler for bit-exact compat — saved
+    #   LinUCB agents and the benchmark tables assume it.  (nangate45 tinymac is
+    #   identical either way since _CLK_NORM nangate45 == (3, 8-3); the legacy
+    #   path additionally pins tinymac's asap7 numbers.)
+    wns_scale = 5.0                         # legacy fixed /5-ns WNS ruler
+    clk_range: tuple[float, float] | None = None
+    if design is not None:
+        try:
+            if not design.is_tinyvad():
+                cr = (design.platforms.get(platform) or {}).get("clock_range_ns")
+                if cr and len(cr) == 2 and float(cr[1]) > float(cr[0]):
+                    clk_range = (float(cr[0]), float(cr[1]))
+        except Exception:  # noqa: BLE001
+            clk_range = None
+    if clk_range is not None:
+        clk_lo, clk_hi = clk_range
+        d2 = (clk - clk_lo) / (clk_hi - clk_lo)
+        wns_scale = max(clk, 1e-9)          # normalise WNS by the clock period
+    else:
+        clk_offset, clk_scale = _CLK_NORM.get(platform, (3.0, 5.0))
+        d2 = (clk - clk_offset) / clk_scale
 
     # [0..4] config encoding
     d0 = math.log2(max(lanes, 1)) / 5.0
     d1 = (acc_w - 16) / 16.0
-    d2 = (clk - clk_offset) / clk_scale
     d3 = recipe_idx / 2.0
-    d4 = plat_flag
+    # [4] platform ordinal: 0.0 = nangate45, 0.5 = sky130hd, 1.0 = asap7 (F10).
+    # Was a binary asap7-vs-rest flag that silently encoded sky130hd as
+    # nangate45; the ordinal separates the three platforms within the fixed
+    # 22-dim contract.  nangate45/asap7 keep their old values (0.0/1.0), so
+    # tinymac is unchanged; only sky130hd (sagar) moves 0.0 -> 0.5.
+    d4 = _PLATFORM_ORDINAL.get(platform, 0.0)
 
     # [5..6] F0 analytic
     d5 = math.log2(SW_BASELINE_CYCLES / max(f0_cycles, 1.0)) / 10.0
@@ -362,7 +405,7 @@ def _build_state(
         raw_area = f2_obs.get("area_um2")
         raw_wns  = f2_obs.get("wns_ns")
         d9  = float(np.clip(raw_area / 20000.0, 0.0, 3.0)) if raw_area is not None else 0.0
-        d10 = float(np.clip((raw_wns or 0.0) / 5.0, -2.0, 2.0))
+        d10 = float(np.clip((raw_wns or 0.0) / wns_scale, -2.0, 2.0))
         # netlist stats (cells/FF count) from F2 proxy result
         ff_count    = f2_obs.get("ff_count")    or f2_obs.get("cells") or 0
         cell_count  = f2_obs.get("cell_count") or f2_obs.get("cells") or 0
@@ -476,7 +519,7 @@ class FunnelEnv:
         budget_s: float = 14400.0,
         surrogate: Any | None = None,
         table: dict | None = None,
-        results_path: str | Path = str(Path(__file__).resolve().parent.parent / "results" / "gen2" / "results_funnel.jsonl"),
+        results_path: str | Path = str(Path(__file__).resolve().parent.parent / "results" / "funnel" / "results_funnel.jsonl"),
         seed: int = 0,
         lambda_cost: float = 1.0,
         design: "str | Any | None" = None,
@@ -635,8 +678,10 @@ class FunnelEnv:
             When no surrogate: r_k = −λ·cost_k / budget_s
             On F3 terminal: adds the final composite reward (ladder-consistent).
 
-        Reward is only *positive* from the F3 terminal payoff; shaping terms
-        are always ≤ 0 (anti-gaming: proxy can only kill, never accept).
+        The cost term is always ≤ 0; the surrogate-Δ term telescopes over the
+        episode (post − prior around each observation, nonzero mainly at F2
+        where new obs condition the surrogate), so it cannot be farmed for
+        net reward.  Sustained positive reward comes only from the F3 payoff.
         """
         if self._done:
             raise RuntimeError("FunnelEnv.step() called after done=True; call reset() first.")
@@ -737,6 +782,10 @@ class FunnelEnv:
     def _run_stage(self, fidelity: str) -> float:
         """Run `fidelity` (F1/F2/F3), update state, return shaped reward."""
         assert self._config is not None
+        # Surrogate prior MUST be captured before the stage runs: the stage
+        # mutates _f2_obs, and a prior taken afterwards is identical to the
+        # posterior, silently zeroing the Δ shaping term for every step.
+        prior_mu = self._surrogate_mu() if self._surrogate is not None else 0.0
         t_start = time.perf_counter()
 
         if fidelity == "F1":
@@ -773,7 +822,6 @@ class FunnelEnv:
         self._update_state()
 
         # Compute shaped reward
-        prior_mu = self._surrogate_mu()
         reward = -self._lambda * cost_s / max(self.budget_s, 1.0)
 
         if fidelity == "F3":
@@ -867,12 +915,24 @@ class FunnelEnv:
             eff[k] = v
         return eff
 
+    # ORFS knobs that rewrite the SDC (see designs.sdc_text / physical_runner
+    # _stage_inputs) and therefore DO change what the F2 pre-layout STA measures.
+    # The placement/routing knobs (CORE_UTILIZATION, PLACE_DENSITY, GR_SEED, …)
+    # still do not — the proxy has no floorplan/place/route.
+    _F2_SDC_KNOBS = frozenset({"CLOCK_UNCERTAINTY", "IO_DELAY"})
+
     def _run_f2(self) -> tuple[dict, str]:
         """F2: synth+STA proxy (run_synth_sta, mock-aware).
 
         Note: the proxy is yosys synth + pre-layout STA — it has no floorplan,
-        placement, CTS or routing, so the tier-2/3 ORFS knobs do not affect its
-        output and are intentionally not forwarded here.  They take effect at F3.
+        placement, CTS or routing, so the placement/routing tier-2/3 ORFS knobs
+        do not affect its output and are intentionally not forwarded here.  The
+        SDC-owned knobs (CLOCK_UNCERTAINTY / IO_DELAY) DO change the constraints
+        the STA is measured against, so they ARE forwarded (audit F8) — otherwise
+        F2 times against clk*0.2 io while F3 uses the sampled IO_DELAY, and for
+        combinational designs the two stages are timed under different rulers,
+        degrading the F2->F3 correlation the funnel's kill decisions depend on.
+        The F2 cache key already includes knob_values, so caching stays correct.
         """
         assert self._config is not None
         lanes  = int(self._config.get("mac_lanes", 4))
@@ -897,6 +957,15 @@ class FunnelEnv:
                 kwargs["design"] = self._design_spec
             except Exception:   # noqa: BLE001
                 pass   # design resolution failed; fall back to tinymac behaviour
+        # Forward only the SDC-owned knob subset so the F2 STA sees the same
+        # timing constraints the F3 build will (audit F8).  Placement/routing
+        # knobs stay out — the proxy can't use them.
+        if "knob_values" in sig.parameters:
+            eff = self._effective_orfs_knobs()
+            sdc_knobs = {k: v for k, v in eff.items()
+                         if k in self._F2_SDC_KNOBS and v is not None}
+            if sdc_knobs:
+                kwargs["knob_values"] = sdc_knobs
 
         try:
             result = run_synth_sta(lanes, acc_w, clk, self.platform, **kwargs)
@@ -910,6 +979,11 @@ class FunnelEnv:
                 "cell_count":  result.get("cells"),
                 "ff_count":    result.get("cells"),   # proxy has no separate FF count
                 "logic_levels": None,                 # not available from synth+STA
+                # audit F4: honest markers so the corpus distinguishes a measured
+                # min-period from "no clocked path" (fmax None) or a slack-inferred
+                # fallback.  None-safe: absent keys default to False for old rows.
+                "combinational":  result.get("combinational", False),
+                "fmax_inferred":  result.get("fmax_inferred", False),
             }
             return obs, status
         except Exception as exc:  # noqa: BLE001
@@ -929,7 +1003,10 @@ class FunnelEnv:
         # from the sampled config, falling back to design-fixed constants, then
         # to the historical defaults (40 / 0.60).
         eff = self._effective_orfs_knobs()
-        util    = int(eff.pop("CORE_UTILIZATION", 40))
+        # CORE_UTILIZATION is an int knob (audit F9), but a design's fixed/override
+        # value may still arrive as a float (e.g. YAML default 5.0); round rather
+        # than truncate so 6.99 -> 7, not 6, and sampler/log/variant/emission agree.
+        util    = int(round(float(eff.pop("CORE_UTILIZATION", 40))))
         density = float(eff.pop("PLACE_DENSITY", 0.60))
         knob_values = eff
         # M3: lanes/acc_w are RTL chparams.  For designs without them (e.g. gcd,
@@ -999,6 +1076,16 @@ class FunnelEnv:
                 "cell_count":  result.get("cell_count"),
                 "ff_count":    result.get("ff_count"),
                 "gds":         result.get("gds"),
+                # audit F1: fixed-ruler reference-SDC metrics (io 0.2, no
+                # uncertainty).  _terminal_reward scores on these so the reward
+                # can't be gamed by the sampled IO_DELAY/CLOCK_UNCERTAINTY; the
+                # sampled-SDC wns/fmax above stay for flow visibility.  Absent
+                # (None) when the reference STA failed → reward falls back + warns.
+                "fmax_ref_mhz":     result.get("fmax_ref_mhz"),
+                "wns_ref_ns":       result.get("wns_ref_ns"),
+                "period_ref_ns":    result.get("period_ref_ns"),
+                "comb_delay_ns":    result.get("comb_delay_ns"),
+                "combinational_ref": result.get("combinational_ref"),
                 # Effective recipe used at F3 (may differ from config["abc_recipe"]
                 # because "plain" is not a valid full-flow recipe and is remapped to
                 # "orfs_speed").  Always carry this so the training corpus is honest.
@@ -1021,6 +1108,41 @@ class FunnelEnv:
 
     # ── Terminal reward computation ─────────────────────────────────────────────
 
+    def _reward_obs_with_ref(self, obs: dict) -> dict:
+        """Return obs with its timing metrics swapped for the fixed-ruler
+        reference-SDC values (audit F1).
+
+        The reference metrics (measured under io=0.2 fraction, no uncertainty, at
+        the same sampled clock) are immune to the sampled IO_DELAY/
+        CLOCK_UNCERTAINTY, so scoring on them removes the "relax my own
+        constraints → higher reward" gaming.  Area/power are physical and left
+        untouched.  When the reference STA didn't produce a speed number
+        (fmax_ref_mhz is None — e.g. it failed, or a legacy path), fall back to
+        the sampled-SDC obs with a one-time warning; a successful build is never
+        discarded.
+        """
+        fmax_ref = obs.get("fmax_ref_mhz")
+        if fmax_ref is None:
+            # Live build whose reference STA failed → warn (the reward is now
+            # gameable).  Table replay has no reference by construction (historical
+            # rows predate this metric) — stay silent there.
+            if self._table is None and obs.get("fmax_mhz") is not None:
+                warnings.warn(
+                    "F1 reference STA produced no fmax; scoring the terminal "
+                    "reward on the sampled-SDC metrics (gameable by "
+                    "IO_DELAY/CLOCK_UNCERTAINTY).",
+                    stacklevel=2,
+                )
+            return obs
+        ro = dict(obs)
+        ro["fmax_mhz"] = fmax_ref
+        ro["period_min_ns"] = obs.get("period_ref_ns", obs.get("period_min_ns"))
+        wns_ref = obs.get("wns_ref_ns")
+        if wns_ref is not None:
+            ro["wns_ns"] = wns_ref
+            ro["timing_met"] = (wns_ref >= 0.0)
+        return ro
+
     def _terminal_reward(self, obs: dict, status: str) -> float:
         """Compute the F3 terminal payoff using the ladder-consistent scorer.
 
@@ -1038,17 +1160,20 @@ class FunnelEnv:
         full_fail_penalty = float(penalties.get("full", -20.0))
 
         if status in ("ok", "mock", "mock-proxy"):
+            # audit F1: score on the fixed-ruler reference-SDC timing metrics so
+            # the reward can't be gamed by the sampled IO_DELAY/CLOCK_UNCERTAINTY.
+            reward_obs = self._reward_obs_with_ref(obs)
             if self._f1_enabled():
                 # TinyVAD design: speedup/accuracy/area composite (TinyMAC anchors).
                 sim_cycles = None
                 if self._f1_obs is not None:
                     sim_cycles = self._f1_obs.get("avg_cycles")
-                scored = compute_physical_reward(obs, self._reward_cfg,
+                scored = compute_physical_reward(reward_obs, self._reward_cfg,
                                                  cycles=sim_cycles)
             else:
                 # Generic design: pure PPA reward with per-design anchors (audit C1).
-                refs, weights = self._generic_reward_cfg(obs)
-                scored = compute_generic_reward(obs, weights=weights, refs=refs)
+                refs, weights = self._generic_reward_cfg(reward_obs)
+                scored = compute_generic_reward(reward_obs, weights=weights, refs=refs)
             return float(scored.get("reward", full_fail_penalty))
 
         if status == "table_miss":
@@ -1154,6 +1279,7 @@ class FunnelEnv:
             depth=self._depth,
             surrogate_reward_kind=kind,
             surrogate_refs=refs,
+            design=self._design_spec,
         )
 
     def _log_row(self, fidelity: str, obs: dict, cost_s: float, status: str) -> None:

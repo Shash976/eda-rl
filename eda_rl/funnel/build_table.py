@@ -27,7 +27,7 @@ Usage:
 
 Options:
     --space PATH       search_space_funnel.yaml  (default: search_space_funnel.yaml)
-    --out PATH         output jsonl              (default: results/gen2/results_funnel.jsonl)
+    --out PATH         output jsonl              (default: results/funnel/results_funnel.jsonl)
     --fidelity F0|F1|F2  target fidelity         (default: F2)
     --limit N          max evaluations to run    (default: no limit)
     --subset strategic  corner+axis sweep (~54-87 deduped configs instead of 594)
@@ -42,14 +42,12 @@ from __future__ import annotations
 import argparse
 import inspect
 import json
-import math
 import os
 import sys
 import time
 from itertools import product
 from pathlib import Path
 
-import numpy as np
 
 # ── path setup ────────────────────────────────────────────────────────────────
 _THIS_DIR = Path(__file__).resolve().parent
@@ -121,6 +119,35 @@ def _load_space(space_path: Path) -> dict:
     except Exception:  # noqa: BLE001 — yaml not installed or wrong format; use defaults
         pass
     return space
+
+
+def _clock_grid(lo: float, hi: float) -> list[float]:
+    """Return a clock-period grid for the range [lo, hi], derived from the range.
+
+    Uses a step of (hi - lo) / 10 (≈ 11 points) rather than the old hardcoded
+    0.5 ns step (audit F6).  On sub-ns ranges (e.g. likith's [0.045, 0.070]) the
+    0.5 ns step produced only two points and put the *second* one (0.545)
+    outside the design's own declared range; deriving the step from the range
+    keeps every point in-range and gives a real grid.  Degenerate ranges
+    (lo == hi) yield a single point.  All returned points are asserted to lie
+    within [lo, hi].
+    """
+    lo, hi = float(lo), float(hi)
+    if hi < lo:
+        lo, hi = hi, lo
+    span = hi - lo
+    if span <= 0:
+        grid = [round(lo, 6)]
+    else:
+        step = span / 10.0
+        # at least 1 interval => at least 2 points for a non-degenerate range
+        n_int = max(int(round(span / step)), 1)
+        raw = [lo + i * step for i in range(n_int + 1)]
+        # clamp to guard against float drift past hi, round, and dedupe
+        grid = sorted({round(min(max(c, lo), hi), 6) for c in raw})
+    assert all(lo - 1e-9 <= c <= hi + 1e-9 for c in grid), \
+        f"_clock_grid produced out-of-range points {grid} for [{lo}, {hi}]"
+    return grid
 
 
 def _enumerate_grid(space: dict) -> list[dict]:
@@ -265,7 +292,7 @@ def _eval_f0(config: dict, design: "Any | None" = None) -> tuple[dict, str]:
     # agrees with FunnelEnv._f0_accuracy (audit M1) instead of a lanes-independent
     # approximation.  Fall back to the simple acc_w rule only if funnel is absent.
     try:
-        from eda_rl.gen2.funnel import _f0_accuracy
+        from eda_rl.funnel.env import _f0_accuracy
         acc = _f0_accuracy(lanes, acc_w)
     except ImportError:
         acc = 1.0 if acc_w >= 24 else (0.92 if acc_w >= 20 else 47.0 / 64.0)
@@ -312,7 +339,7 @@ def _eval_f1(config: dict, design: "Any | None" = None) -> tuple[dict, str]:
             _F1_CACHE[lanes] = (obs_sim, "mock")
         else:
             try:
-                from eda_rl.gen1.runner import run_sim  # type: ignore[import]
+                from eda_rl.common.sim import run_sim  # audit F16: was gen1.runner
                 raw = run_sim(lanes, acc_width=32)   # acc_width=32 → guaranteed correct
                 obs_sim = {
                     "avg_cycles": float(raw.get("avg_cycles", behavioral_cycles(lanes))),
@@ -332,7 +359,7 @@ def _eval_f1(config: dict, design: "Any | None" = None) -> tuple[dict, str]:
     # Uses funnel's measured (lanes, acc_w) table (V13: acc16 accuracy is LANES-dependent)
     # so table F1 rows agree with FunnelEnv's F0 analytic accuracy.
     try:
-        from eda_rl.gen2.funnel import _f0_accuracy
+        from eda_rl.funnel.env import _f0_accuracy
         acc = _f0_accuracy(lanes, acc_w)
     except ImportError:
         acc = 1.0 if acc_w >= 24 else (0.92 if acc_w >= 20 else 47.0 / 64.0)
@@ -379,7 +406,7 @@ def _eval_f2(config: dict, platform: str, design: "Any | None" = None) -> tuple[
         return {"error": str(exc)}, "import_error"
 
     # Defensive: pass abc_recipe/design only if run_synth_sta accepts them
-    # (mirrors funnel.py's _run_f2 signature-inspection pattern).
+    # (mirrors env.py's _run_f2 signature-inspection pattern).
     try:
         sig = inspect.signature(run_synth_sta)
         accepts_recipe = "abc_recipe" in sig.parameters
@@ -538,8 +565,10 @@ def run_table_builder(
                 cspec = knob_space["clock_period_ns"]
                 if "range" in cspec:
                     lo, hi = cspec["range"]
-                    steps = max(int(round((hi - lo) / 0.5)), 1)
-                    space["clks"] = [round(lo + i * 0.5, 4) for i in range(steps + 1)]
+                    # Derive the grid step from the range (audit F6): a hardcoded
+                    # 0.5 ns step overshot sub-ns ranges (likith [0.045,0.070] ->
+                    # a second point at 0.545, outside the range).
+                    space["clks"] = _clock_grid(lo, hi)
             if "abc_recipe" in knob_space:
                 rspec = knob_space["abc_recipe"]
                 if "choices" in rspec:
@@ -682,8 +711,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--out",
-        default=str(_THIS_DIR.parent / "results" / "gen2" / "results_funnel.jsonl"),
-        help="Output JSONL file path",
+        default=None,
+        help="Output JSONL file path (default: results/funnel/results_funnel.jsonl; "
+             "under PHYSICAL_MOCK, a temp path unless --out is given explicitly, "
+             "so mock rows never land in the tracked results file — audit F17/R8)",
     )
     parser.add_argument(
         "--fidelity",
@@ -717,7 +748,7 @@ def main() -> None:
         "--design",
         default=None,
         help=(
-            "Design name or YAML path (e.g. 'gcd' or 'optimizer/designs/gcd.yaml'). "
+            "Design name or YAML path (e.g. 'gcd' or 'eda_rl/designs/gcd.yaml'). "
             "Default: tinymac_accel (unchanged behaviour). "
             "Grid enumeration uses KnobRegistry.space(design, max_tier, platform) "
             "when --design is specified. "
@@ -737,9 +768,22 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    # F17/R8: PHYSICAL_MOCK=1 build_table (a canonical self-test) must not append
+    # mock rows to the tracked results file.  When --out is not given explicitly,
+    # default to the tracked path normally, but to a temp path under mock mode.
+    if args.out is not None:
+        out_path = Path(args.out)
+    elif os.environ.get("PHYSICAL_MOCK"):
+        import tempfile
+        out_path = Path(tempfile.gettempdir()) / "eda_rl_build_table_mock.jsonl"
+        print(f"  [PHYSICAL_MOCK] --out not given; writing mock rows to {out_path} "
+              f"(not the tracked results/funnel/results_funnel.jsonl)")
+    else:
+        out_path = _THIS_DIR.parent / "results" / "funnel" / "results_funnel.jsonl"
+
     run_table_builder(
         space_path=Path(args.space),
-        out_path=Path(args.out),
+        out_path=out_path,
         target_fidelity=args.fidelity,
         limit=args.limit,
         subset=args.subset,
@@ -765,6 +809,19 @@ def _selftest() -> None:
     }
     configs = _enumerate_grid(space)
     assert len(configs) == 2 * 2 * 2 * 1  # 8
+
+    # F6: clock grid derived from range stays in-range, even for sub-ns ranges.
+    likith_clks = _clock_grid(0.045, 0.070)
+    assert len(likith_clks) >= 2, f"expected >=2 clock points, got {likith_clks}"
+    assert all(0.045 <= c <= 0.070 for c in likith_clks), \
+        f"likith clock grid escapes [0.045, 0.070]: {likith_clks}"
+    assert min(likith_clks) == 0.045 and max(likith_clks) == 0.070, \
+        f"likith clock grid should span the full range, got {likith_clks}"
+    # degenerate range -> single point
+    assert _clock_grid(5.0, 5.0) == [5.0], _clock_grid(5.0, 5.0)
+    # nangate45-style range still yields a sane multi-point grid
+    n45_clks = _clock_grid(3.0, 8.0)
+    assert all(3.0 <= c <= 8.0 for c in n45_clks) and len(n45_clks) >= 2
 
     strat = _strategic_subset(space)
     # Strategic: (2 lanes × 2 acc_ws × 1 clk_nearest_4 × 1 recipe = 4) + clk sweep (2×1) = 6 - dedup
@@ -802,7 +859,7 @@ def _selftest() -> None:
 
     # Also verify config_key produced by build_table matches funnel.load_table expectation
     import json as _json
-    from eda_rl.gen2.funnel import load_table as _load_table
+    from eda_rl.funnel.env import load_table as _load_table
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp) / "funnel_compat.jsonl"
         canonical_cfg = {"mac_lanes": 4, "accumulator_width": 24,

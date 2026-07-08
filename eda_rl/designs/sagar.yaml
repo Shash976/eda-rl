@@ -1,0 +1,68 @@
+# designs/sagar.yaml — tiny combinational 4-bit ALU (module `alu_4bit`).
+#
+# alu_4bit.v: A[3:0], B[3:0], sel[1:0] -> OUT[3:0], carry_out, pure
+# `always @(*)` — NO clock port on the module at all. Same virtual-clock
+# behavior as likith.yaml applies here (verified for this design too), so
+# `clock_port: clk` below works as a placeholder despite alu_4bit having no
+# clk pin. eda-rl generates its own SDC from this spec. (sagar's original
+# hand-written virtual-clock constraint.sdc — the same idiom eda-rl's
+# generator produces implicitly — was removed with the rest of the raw
+# AutoTuner bundle in the third-audit cleanup; only autotuner.json is kept,
+# as the provenance record for the knob ranges below.)
+#
+# Platform: sky130hd — this design's real target.
+#
+# CORE_UTILIZATION override: eda-rl's tool-default range [20,60] is too dense
+# for this design — ORFS's default PDN power-grid can't fit its straps at the
+# resulting floorplan size. Verified via real ORFS builds: util=40 ->
+# ERROR PDN-0185 (28.06 um available vs 28.8 um needed — barely short);
+# util=15 -> clean full RTL-to-GDS build (area 492 um^2, timing met,
+# fmax 214.8 MHz, cell_count=80, real GDS produced).
+#
+# PLACE_DENSITY_LB_ADDON override: narrowed to match sagar/autotuner.json's
+# declared bounds [0.20,0.40] (not read by eda-rl — kept only as the
+# provenance record for what should be tunable).
+# sagar/autotuner.json's only other axis, _SDC_CLK_PERIOD, is already the
+# CLOCK_PERIOD knob below (native ns on sky130hd, no ps conversion needed).
+#
+# Campaigns need --max-tier 2 to actually exercise PLACE_DENSITY_LB_ADDON
+# (tier 2); CORE_UTILIZATION/CLOCK_PERIOD are tier 1 / unconditional.
+
+name: alu4b
+top:  alu_4bit
+
+rtl_files:
+  - sagar/alu_4bit.v
+
+# Placeholder — alu_4bit has no physical clk port; becomes a virtual clock.
+clock_port: clk
+
+# No RTL chparam axes (alu_4bit has no configurable parameters).
+params: {}
+
+platforms:
+  sky130hd:
+    # autotuner.json _SDC_CLK_PERIOD [5.5,8.0] ns (sky130hd is ns-native, no conversion)
+    clock_range_ns: [5.5, 8.0]
+    default_clock_ns: 6.5
+
+# has_macros: false — alu_4bit is a pure std-cell design (no SRAM/macro instances).
+has_macros: false
+
+# functional_eval: none — alu_4bit has no behavioral simulation hook.
+# F0 is legality/validate_config only; F1 is skipped (functional_eval.kind != tinyvad_sim).
+functional_eval:
+  kind: none
+
+knobs:
+  override:
+    CORE_UTILIZATION:
+      # Verified working value is 15 on sky130hd (see header comment);
+      # bracket it with margin. 40 fails only barely, so the top of this
+      # range is a plausible-but-untested risk edge, not a hard cutoff.
+      range: [10.0, 20.0]
+      default: 15.0
+    PLACE_DENSITY_LB_ADDON:
+      # autotuner.json [0.20,0.40] — narrower than the tool default (0.0,0.20)
+      range: [0.20, 0.40]
+      default: 0.30

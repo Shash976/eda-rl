@@ -28,7 +28,7 @@ dashboard = ["optuna-dashboard"]
 eda-rl = "eda_rl.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["eda_rl*"]
+include = ["eda_rl", "eda_rl.*"]
 
 [tool.setuptools.package-data]
 eda_rl = ["**/*.yaml", "**/*.yml"]

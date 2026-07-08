@@ -29,7 +29,7 @@ from typing import Any, Iterable
 # ── default location ──────────────────────────────────────────────────────────
 def _find_latest_campaign_log() -> Path:
     """Return the most-recently-modified results_funnel_campaigns.jsonl under
-    optimizer/campaigns/<design>/<platform>/; fall back to the old flat path."""
+    eda_rl/campaigns/<design>/<platform>/; fall back to the old flat path."""
     campaigns_root = Path(__file__).resolve().parents[1] / "campaigns"
     if campaigns_root.exists():
         logs = sorted(
@@ -41,7 +41,7 @@ def _find_latest_campaign_log() -> Path:
             return logs[0]
     # No flat fallback — require campaigns/ structure
     raise FileNotFoundError(
-        "No results_funnel_campaigns.jsonl found under optimizer/campaigns/. "
+        "No results_funnel_campaigns.jsonl found under eda_rl/campaigns/. "
         "Run run_funnel_optimizer.py first."
     )
 
