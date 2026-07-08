@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """report.py — static self-contained HTML report for a funnel-optimizer campaign.
 
-    python3 optimizer/viz/report.py                       # latest campaign
-    python3 optimizer/viz/report.py --campaign all
-    python3 optimizer/viz/report.py --log tinymac_accel_run1.jsonl --open
-    python3 optimizer/viz/report.py --out /tmp/run.html
+    eda-rl report                       # latest campaign
+    eda-rl report --campaign all
+    eda-rl report --log tinymac_accel_run1.jsonl --open
+    eda-rl report --out /tmp/run.html
 
 Produces one HTML file (Plotly CDN, no server) with:
   - optimization history: per-episode reward + best-so-far, vs episode and vs

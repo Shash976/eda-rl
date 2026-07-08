@@ -106,7 +106,7 @@ def compute_generic_reward(
 
     if not r:
         # FunnelEnv always pre-resolves refs (design YAML or auto-anchored from
-        # the first F3 build, see funnel.py._generic_reward_cfg) before calling
+        # the first F3 build, see env.py._generic_reward_cfg) before calling
         # here, so this only fires for standalone callers that skip that step —
         # without it, norm_area/norm_fmax both collapse to 1.0 (self-normalised
         # against this call's own metrics), giving a constant, uninformative

@@ -1,7 +1,7 @@
-"""optimizer/common/designs.py — design registry for the chip-config optimizer.
+"""eda_rl/common/designs.py — design registry for the chip-config optimizer.
 
 Any design (RTL files + top module, possibly with macros) becomes an input by
-creating a YAML spec in optimizer/designs/<name>.yaml and loading it via
+creating a YAML spec in eda_rl/designs/<name>.yaml and loading it via
 DesignSpec.load(name_or_path).
 
 PINNED interface (concurrent agents code against this exactly):
@@ -22,7 +22,7 @@ PINNED interface (concurrent agents code against this exactly):
                      uncertainty: float | None = None,
                      io_delay: float | None = None) -> str
 
-Design YAML spec format (see optimizer/designs/tinymac_accel.yaml for full example):
+Design YAML spec format (see eda_rl/designs/tinymac_accel.yaml for full example):
     name: <str>
     top: <str>
     rtl_files: [<path>, ...]   # relative to repo root OR absolute
@@ -51,7 +51,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-# Repo root: optimizer/common/designs.py → ../../../ = repo root
+# Repo root: eda_rl/common/designs.py → ../../../ = repo root
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 # Designs YAML directory
 _DESIGNS_DIR = Path(__file__).resolve().parent.parent / "designs"
@@ -221,7 +221,7 @@ class DesignSpec:
         Resolution order:
             1. If name_or_path is an existing path (absolute or relative to cwd),
                load it directly.
-            2. Otherwise, look up optimizer/designs/<name_or_path>.yaml.
+            2. Otherwise, look up eda_rl/designs/<name_or_path>.yaml.
 
         RTL file paths in the YAML are resolved as:
             - If absolute: used as-is.

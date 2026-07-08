@@ -1,7 +1,7 @@
-"""funnel.py — FunnelEnv: gym-style environment exposing per-stage observations
+"""env.py — FunnelEnv: gym-style environment exposing per-stage observations
 and accepting promotion *actions* over the multi-fidelity evaluation funnel.
 
-Architecture (see docs/07_rl_pipeline_design.md Phase 4):
+Architecture (see docs/rl_system.md):
 
     F0  validate + analytic cycle model        cost ≈ 0 s    (always runs on reset)
     F1  behavioral Verilator sim               cost ≈ 5 s
@@ -18,7 +18,9 @@ generator / promotion policy) drives the episode via step(action):
 
 After F3 completes the episode is always done=True.
 
-State vector (22-dim float32, PINNED):
+State vector (22-dim float32, PINNED — state_spec.py is the single source of
+truth; the sketch below is the tinymac/legacy normalization, see state_spec.py
+for the generic-design variants of slots [2]/[4]/[10]):
     [0]  log2(lanes)/5
     [1]  (acc_w − 16)/16
     [2]  (clk − 3)/5           # nangate45 normalisation; asap7: (clk−0.3)/1.2
@@ -42,7 +44,7 @@ State vector (22-dim float32, PINNED):
 Logging: every (config, fidelity, obs) row is appended to results_funnel.jsonl:
     {"ts", "config", "fidelity", "obs", "cost_s", "platform", "status"}
 
-Live mode (table=None): calls cascade.py's existing tool wrappers for F1/F2/F3.
+Live mode (table=None): drives common.sim (F1) and common.physical_runner (F2/F3).
 Table mode (table=dict): replays observations from the table, charges recorded
     cost against the budget — no real tools.  Use load_table(path) to build the
     dict from an existing results_funnel.jsonl.
@@ -84,7 +86,7 @@ except ImportError:
 
 # surrogate.py is being written by a concurrent agent; fall back gracefully.
 try:
-    from eda_rl.gen2.surrogate import Surrogate  # noqa: F401  (type hint only)
+    from eda_rl.funnel.surrogate import Surrogate  # noqa: F401  (type hint only)
     _SURROGATE_AVAILABLE = True
 except ImportError:
     _SURROGATE_AVAILABLE = False
@@ -149,7 +151,7 @@ _PLATFORM_ORDINAL: dict[str, float] = {
     "asap7":     1.0,
 }
 
-from eda_rl.gen2.state_spec import STATE_DIM as _STATE_DIM  # canonical 22-dim spec
+from eda_rl.funnel.state_spec import STATE_DIM as _STATE_DIM  # canonical 22-dim spec
 
 
 # ── Table helpers ──────────────────────────────────────────────────────────────
@@ -517,7 +519,7 @@ class FunnelEnv:
         budget_s: float = 14400.0,
         surrogate: Any | None = None,
         table: dict | None = None,
-        results_path: str | Path = str(Path(__file__).resolve().parent.parent / "results" / "gen2" / "results_funnel.jsonl"),
+        results_path: str | Path = str(Path(__file__).resolve().parent.parent / "results" / "funnel" / "results_funnel.jsonl"),
         seed: int = 0,
         lambda_cost: float = 1.0,
         design: "str | Any | None" = None,

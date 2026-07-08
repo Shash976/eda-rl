@@ -15,7 +15,7 @@ Three agents implement the same interface for the FunnelEnv action space
 
 3. RandomPromotionAgent — uniform-random action selection.  Sanity check.
 
-State vector layout: see eda_rl/gen2/state_spec.py — the single source of truth
+State vector layout: see eda_rl/funnel/state_spec.py — the single source of truth
 (imported below).  The agents below read it through the IDX_* constants so they
 can never drift from what FunnelEnv._build_state actually emits (audit H3/H4).
 Key slots the gates use: [6] F0 accuracy, [8] F1 accuracy, [10] F2 wns_norm
@@ -69,7 +69,7 @@ _ActionTuple = tuple[str, ...]
 _DEFAULT_ACTIONS: _ActionTuple = ("kill", "re-proxy", "promote", "commit")
 
 # ── state vector indices — re-exported from the canonical state_spec module ───
-from eda_rl.gen2.state_spec import (  # noqa: E402,F401
+from eda_rl.funnel.state_spec import (  # noqa: E402,F401
     STATE_DIM,
     IDX_LANES_NORM, IDX_ACCW_NORM, IDX_CLK_NORM,
     IDX_RECIPE, IDX_PLATFORM, IDX_RECIPE_SPD, IDX_RECIPE_AREA,
@@ -268,10 +268,10 @@ class FixedGateAgent:
         state[10] (F2 proxy_wns_norm) < -_WNS_KILL_CLK_FRACTION (= -0.5) → "kill"
             Clock-relative gate (F11): kill when wns < -0.5·clock_period.  This is
             read straight off the normalised state[10]:
-              • generic designs — funnel.py sets state[10] = wns/clk (F10), so
+              • generic designs — env.py sets state[10] = wns/clk (F10), so
                 -0.5 == wns < -0.5·clk.  Fires correctly on sub-ns platforms
                 (asap7/sky130hd) where the old absolute -2.5 ns gate was inert.
-              • tinymac/legacy — funnel.py keeps state[10] = wns_ns/5, so -0.5 ==
+              • tinymac/legacy — env.py keeps state[10] = wns_ns/5, so -0.5 ==
                 raw wns < -2.5 ns (Phase-5 Exp-3 calibrated), unchanged.
         otherwise → "promote"
 
@@ -288,7 +288,7 @@ class FixedGateAgent:
     # this fraction of the clock period below zero:
     #       wns < -_WNS_KILL_CLK_FRACTION * clock_period.
     # This is computed directly from the normalised state slot [10] WITHOUT the
-    # agent needing the raw clock, because funnel.py normalises WNS by the
+    # agent needing the raw clock, because env.py normalises WNS by the
     # design's own clock period for designs that expose a clock range (F10), so
     # for those designs state[10] = wns/clk and the rule is exactly
     #       state[10] < -_WNS_KILL_CLK_FRACTION   (= -0.5).
@@ -296,7 +296,7 @@ class FixedGateAgent:
     # is inert on sub-ns platforms (asap7/likith WNS is O(±0.003 ns)): the gate
     # could never fire and "fixed gates" degenerated to always-promote (F11).
     #
-    # Legacy/TinyVAD path: funnel.py keeps the fixed /5-ns WNS ruler (state[10] =
+    # Legacy/TinyVAD path: env.py keeps the fixed /5-ns WNS ruler (state[10] =
     # wns_ns/5) for bit-compat with saved LinUCB agents and the benchmark tables.
     # The SAME normalised threshold -0.5 then corresponds to raw wns < -2.5 ns —
     # the Phase-5 Exp-3 calibrated tinymac/nangate45 value — so tinymac behaviour
@@ -517,7 +517,7 @@ def _selftest() -> None:
     assert fg.act(s) == "promote", "F2 WNS 0.0 (timing met) should promote"
 
     # F11 regression: sub-ns-platform-shaped state (likith/asap7, clk O(0.05 ns)).
-    # funnel.py normalises WNS by the design's clock period for generic designs
+    # env.py normalises WNS by the design's clock period for generic designs
     # (F10), so state[10] = wns/clk — the raw O(±0.003 ns) magnitudes that made
     # the old absolute -2.5 ns gate inert become clock-relative fractions here.
     # wns = -0.6·clk → state[10] = -0.6 < -0.5 → MUST kill (was always-promote).

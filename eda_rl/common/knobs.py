@@ -1,4 +1,4 @@
-"""optimizer/common/knobs.py — design-agnostic ORFS knob registry.
+"""eda_rl/common/knobs.py — design-agnostic ORFS knob registry.
 
 The original 24 knobs are transcribed from /tmp/knobs_research.yaml (the
 evidence-annotated research pass over ORFS variables.yaml and AutoTuner JSON
@@ -156,14 +156,14 @@ class KnobRegistry:
         and getattr(str, 'params', {}) returns {}, silently dropping all design params.
         Returns the resolved DesignSpec (or original object if not a str).
 
-        Import is tried as both 'common.designs' (when optimizer/ is on sys.path)
-        and with a sys.path insertion for the optimizer root so the method works
-        whether called from optimizer/ context or from optimizer/common/ context.
+        Import is tried as both 'common.designs' (when eda_rl/ is on sys.path)
+        and with a sys.path insertion for the package root so the method works
+        whether called from eda_rl/ context or from eda_rl/common/ context.
         """
         if isinstance(design, str):
             import sys as _sys
             from pathlib import Path as _Path
-            # Ensure optimizer/ root is importable (idempotent if already present)
+            # Ensure the package root is importable (idempotent if already present)
             _opt_root = str(_Path(__file__).resolve().parent.parent)
             if _opt_root not in _sys.path:
                 _sys.path.insert(0, _opt_root)
@@ -1120,7 +1120,7 @@ def _build_knobs() -> list[Knob]:
 # ── Self-test ──────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    """Self-test: run with `python3 optimizer/common/knobs.py`."""
+    """Self-test: run with `python3 eda_rl/common/knobs.py`."""
     import sys
 
     print("=== knobs.py self-test ===")

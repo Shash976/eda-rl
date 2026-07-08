@@ -55,7 +55,7 @@ from pathlib import Path
 from typing import Any
 
 
-# ── bootstrap: optimizer/ root on path ───────────────────────────────────────
+# ── bootstrap (historical; removed for the installed package) ───────────────────────────────────────
 # [eda_rl] bootstrap removed (installed package): sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 # ── Fallback space (4-axis tinymac space) ─────────────────────────────────────
@@ -140,7 +140,7 @@ class CandidateGenerator:
     ----------
     space      : axis-spec dict (from KnobRegistry.space or _fallback_space()).
     sampler    : "tpe" | "surrogate_ucb" | "random".
-    surrogate  : optional fitted Surrogate instance (gen2.surrogate.Surrogate).
+    surrogate  : optional fitted Surrogate instance (funnel.surrogate.Surrogate).
                  Required for sampler="surrogate_ucb"; ignored for others.
     seed       : RNG seed (ensures deterministic campaigns).
     kappa      : UCB exploration coefficient μ + κ·σ (surrogate_ucb only).
@@ -682,10 +682,10 @@ if __name__ == "__main__":
 
     # ── TEST 5: surrogate_ucb path with real saved surrogate ──────────────────
     print("\n--- TEST 5: surrogate_ucb with real surrogate (surrogate_n45.joblib) ---")
-    _surr_path = Path(__file__).resolve().parents[1] / "results" / "gen2" / "surrogate_n45.joblib"
+    _surr_path = Path(__file__).resolve().parents[1] / "results" / "funnel" / "surrogate_n45.joblib"
     if _surr_path.exists():
         try:
-            from eda_rl.gen2.surrogate import Surrogate
+            from eda_rl.funnel.surrogate import Surrogate
             surr = Surrogate.load(_surr_path)
             gen5 = CandidateGenerator(space, sampler="surrogate_ucb",
                                       surrogate=surr, seed=0, kappa=1.0, grid_snap=True)

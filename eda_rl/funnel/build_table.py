@@ -27,7 +27,7 @@ Usage:
 
 Options:
     --space PATH       search_space_funnel.yaml  (default: search_space_funnel.yaml)
-    --out PATH         output jsonl              (default: results/gen2/results_funnel.jsonl)
+    --out PATH         output jsonl              (default: results/funnel/results_funnel.jsonl)
     --fidelity F0|F1|F2  target fidelity         (default: F2)
     --limit N          max evaluations to run    (default: no limit)
     --subset strategic  corner+axis sweep (~54-87 deduped configs instead of 594)
@@ -292,7 +292,7 @@ def _eval_f0(config: dict, design: "Any | None" = None) -> tuple[dict, str]:
     # agrees with FunnelEnv._f0_accuracy (audit M1) instead of a lanes-independent
     # approximation.  Fall back to the simple acc_w rule only if funnel is absent.
     try:
-        from eda_rl.gen2.funnel import _f0_accuracy
+        from eda_rl.funnel.env import _f0_accuracy
         acc = _f0_accuracy(lanes, acc_w)
     except ImportError:
         acc = 1.0 if acc_w >= 24 else (0.92 if acc_w >= 20 else 47.0 / 64.0)
@@ -359,7 +359,7 @@ def _eval_f1(config: dict, design: "Any | None" = None) -> tuple[dict, str]:
     # Uses funnel's measured (lanes, acc_w) table (V13: acc16 accuracy is LANES-dependent)
     # so table F1 rows agree with FunnelEnv's F0 analytic accuracy.
     try:
-        from eda_rl.gen2.funnel import _f0_accuracy
+        from eda_rl.funnel.env import _f0_accuracy
         acc = _f0_accuracy(lanes, acc_w)
     except ImportError:
         acc = 1.0 if acc_w >= 24 else (0.92 if acc_w >= 20 else 47.0 / 64.0)
@@ -406,7 +406,7 @@ def _eval_f2(config: dict, platform: str, design: "Any | None" = None) -> tuple[
         return {"error": str(exc)}, "import_error"
 
     # Defensive: pass abc_recipe/design only if run_synth_sta accepts them
-    # (mirrors funnel.py's _run_f2 signature-inspection pattern).
+    # (mirrors env.py's _run_f2 signature-inspection pattern).
     try:
         sig = inspect.signature(run_synth_sta)
         accepts_recipe = "abc_recipe" in sig.parameters
@@ -712,7 +712,7 @@ def main() -> None:
     parser.add_argument(
         "--out",
         default=None,
-        help="Output JSONL file path (default: results/gen2/results_funnel.jsonl; "
+        help="Output JSONL file path (default: results/funnel/results_funnel.jsonl; "
              "under PHYSICAL_MOCK, a temp path unless --out is given explicitly, "
              "so mock rows never land in the tracked results file — audit F17/R8)",
     )
@@ -748,7 +748,7 @@ def main() -> None:
         "--design",
         default=None,
         help=(
-            "Design name or YAML path (e.g. 'gcd' or 'optimizer/designs/gcd.yaml'). "
+            "Design name or YAML path (e.g. 'gcd' or 'eda_rl/designs/gcd.yaml'). "
             "Default: tinymac_accel (unchanged behaviour). "
             "Grid enumeration uses KnobRegistry.space(design, max_tier, platform) "
             "when --design is specified. "
@@ -777,9 +777,9 @@ def main() -> None:
         import tempfile
         out_path = Path(tempfile.gettempdir()) / "eda_rl_build_table_mock.jsonl"
         print(f"  [PHYSICAL_MOCK] --out not given; writing mock rows to {out_path} "
-              f"(not the tracked results/gen2/results_funnel.jsonl)")
+              f"(not the tracked results/funnel/results_funnel.jsonl)")
     else:
-        out_path = _THIS_DIR.parent / "results" / "gen2" / "results_funnel.jsonl"
+        out_path = _THIS_DIR.parent / "results" / "funnel" / "results_funnel.jsonl"
 
     run_table_builder(
         space_path=Path(args.space),
@@ -859,7 +859,7 @@ def _selftest() -> None:
 
     # Also verify config_key produced by build_table matches funnel.load_table expectation
     import json as _json
-    from eda_rl.gen2.funnel import load_table as _load_table
+    from eda_rl.funnel.env import load_table as _load_table
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp) / "funnel_compat.jsonl"
         canonical_cfg = {"mac_lanes": 4, "accumulator_width": 24,

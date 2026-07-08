@@ -26,7 +26,7 @@ Honesty rules (from Phase 4 doc):
       precedent).  We just run it and report.
 
 Usage:
-    python3 optimizer/benchmark_funnel.py [options]
+    eda-rl benchmark [options]
 
 Options:
     --seeds N          number of seeds                    (default: 20)
@@ -56,7 +56,7 @@ import numpy as np
 # ── CandidateGenerator (optional — absent before candidates.py lands) ─────────
 _CAND_AVAILABLE = False
 try:
-    from eda_rl.gen2.candidates import CandidateGenerator, _fallback_space
+    from eda_rl.funnel.candidates import CandidateGenerator, _fallback_space
     _CAND_AVAILABLE = True
 except Exception:
     CandidateGenerator = None   # type: ignore[assignment,misc]
@@ -80,14 +80,14 @@ _FUNNEL_AVAILABLE = False
 _FUNNEL_IMPORT_ERROR: str = ""
 
 try:
-    from eda_rl.gen2.funnel import FunnelEnv, load_table  # type: ignore[import]
+    from eda_rl.funnel.env import FunnelEnv, load_table  # type: ignore[import]
     _FUNNEL_AVAILABLE = True
 except Exception as _e:
     _FUNNEL_IMPORT_ERROR = str(_e)
 
 # ── promotion agent imports ────────────────────────────────────────────────────
 
-from eda_rl.gen2.promotion_agent import (  # noqa: E402
+from eda_rl.funnel.promotion_agent import (  # noqa: E402
     FixedGateAgent,
     PromotionAgent,
     RandomPromotionAgent,
@@ -357,7 +357,7 @@ def _run_campaign(
                     except Exception:
                         break
                     # Snap to table-present configs: only yield if in the table
-                    from eda_rl.gen2.funnel import _config_key as _ck
+                    from eda_rl.funnel.env import _config_key as _ck
                     key = _ck(cfg)
                     if key in table and key not in _seen:
                         _seen.add(key)
@@ -537,7 +537,7 @@ def run_benchmark(
     # returned -20 and silently became the "optimum" on an F3-less table — the
     # benchmark then "measured" agents against a -20 failure floor and the
     # guard below never fired.  We now skip them and require ≥1 real F3 row.
-    from eda_rl.gen2.funnel import _config_key as _ck
+    from eda_rl.funnel.env import _config_key as _ck
     import tempfile as _tmpfile
     f3_rewards: list[float] = []
     n_table_miss = 0
@@ -567,7 +567,7 @@ def run_benchmark(
             f"Benchmark table has 0 real F3 rows across {len(grid_configs)} "
             "scanned configs — the optimum is undefined and no verdict can be "
             "rendered. Point --table at a file with real F3/ok rows (e.g. a "
-            "campaign log under optimizer/campaigns/), pass --include-campaigns, "
+            "campaign log under eda_rl/campaigns/), pass --include-campaigns, "
             "or build F3 rows first. (See audit EXP-F1.)"
         )
     table_optimum = max(f3_rewards)
@@ -850,7 +850,7 @@ def _merge_tables(paths: list[Path]) -> dict:
 
 
 def _campaign_jsonl_paths() -> list[Path]:
-    """All campaign logs under optimizer/campaigns/<design>/<platform>/*.jsonl."""
+    """All campaign logs under eda_rl/campaigns/<design>/<platform>/*.jsonl."""
     camp = _OPT_DIR / "campaigns"
     return sorted(camp.rglob("*.jsonl")) if camp.is_dir() else []
 
@@ -919,11 +919,11 @@ def main() -> None:
     parser.add_argument("--selftest", action="store_true",
                         help="Run synthetic-table selftest and exit")
     parser.add_argument("--table",
-                        default=str(_THIS_DIR.parent / "results" / "gen2" / "results_funnel.jsonl"),
+                        default=str(_THIS_DIR.parent / "results" / "funnel" / "results_funnel.jsonl"),
                         help="Path(s) to results_funnel.jsonl table(s); comma-separated to merge")
     parser.add_argument("--include-campaigns", action="store_true",
                         dest="include_campaigns",
-                        help="Also merge all real F3 rows from optimizer/campaigns/**/*.jsonl")
+                        help="Also merge all real F3 rows from eda_rl/campaigns/**/*.jsonl")
     parser.add_argument("--target-pct", type=float, default=0.95,
                         dest="target_pct",
                         help="Fraction of optimum considered 'found'")
@@ -934,7 +934,7 @@ def main() -> None:
                             "(default, keeps existing results comparable); "
                             "tpe = Optuna TPE-backed CandidateGenerator; "
                             "surrogate_ucb = surrogate UCB (falls back to tpe without surrogate). "
-                            "Non-shuffled modes require gen2/candidates.py."
+                            "Non-shuffled modes require funnel/candidates.py."
                         ))
 
     args = parser.parse_args()
@@ -954,7 +954,7 @@ def main() -> None:
     missing = [p for p in table_paths if not p.exists()]
     if missing:
         print(f"Table file(s) not found: {[str(p) for p in missing]}")
-        print("Run: python3 optimizer/build_table.py --subset strategic")
+        print("Run: eda-rl build-table --subset strategic")
         print("Or use --selftest / --include-campaigns.")
         sys.exit(1)
     if not table_paths:

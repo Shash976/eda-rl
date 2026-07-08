@@ -632,7 +632,7 @@ class Surrogate:
         models were trained on the old fixed 8-element feature layout, which
         the current feature builder no longer produces, so predictions would
         be silently wrong. Refit from the campaign corpus instead
-        (eda-rl fit-surrogate / python -m eda_rl.gen2.fit_surrogate).
+        (eda-rl fit-surrogate / python -m eda_rl.funnel.fit_surrogate).
         """
         payload = joblib.load(path)
         s = cls(seed=payload.get("seed", 0))
@@ -652,7 +652,7 @@ class Surrogate:
                 "schema — it predates the audit-F5 featurization change and "
                 "its models are incompatible with the current feature layout. "
                 "Refit the surrogate from the campaign corpus "
-                "(python -m eda_rl.gen2.fit_surrogate)."
+                "(python -m eda_rl.funnel.fit_surrogate)."
             )
         return s
 

@@ -14,16 +14,16 @@ This script:
 6. Runs sanity predictions:
      - area(L1) < area(L32)          [LANES dominates area, must hold]
      - sigma larger for OOD config (asap7 platform or extreme clk) than in-dist
-7. Saves the fitted model to optimizer/surrogate_n45.joblib.
+7. Saves the fitted model to eda_rl/results/funnel/surrogate_n45.joblib.
 
 NOTE: physical_runner.py is being edited concurrently.  We vendor the same
 report-parsing regexes here rather than importing to avoid transient import
 failures.  The regexes are intentionally identical to physical_runner._parse_metrics.
 
 Run with:
-    python3 optimizer/fit_surrogate.py
+    eda-rl fit-surrogate
 or via:
-    python3 optimizer/surrogate.py  (delegates here)
+    python -m eda_rl.funnel.surrogate  (delegates here)
 """
 
 from __future__ import annotations
@@ -35,13 +35,13 @@ import sys
 from pathlib import Path
 
 
-# Bootstrap: make optimizer/ root importable (gen2/ is one level below it)
+# Package root (funnel/ is one level below eda_rl/)
 # [eda_rl] bootstrap removed: _sys.path.insert(0, str(_pl.Path(__file__).resolve().parents[1]))
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 
 _REPO     = Path(__file__).resolve().parent.parent.parent
-_OPTIMIZER = Path(__file__).resolve().parent.parent       # optimizer/
+_OPTIMIZER = Path(__file__).resolve().parent.parent       # eda_rl/
 _RUN_DIR  = _REPO / "physical" / "orfs" / "runs"
 _RPT_DIR  = _RUN_DIR / "reports" / "nangate45" / "tinymac_accel"
 _LOG_DIR  = _RUN_DIR / "logs"    / "nangate45" / "tinymac_accel"
@@ -50,7 +50,7 @@ _PROXY_DIR = _RUN_DIR / "proxy"
 _MAKE_DIR = _REPO / "physical" / "orfs" / "make"
 # Where live campaigns now log per-fidelity rows: campaigns/<design>/<platform>/*.jsonl
 _CAMPAIGN_DIR = _OPTIMIZER / "campaigns"
-_OUT_MODEL = Path(__file__).resolve().parent.parent / "results" / "gen2" / "surrogate_n45.joblib"
+_OUT_MODEL = Path(__file__).resolve().parent.parent / "results" / "funnel" / "surrogate_n45.joblib"
 
 # ── Vendored regexes from physical_runner.py (identical; keep in sync) ────────
 # Source: physical_runner._parse_metrics, checked 2026-06-11
@@ -444,7 +444,7 @@ def main():
     import argparse
     from collections import Counter
 
-    from eda_rl.gen2.surrogate import Surrogate
+    from eda_rl.funnel.surrogate import Surrogate
 
     ap = argparse.ArgumentParser(description="Fit + CP3-validate the PPA surrogate.")
     ap.add_argument("--design", default=None,

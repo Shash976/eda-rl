@@ -1,11 +1,11 @@
 """state_spec.py — the single source of truth for the 22-dim FunnelEnv state.
 
 Every component that reads or writes the promotion-policy state vector imports
-the layout from here so funnel.py (which *builds* the vector), promotion_agent.py
-(which *reads* it), and benchmark_funnel.py (which wires agents) can never drift
-apart.  Previously the layout was documented three different ways — funnel.py
+the layout from here so env.py (which *builds* the vector), promotion_agent.py
+(which *reads* it), and benchmark_env.py (which wires agents) can never drift
+apart.  Previously the layout was documented three different ways — env.py
 emitted one encoding, promotion_agent.py's header documented another
-(lanes/32, acc_w/32, recipe one-hot, unrun = -1), and benchmark_funnel.py had a
+(lanes/32, acc_w/32, recipe one-hot, unrun = -1), and benchmark_env.py had a
 third dead builder — a correctness trap (audit H3/H4).
 
 CANONICAL LAYOUT (what FunnelEnv._build_state actually emits; unrun slots = 0.0):

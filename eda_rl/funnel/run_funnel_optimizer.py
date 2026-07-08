@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""run_funnel_optimizer.py — live campaign driver for the gen2 funnel optimizer.
+"""run_funnel_optimizer.py — live campaign driver for the funnel optimizer.
 
 Gen2 counterpart of gen1/run_physical_optimizer.py.  Drives a loop of:
   1. CandidateGenerator.suggest() → next config
@@ -8,26 +8,25 @@ Gen2 counterpart of gen1/run_physical_optimizer.py.  Drives a loop of:
   4. CandidateGenerator.update(config, terminal_reward, fidelity)
   5. PromotionAgent.update per step (online LinUCB update)
 
-Logs one JSONL line per episode to optimizer/campaigns/<design>/<platform>/results_funnel_campaigns.jsonl.
+Logs one JSONL line per episode to eda_rl/campaigns/<design>/<platform>/results_funnel_campaigns.jsonl.
 Prints a running incumbent line and a summary on exit.
 
 CLI
 ---
-  python3 optimizer/gen2/run_funnel_optimizer.py \\
+  python3 eda-rl optimize \\
       --design tinymac_accel --platform nangate45 \\
       --budget-hours 4 \\
       --max-tier 1 \\
       --sampler tpe|surrogate_ucb|random \\
       --promotion fixed|linucb|random \\
       --seed 0 \\
-      --table optimizer/results/gen2/results_funnel.jsonl  # omit for live mode
-      --surrogate optimizer/results/gen2/surrogate_n45.joblib   # default: auto-detect
+      --table eda_rl/results/funnel/results_funnel.jsonl  # omit for live mode
+      --surrogate eda_rl/results/funnel/surrogate_n45.joblib   # default: auto-detect
 
 Table mode (--table given): replays logged observations, charges recorded cost
 against a simulated wall-clock budget.  PHYSICAL_MOCK=1 activates mock metrics
 for live mode (no real ORFS calls).
 
-Entry point is also available via the compat shim optimizer/run_funnel_optimizer.py.
 """
 
 from __future__ import annotations
@@ -40,7 +39,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-# ── bootstrap: make optimizer/ root importable ───────────────────────────────
+# ── bootstrap (historical; package is installed) ───────────────────────────────
 # [eda_rl] bootstrap removed (installed package): sys.path.insert(0, str(_pl.Path(__file__).resolve().parents[1]))
 
 # Force UTF-8 stdout
@@ -52,21 +51,21 @@ except Exception:
 # ── imports (all defensive with clear error messages) ─────────────────────────
 
 try:
-    from eda_rl.gen2.funnel import FunnelEnv, load_table
+    from eda_rl.funnel.env import FunnelEnv, load_table
     _FUNNEL_OK = True
 except Exception as _e:
     _FUNNEL_OK = False
     _FUNNEL_ERR = str(_e)
 
 try:
-    from eda_rl.gen2.candidates import CandidateGenerator, _fallback_space
+    from eda_rl.funnel.candidates import CandidateGenerator, _fallback_space
     _CAND_OK = True
 except Exception as _e:
     _CAND_OK = False
     _CAND_ERR = str(_e)
 
 try:
-    from eda_rl.gen2.promotion_agent import (
+    from eda_rl.funnel.promotion_agent import (
         FixedGateAgent,
         PromotionAgent,
         RandomPromotionAgent,
@@ -81,7 +80,7 @@ except Exception as _e:
 
 _OPT_ROOT = Path(__file__).resolve().parents[1]
 _CAMPAIGNS_ROOT = _OPT_ROOT / "campaigns"
-_DEFAULT_SURROGATE = _OPT_ROOT / "results" / "gen2" / "surrogate_n45.joblib"
+_DEFAULT_SURROGATE = _OPT_ROOT / "results" / "funnel" / "surrogate_n45.joblib"
 _DEFAULT_SPACE_YAML = Path(__file__).resolve().parent / "search_space_funnel.yaml"
 
 # Fidelity labels in promotion order
@@ -98,7 +97,7 @@ def _load_surrogate(path: str | Path | None) -> Any | None:
     if not p.exists():
         return None
     try:
-        from eda_rl.gen2.surrogate import Surrogate
+        from eda_rl.funnel.surrogate import Surrogate
         s = Surrogate.load(p)
         return s
     except Exception as exc:   # noqa: BLE001

@@ -30,7 +30,7 @@ SW_BASELINE_CYCLES: int = 11_196_638
 
 # SW baseline clock / latency, used to convert cycle counts → real-time speedup
 # (reward.real_speedup, physical_reward).  Moved here from gen1/reward.py so
-# gen2/common no longer import gen1 for these measured constants (audit F16);
+# funnel/common no longer import gen1 for these measured constants (audit F16);
 # gen1/reward.py keeps its own identical copies (frozen history).
 SW_BASELINE_CLOCK_NS: float = 10.0                              # 100 MHz
 SW_BASELINE_LATENCY_NS: float = SW_BASELINE_CYCLES * SW_BASELINE_CLOCK_NS
@@ -49,7 +49,7 @@ def acc_overflows(config: dict) -> bool:
 
     The sim will also catch this (accuracy < 1.0), but this lets agents/rewards
     skip obviously bad configs without launching a subprocess.  Identical to the
-    gen1/reward.py predicate it was moved from (audit F16 — decouple gen2/common
+    gen1/reward.py predicate it was moved from (audit F16 — decouple funnel/common
     from gen1); gen1 keeps its own copy.
     """
     acc_w = config.get("accumulator_width", 32)
@@ -62,7 +62,7 @@ def acc_overflows(config: dict) -> bool:
 # Cycle model is output-stationary with ACCEL_CH_OVERHEAD=2 (bias load + requant):
 #   latency = n_outputs × (ceil(K / LANES) + 2)
 #
-# Sanity anchors from docs/07_rl_pipeline_design.md (measured on same machine):
+# Sanity anchors from legacy/docs/07_rl_pipeline_design.md (measured on same machine):
 #   8 lanes ≈ 61,399  →  measured 61,400  ✓ (within 1 cycle)
 #  16 lanes ≈ 46,669  →  measured 46,670  ✓ (within 1 cycle)
 AVG_CYCLES: dict[int, int] = {
