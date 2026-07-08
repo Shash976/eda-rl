@@ -411,16 +411,20 @@ def _run_campaign(
             simulated_s += episode_cost
 
             # Only count terminal F3 rewards toward the incumbent.
-            # episode_reward is the FunnelEnv terminal reward (including shaping);
-            # for the benchmark metric we use it directly since this is the same
-            # reward that agents are optimizing.
+            # Score with the PURE terminal reward (info["terminal_reward"]), the
+            # same signal the live driver tells Optuna and tracks best on.  The
+            # accumulated shaped sum (episode_reward) is path- and budget-
+            # dependent — an agent that promotes through F1+F2 pays more shaping
+            # cost than one that commits straight to F3 for the same chip — so
+            # scoring it against the pure-terminal table optimum systematically
+            # penalized promote-through policies.
             fid_reached = info.get("fidelity", "?") if episode_done else "?"
             is_table_miss = bool(info.get("table_miss"))
             # A real F3 commit (not a table_miss) is the only thing that updates
             # the incumbent / counts toward the optimum (audit EXP-F6): a
             # table_miss carries no terminal data and must not be scored.
             if fid_reached == "F3" and episode_done and not is_table_miss:
-                final_reward = float(episode_reward)
+                final_reward = float(info.get("terminal_reward", episode_reward))
 
                 # Feed back to CandidateGenerator (F3-only tell rule)
                 if _cand_gen is not None:

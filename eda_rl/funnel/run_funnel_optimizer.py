@@ -105,6 +105,30 @@ def _load_surrogate(path: str | Path | None) -> Any | None:
         return None
 
 
+def _surrogate_covers(surrogate: Any, space: dict) -> bool:
+    """True if the fitted surrogate's config-axis schema covers this space.
+
+    Probes with one representative config drawn from the space (defaults /
+    first choices / range lows). An unfitted surrogate passes — it predicts
+    nothing either way and stays useful as a shaping no-op.
+    """
+    if not getattr(surrogate, "_fitted", False):
+        return True
+    cfg: dict = {}
+    for axis, spec in space.items():
+        if "default" in spec:
+            cfg[axis] = spec["default"]
+        elif spec.get("choices"):
+            cfg[axis] = spec["choices"][0]
+        elif spec.get("range"):
+            cfg[axis] = spec["range"][0]
+    try:
+        surrogate.predict_reward_stats(cfg, None, reward_kind="generic", refs={})
+        return True
+    except Exception:  # noqa: BLE001 — schema-coverage refusal (or any predict failure)
+        return False
+
+
 # ── helper: build space dict ──────────────────────────────────────────────────
 
 def _build_space(
@@ -193,21 +217,32 @@ def run_campaign(
     results_path.parent.mkdir(parents=True, exist_ok=True)
     campaign_id = f"campaign_{seed}_{int(t0)}"
 
+    # ── build space ────────────────────────────────────────────────────────────
+    space = _build_space(design, platform, max_tier, space_yaml=space_yaml)
+    if verbose:
+        print(f"  Space: {len(space)} axes: {list(space.keys())}")
+
     # ── load surrogate ─────────────────────────────────────────────────────────
     # Auto-detect default surrogate if not specified
     if surrogate_path is None and _DEFAULT_SURROGATE.exists():
         surrogate_path = _DEFAULT_SURROGATE
     surrogate = _load_surrogate(surrogate_path)
+    if surrogate is not None and not _surrogate_covers(surrogate, space):
+        # A fitted surrogate whose config-axis schema doesn't cover this
+        # design's space would raise on every predict — the coverage guard
+        # catches each call, so it silently contributes 0.0 everywhere and
+        # surrogate_ucb degenerates to arbitrary ordering. Drop it loudly
+        # instead of announcing "Surrogate loaded".
+        if verbose:
+            print(f"  [WARNING] surrogate at {surrogate_path} does not cover this "
+                  f"design's config axes — ignoring it. Refit with: eda-rl "
+                  f"fit-surrogate on campaigns of this design.")
+        surrogate = None
     if verbose and surrogate is not None:
         print(f"  Surrogate loaded from {surrogate_path} "
               f"(fitted={surrogate._fitted}, n_rows={surrogate._n_rows})")
     elif verbose:
         print(f"  No surrogate (UCB scoring disabled)")
-
-    # ── build space ────────────────────────────────────────────────────────────
-    space = _build_space(design, platform, max_tier, space_yaml=space_yaml)
-    if verbose:
-        print(f"  Space: {len(space)} axes: {list(space.keys())}")
 
     # ── load table (if given) ──────────────────────────────────────────────────
     table = None

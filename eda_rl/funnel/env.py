@@ -678,8 +678,10 @@ class FunnelEnv:
             When no surrogate: r_k = −λ·cost_k / budget_s
             On F3 terminal: adds the final composite reward (ladder-consistent).
 
-        Reward is only *positive* from the F3 terminal payoff; shaping terms
-        are always ≤ 0 (anti-gaming: proxy can only kill, never accept).
+        The cost term is always ≤ 0; the surrogate-Δ term telescopes over the
+        episode (post − prior around each observation, nonzero mainly at F2
+        where new obs condition the surrogate), so it cannot be farmed for
+        net reward.  Sustained positive reward comes only from the F3 payoff.
         """
         if self._done:
             raise RuntimeError("FunnelEnv.step() called after done=True; call reset() first.")
@@ -780,6 +782,10 @@ class FunnelEnv:
     def _run_stage(self, fidelity: str) -> float:
         """Run `fidelity` (F1/F2/F3), update state, return shaped reward."""
         assert self._config is not None
+        # Surrogate prior MUST be captured before the stage runs: the stage
+        # mutates _f2_obs, and a prior taken afterwards is identical to the
+        # posterior, silently zeroing the Δ shaping term for every step.
+        prior_mu = self._surrogate_mu() if self._surrogate is not None else 0.0
         t_start = time.perf_counter()
 
         if fidelity == "F1":
@@ -816,7 +822,6 @@ class FunnelEnv:
         self._update_state()
 
         # Compute shaped reward
-        prior_mu = self._surrogate_mu()
         reward = -self._lambda * cost_s / max(self.budget_s, 1.0)
 
         if fidelity == "F3":
