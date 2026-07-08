@@ -8,7 +8,7 @@ cycle, and acc_sat = saturate(acc + psum) is latched — once per chunk, not onc
 per individual product.
 
 Sweep command that produced these numbers:
-    python3 optimizer/measure_real.py
+    python3 legacy/measure_real.py
     (extended to LANES ∈ {1,2,4,8,16,32}, averaging all 64 inference vectors)
 
 Public contract (other modules import exactly these names):

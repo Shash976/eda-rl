@@ -22,7 +22,7 @@ Key slots the gates use: [6] F0 accuracy, [8] F1 accuracy, [10] F2 wns_norm
 (clip[-2,2] of wns/clk for generic designs, wns_ns/5 for tinymac/legacy — see
 state_spec.py [10]), [18..21] depth one-hot.  The unrun convention is 0.0.
 
-FixedGateAgent mapping to cascade.py / cascade_reward.py gates:
+FixedGateAgent mapping to the original cascade gates (legacy/gen1/cascade.py):
     The cascade uses three hard thresholds (derived from search_space_full.yaml
     gates: block + cascade.py _run_sim / proxy checks):
 

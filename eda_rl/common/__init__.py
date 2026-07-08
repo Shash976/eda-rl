@@ -1,5 +1,6 @@
-"""common — tool plumbing and measured constants shared by gen1 and gen2.
+"""common — tool plumbing and measured constants shared across the package.
 
-Contains: physical_runner (ORFS wrappers), physical_reward, cascade_reward,
-constants (cycle measurements), recipe (ABC synthesis axis), validate, measure_real.
+Contains: physical_runner (ORFS wrappers), physical_reward, designs (DesignSpec),
+knobs (KnobRegistry), constants (cycle measurements), recipe (ABC synthesis axis),
+sim + verilator_sim (behavioral F1 sim).
 """
