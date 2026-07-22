@@ -27,7 +27,7 @@ import sys
 import webbrowser
 from pathlib import Path
 
-from eda_rl.viz.campaign_data import DEFAULT_LOG, load_campaign_rows, episode_value
+from eda_rl.viz.campaign_data import load_campaign_rows, episode_value, resolve_log_path
 
 
 # ── metric accessors ──────────────────────────────────────────────────────────
@@ -225,15 +225,21 @@ def build_page(picks: list[dict], design: str, platform: str, imgs: dict[str, st
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="Collect the best configs from a campaign: GDS + report + comparison page")
-    ap.add_argument("--log", default=str(DEFAULT_LOG) if DEFAULT_LOG is not None else None,
-                    required=(DEFAULT_LOG is None),
-                    help="campaign JSONL path (default: latest under campaigns/)")
+    ap.add_argument("--design", default=None,
+                    help="design name, e.g. 'sagar' — resolves the campaign log for you "
+                         "(pair with --platform; preferred over --log)")
+    ap.add_argument("--platform", default=None,
+                    help="platform name, e.g. 'sky130hd' (pair with --design)")
+    ap.add_argument("--log", default=None,
+                    help="campaign JSONL path (overrides --design/--platform; "
+                         "default: most-recently-modified log under eda_rl/campaigns/)")
     ap.add_argument("--campaign", default="latest", help="campaign_id | 'latest' | 'all'")
     ap.add_argument("--out", default=None, help="output directory (default: best_configs/<design>_<platform>)")
     ap.add_argument("--top", type=int, default=3, help="how many top-by-score configs to include (default 3)")
     ap.add_argument("--render", action="store_true", help="render layout PNGs with KLayout (needs klayout + ORFS_DIR)")
     ap.add_argument("--open", action="store_true", help="open the comparison page in a browser")
     args = ap.parse_args()
+    args.log = str(resolve_log_path(args.log, args.design, args.platform))
 
     rows = load_campaign_rows(args.log, args.campaign)
     if not rows:

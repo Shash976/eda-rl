@@ -11,7 +11,7 @@ run_funnel_optimizer.py runs.
     eda-rl dashboard
 
     # follow a live run (in another terminal, while the optimizer writes the log)
-    eda-rl dashboard --live --log tinymac_accel_run1.jsonl
+    eda-rl dashboard --live --design gcd --platform nangate45
 
     # just rebuild the study file without launching the server
     eda-rl dashboard --no-serve --storage /tmp/funnel.db
@@ -30,7 +30,7 @@ from pathlib import Path
 
 # [eda_rl] bootstrap removed (installed package): sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from eda_rl.viz.campaign_data import DEFAULT_LOG, build_study, load_campaign_rows  # noqa: E402
+from eda_rl.viz.campaign_data import build_study, load_campaign_rows, resolve_log_path  # noqa: E402
 
 
 def _make_storage(path: Path):
@@ -49,7 +49,14 @@ def _sync(storage, log_path: Path, campaign: str, study_name: str) -> int:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Live Optuna dashboard for a campaign log")
-    ap.add_argument("--log", default=str(DEFAULT_LOG), help="campaign JSONL")
+    ap.add_argument("--design", default=None,
+                    help="design name, e.g. 'sagar' — resolves the campaign log for you "
+                         "(pair with --platform; preferred over --log)")
+    ap.add_argument("--platform", default=None,
+                    help="platform name, e.g. 'sky130hd' (pair with --design)")
+    ap.add_argument("--log", default=None,
+                    help="campaign JSONL path (overrides --design/--platform; "
+                         "default: most-recently-modified log under eda_rl/campaigns/)")
     ap.add_argument("--campaign", default="latest",
                     help="campaign_id | 'latest' | 'all'")
     ap.add_argument("--storage", default=None,
@@ -67,7 +74,7 @@ def main() -> None:
                     help="build/sync the study but do not launch the dashboard")
     args = ap.parse_args()
 
-    log_path = Path(args.log)
+    log_path = resolve_log_path(args.log, args.design, args.platform)
     if not log_path.exists():
         print(f"campaign log not found: {log_path}")
         sys.exit(1)

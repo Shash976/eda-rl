@@ -248,7 +248,7 @@ def main() -> None:
         if args.probe_f3:
             if os.environ.get("PHYSICAL_MOCK"):
                 rep.line(_WARN, "F3 probe skipped", "PHYSICAL_MOCK metrics are "
-                         "TinyMAC-shaped; a mock probe proves nothing")
+                         "synthetic and design-independent; a mock probe proves nothing")
             else:
                 _f3_probe(rep, design, args.platform, ctx["default_clk"])
     else:

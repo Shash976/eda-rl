@@ -6,7 +6,7 @@ parses its own arguments with argparse.  Usage:
     eda-rl optimize    --design <yaml> --platform <plat> --budget-hours N [...]
     eda-rl build-table --design <yaml> [...]
     eda-rl benchmark   [...]
-    eda-rl report      [--campaign all | --log <jsonl>] [...]
+    eda-rl report      --design <name> --platform <plat> [--campaign all|latest|<id>] [...]
 
 Run ``eda-rl <subcommand> --help`` for per-command options.
 """

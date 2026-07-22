@@ -90,11 +90,14 @@ r_step = −λ·cost_s/budget_s                    (cost of the stage just run)
 - The **surrogate-Δ prior is captured *before* the stage runs** — the stage
   mutates the F2 observation the surrogate conditions on. (A regression here
   once made the term identically zero; see §5.)
-- The **terminal reward** is design-aware (`common/physical_reward.py`):
-  - TinyVAD designs → `compute_physical_reward`, a speedup/accuracy/area/power
+- The **terminal reward** is design-aware, dispatched on
+  `design.functional_model()`:
+  - Designs with a functional model → that plugin's `terminal_reward`
+    (`common/functional_models/`). TinyVAD's is a speedup/accuracy/area/power
     composite against the measured software baseline (peaks ≈ +4; correctness
     failure −50).
-  - Generic designs → `compute_generic_reward` = `+1.0·(fmax/ref) −
+  - Designs with no functional model → `compute_generic_reward`
+    (`common/physical_reward.py`) = `+1.0·(fmax/ref) −
     1.0·(area/ref) − 0.4·(power/ref)` + timing-violation penalty, with refs
     auto-anchored from the design YAML `reward:` block or the first successful
     F3 build.
@@ -113,12 +116,34 @@ accumulator.
 ### The promotion policy — LinUCB
 
 `PromotionAgent` (`eda_rl/funnel/promotion_agent.py`) is a **disjoint linear
-contextual bandit**: one ridge model per action over the 22-dim state.
+contextual bandit**: one ridge model per **(action, depth)** pair over the
+22-dim state — depth-conditioned by default (`depth_conditioned=True`).
 
-- Init: `A_a = λI` (λ=1), `b_a = 0` for each action `a`.
-- Act: `argmax_a  θ_aᵀs + α·√(sᵀA_a⁻¹s)` with `θ_a = A_a⁻¹b_a`, α=1.
+- Init: `A_a = λI` (λ=1), `b_a = 0` for each arm `a`.
+- Act: `argmax_a  θ_aᵀs + α·√(sᵀA_a⁻¹s)` with `θ_a = A_a⁻¹b_a`, α=1; with
+  probability `epsilon` (default 0.03) the argmax is overridden by a
+  uniformly random action instead (forced-exploration floor).
 - Update after every step, with the **pre-action** state and that step's
-  shaped reward: `A_a += ssᵀ`, `b_a += r·s`.
+  shaped reward clipped to `±reward_clip` (default 5.0):
+  `A_a += ssᵀ`, `b_a += clip(r)·s`. The arm updated is keyed by the depth
+  read off the state's one-hot (`IDX_DEPTH_F0..F3`), not just the action.
+
+Depth-conditioning + clipping + the epsilon floor (2026-07-11) fix a real
+collapse: a shared "promote" arm absorbs both tiny F0→F2 shaping rewards and
+the rare, huge-magnitude F2→F3 terminal payoff (audit M6). A live campaign
+(likith/asap7) showed the predicted failure in practice — two early F2→F3
+promotions hit genuine reference-SDC timing violations (reward ≈ −3.4),
+permanently zeroing the shared arm's F2-depth estimate for the remaining 7884
+episodes of an 8-hour budget (F2→F3 rate: 0.56% → a hard 0.00%, never
+recovering). Depth-conditioning alone was *insufficient*: stress-testing
+against that same reward regime showed the now-isolated F2 arm still locks to
+permanent "always kill" within 1–3 samples, because a combinational design's
+F2 proxy WNS is pinned at exactly 0.0 (no timing-margin signal exists before
+F3 runs) — pure LinUCB is rationally correct to converge fast on a
+near-featureless, highly-skewed arm. The epsilon floor is what actually keeps
+the bandit re-checking F2→F3 for the whole budget instead of writing it off.
+See the `PromotionAgent` class docstring for the full mechanism and the
+regression tests (`_selftest`) that pin this behavior down.
 
 Baselines: `FixedGateAgent` — deterministic kill gates (F0/F1 accuracy < 0.95;
 F2 `state[10] < −0.5`, i.e. **WNS worse than −0.5·clock_period** — the
@@ -243,13 +268,12 @@ policies by ~5% at small budgets).
 
 | file | role |
 |---|---|
-| `physical_runner.py` | drives ORFS make (F3), the yosys+OpenSTA proxy (F2), the reference-SDC re-time, mock metrics, and all report parsing (`tests/test_parsers.py` covers the extracted parsers) |
-| `physical_reward.py` | `compute_physical_reward` (TinyVAD composite) + `compute_generic_reward` (pure PPA) |
-| `designs.py` | `DesignSpec.load`, SDC generation, injection-safe YAML validation |
+| `physical_runner.py` | drives ORFS make (F3), the yosys+OpenSTA proxy (F2), the reference-SDC re-time, mock metrics, and all report parsing (`tests/test_parsers.py` covers the extracted parsers). **Every entry point requires an explicit design — no silent default.** |
+| `physical_reward.py` | `compute_generic_reward` (the design-agnostic PPA reward). Family-specific composite rewards live behind the plugin registry. |
+| `designs.py` | `DesignSpec.load`, `functional_model()` (registry lookup), SDC generation, injection-safe YAML validation |
 | `knobs.py` | `KnobRegistry`: 27 ORFS knobs in 4 tiers, `affects` ontology (constraints/environment knobs are opt-in per design), pseudo-type → sampling-type mapping |
-| `constants.py` | measured TinyVAD cycle model + software-baseline constants |
+| `functional_models/` | the design functional-model **plugin registry**: `base.py` (interface), `__init__.py` (registry), `tinyvad*.py` (the TinyVAD plugin — its cycle model + SW baseline, `acc_overflows`, composite reward, behavioral Verilator sim, and report extension). A design opts in via `functional_eval.kind`; core dispatches through `design.functional_model()`. |
 | `recipe.py` | ABC synthesis recipe axis |
-| `sim.py` / `verilator_sim.py` | mock-aware F1 wrapper / the real TinyVAD Verilator driver (rescued from gen1) |
 
 ### `eda_rl/viz/` — reporting
 

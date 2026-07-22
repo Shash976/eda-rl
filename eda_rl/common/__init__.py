@@ -1,6 +1,7 @@
-"""common — tool plumbing and measured constants shared across the package.
+"""common — tool plumbing shared across the package.
 
-Contains: physical_runner (ORFS wrappers), physical_reward, designs (DesignSpec),
-knobs (KnobRegistry), constants (cycle measurements), recipe (ABC synthesis axis),
-sim + verilator_sim (behavioral F1 sim).
+Contains: physical_runner (ORFS wrappers), physical_reward (generic PPA reward),
+designs (DesignSpec), knobs (KnobRegistry), recipe (ABC synthesis axis),
+functional_models (the design functional-model plugin registry — TinyVAD's
+cycle model, composite reward, and behavioral sim live behind it).
 """

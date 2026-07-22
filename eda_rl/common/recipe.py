@@ -1,4 +1,4 @@
-"""recipe.py — ABC synthesis recipe axis for the TinyMAC design-space.
+"""recipe.py — ABC synthesis recipe axis for the flow search space.
 
 **Rationale** (from docs/07_rl_pipeline_design.md Phase 4 P1 / Phase 5 Exp 4):
 The ABC recipe is the highest-variance synthesis lever on this design:

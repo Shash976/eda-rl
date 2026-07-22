@@ -19,8 +19,9 @@ generator / promotion policy) drives the episode via step(action):
 After F3 completes the episode is always done=True.
 
 State vector (22-dim float32, PINNED — state_spec.py is the single source of
-truth; the sketch below is the tinymac/legacy normalization, see state_spec.py
-for the generic-design variants of slots [2]/[4]/[10]):
+truth; the sketch below is the fixed-ruler (functional-model/legacy)
+normalization, see state_spec.py for the generic-design variants of slots
+[2]/[4]/[10]):
     [0]  log2(lanes)/5
     [1]  (acc_w − 16)/16
     [2]  (clk − 3)/5           # nangate45 normalisation; asap7: (clk−0.3)/1.2
@@ -44,7 +45,8 @@ for the generic-design variants of slots [2]/[4]/[10]):
 Logging: every (config, fidelity, obs) row is appended to results_funnel.jsonl:
     {"ts", "config", "fidelity", "obs", "cost_s", "platform", "status"}
 
-Live mode (table=None): drives common.sim (F1) and common.physical_runner (F2/F3).
+Live mode (table=None): drives the design's functional model (F1) and
+    common.physical_runner (F2/F3).
 Table mode (table=dict): replays observations from the table, charges recorded
     cost against the budget — no real tools.  Use load_table(path) to build the
     dict from an existing results_funnel.jsonl.
@@ -93,31 +95,21 @@ except ImportError:
     Surrogate = None  # type: ignore[assignment,misc]
 
 # ── Core imports (always available) ──────────────────────────────────────────
-from eda_rl.common.constants import (
-    AVG_CYCLES,
-    SW_BASELINE_CYCLES,
-    behavioral_cycles as _behavioral_cycles,
-)
-from eda_rl.common.sim import _run_sim  # mock-aware Verilator wrapper (audit F16: was gen1.cascade)
 from eda_rl.common.physical_runner import run_synth_sta, run_physical
-from eda_rl.common.physical_reward import compute_physical_reward, compute_generic_reward
+from eda_rl.common.physical_reward import compute_generic_reward
+# Functional-model-specific behavior (F0/F1 model, composite reward) is provided
+# by the design's plugin (design.functional_model()); this core never names one.
 
 # ── Module paths ─────────────────────────────────────────────────────────────
 _OPTIMIZER_DIR = Path(__file__).resolve().parent.parent
 _DEFAULT_SPACE = Path(__file__).resolve().parent / "search_space_funnel.yaml"
 
-# ── Accuracy table from sim_measurements.txt (V13: LANES-dependent at ACC_W<32) ──
-# Rows: (lanes, acc_w) → accuracy fraction from the 2026-06-10 measured sweep.
-# Used for F0 analytic accuracy (no real sim run).
-_ACC_TABLE: dict[tuple[int, int], float] = {
-    # (lanes, acc_w): accuracy
-    (1,  32): 1.0, (1,  24): 1.0,  (1,  16): 47/64,
-    (2,  32): 1.0, (2,  24): 1.0,  (2,  16): 48/64,
-    (4,  32): 1.0, (4,  24): 1.0,  (4,  16): 48/64,
-    (8,  32): 1.0, (8,  24): 1.0,  (8,  16): 48/64,
-    (16, 32): 1.0, (16, 24): 1.0,  (16, 16): 48/64,
-    (32, 32): 1.0, (32, 24): 1.0,  (32, 16): 58/64,
-}
+# Fixed cycle-count normalisation ruler for state dims [5]/[7] (F0/F1 cycles).
+# This is a FIXED ruler of the state encoding preserved for bit-compat with saved
+# LinUCB agents and benchmark tables (it historically equals the TinyVAD SW
+# baseline, but the state spec treats it purely as a constant divisor — generic
+# designs carry cycles=0 and land on the same constant, unchanged).
+_CYCLE_NORM_REF: int = 11_196_638
 
 # abc recipe → index mapping (state dim [3])
 _RECIPE_IDX: dict[str, int] = {"orfs_speed": 0, "orfs_area": 1, "plain": 2}
@@ -152,6 +144,10 @@ _PLATFORM_ORDINAL: dict[str, float] = {
 }
 
 from eda_rl.funnel.state_spec import STATE_DIM as _STATE_DIM  # canonical 22-dim spec
+
+# Sentinel for the lazily-resolved functional-model cache (None is a valid value:
+# it means "generic design, no functional model").
+_UNSET = object()
 
 
 # ── Table helpers ──────────────────────────────────────────────────────────────
@@ -303,26 +299,6 @@ def _validate_funnel(config: dict, sim: dict, proxy: dict,
     return True, ""
 
 
-# ── F0 analytic computations ──────────────────────────────────────────────────
-
-def _f0_cycles(lanes: int) -> float:
-    """Return analytic cycle estimate for F0 (uses measured table when available)."""
-    if lanes in AVG_CYCLES:
-        return float(AVG_CYCLES[lanes])
-    return _behavioral_cycles(lanes)
-
-
-def _f0_accuracy(lanes: int, acc_w: int) -> float:
-    """Return analytic accuracy estimate for F0 from the measured table."""
-    key = (lanes, acc_w)
-    if key in _ACC_TABLE:
-        return _ACC_TABLE[key]
-    # Unknown lane count: use acc_w-only fallback
-    if acc_w >= 24:
-        return 1.0
-    return 47.0 / 64.0   # conservative lower bound
-
-
 # ── State vector construction ─────────────────────────────────────────────────
 
 def _build_state(
@@ -336,7 +312,7 @@ def _build_state(
     incumbent_reward: float | None,
     budget_fraction: float,
     depth: int,                         # 0=F0, 1=F1, 2=F2, 3=F3
-    surrogate_reward_kind: str = "tinyvad",
+    surrogate_reward_kind: str = "generic",
     surrogate_refs: dict | None = None,
     design: Any | None = None,
 ) -> np.ndarray:
@@ -362,7 +338,7 @@ def _build_state(
     clk_range: tuple[float, float] | None = None
     if design is not None:
         try:
-            if not design.is_tinyvad():
+            if not design.has_functional_model():
                 cr = (design.platforms.get(platform) or {}).get("clock_range_ns")
                 if cr and len(cr) == 2 and float(cr[1]) > float(cr[0]):
                     clk_range = (float(cr[0]), float(cr[1]))
@@ -388,13 +364,13 @@ def _build_state(
     d4 = _PLATFORM_ORDINAL.get(platform, 0.0)
 
     # [5..6] F0 analytic
-    d5 = math.log2(SW_BASELINE_CYCLES / max(f0_cycles, 1.0)) / 10.0
+    d5 = math.log2(_CYCLE_NORM_REF / max(f0_cycles, 1.0)) / 10.0
     d6 = float(f0_accuracy)
 
     # [7..8] F1 sim (0 if unrun)
     if f1_obs is not None:
         f1_cyc = float(f1_obs.get("avg_cycles", f0_cycles))
-        d7 = math.log2(SW_BASELINE_CYCLES / max(f1_cyc, 1.0)) / 10.0
+        d7 = math.log2(_CYCLE_NORM_REF / max(f1_cyc, 1.0)) / 10.0
         d8 = float(f1_obs.get("accuracy", 0.0))
     else:
         d7 = 0.0
@@ -455,19 +431,6 @@ def _build_state(
     return vec
 
 
-# ── Fallback design descriptor (when designs.py is not yet importable) ──────────
-
-class _TinymacFallback:
-    """Minimal stand-in for DesignSpec when designs.py is not available.
-    Preserves all pre-V12 FunnelEnv behaviour for tinymac."""
-    name = "tinymac_accel"
-    top = "tinymac_accel"
-    has_macros = False
-
-    def is_tinyvad(self) -> bool:
-        return True
-
-
 # ── Main class ─────────────────────────────────────────────────────────────────
 
 class FunnelEnv:
@@ -490,19 +453,18 @@ class FunnelEnv:
     results_path: where to append per-fidelity JSONL rows.
     seed        : random seed (currently unused; reserved for stochastic proxies).
     lambda_cost : budget-pressure scaling factor λ in the per-step shaping reward.
-    design      : str | DesignSpec | None.
-                 - None (default) → DesignSpec.load("tinymac_accel") — zero
-                   behaviour change for all existing callers and tests.
+    design      : str | DesignSpec (REQUIRED — no silent default).
                  - str → DesignSpec.load(name_or_path).
                  - DesignSpec instance used directly.
-                 Controls which design is run at F1/F2/F3.  When the design's
-                 functional_eval kind is NOT "tinyvad_sim", F1 is skipped:
-                 the "promote" action goes directly from F0 to F2.
-                 The fidelity-depth one-hot [18..21] reuses slot [19] for F1
-                 with value 0.0 when F1 is skipped (never set to 1.0).
-                 F0 analytic cycles/accuracy also only run for tinyvad; for
-                 generic designs F0 = legality/validate_config only (cycles
-                 and accuracy both 0.0 in the state vector).
+                 - None → ValueError on first use (reset()).
+                 Controls which design is run at F1/F2/F3.  When the design
+                 declares no functional model (design.functional_model() is
+                 None), F1 is skipped: the "promote" action goes directly from
+                 F0 to F2.  The fidelity-depth one-hot [18..21] reuses slot [19]
+                 for F1 with value 0.0 when F1 is skipped (never set to 1.0).
+                 F0 analytic cycles/accuracy only run when a functional model is
+                 present; for generic designs F0 = legality/validate_config only
+                 (cycles and accuracy both 0.0 in the state vector).
     max_tier    : int (default 1). Maximum knob tier active for this design.
                  Passed through to KnobRegistry.active() and to the runner.
     """
@@ -543,6 +505,7 @@ class FunnelEnv:
         # Resolve design spec (lazy: load on first use to keep import-time fast)
         self._design_arg = design   # raw arg; resolved in property below
         self.__design_spec: Any = None  # cache
+        self.__fmodel: Any = _UNSET     # functional-model plugin cache (None = generic)
 
         # Load space.  `gates` (search_space_funnel.yaml's `gates:` block,
         # e.g. proxy.max_area_um2) is loaded but not currently enforced
@@ -578,16 +541,18 @@ class FunnelEnv:
 
     @property
     def _design_spec(self) -> Any:
-        """Resolve and cache the DesignSpec (loaded on first access)."""
+        """Resolve and cache the DesignSpec (loaded on first access).
+
+        A design is REQUIRED — there is no silent default.  Pass a design name,
+        a path, or a DesignSpec via the ``design`` constructor arg.
+        """
         if self.__design_spec is None:
             arg = self._design_arg
             if arg is None:
-                # Default: tinymac_accel (zero behaviour change)
-                try:
-                    from eda_rl.common.designs import DesignSpec
-                    self.__design_spec = DesignSpec.load("tinymac_accel")
-                except Exception:   # noqa: BLE001
-                    self.__design_spec = _TinymacFallback()
+                raise ValueError(
+                    "FunnelEnv requires an explicit design (name, path, or "
+                    "DesignSpec); pass design=... to the constructor."
+                )
             elif isinstance(arg, str):
                 from eda_rl.common.designs import DesignSpec
                 self.__design_spec = DesignSpec.load(arg)
@@ -595,12 +560,20 @@ class FunnelEnv:
                 self.__design_spec = arg
         return self.__design_spec
 
+    @property
+    def _fmodel(self):
+        """The design's FunctionalModel plugin, or None (generic PPA design)."""
+        if self.__fmodel is _UNSET:
+            try:
+                self.__fmodel = self._design_spec.functional_model()
+            except Exception:   # noqa: BLE001
+                self.__fmodel = None
+        return self.__fmodel
+
     def _f1_enabled(self) -> bool:
-        """Return True if F1 (behavioral sim) should run for this design."""
-        try:
-            return self._design_spec.is_tinyvad()
-        except Exception:   # noqa: BLE001
-            return True   # safe default: run F1
+        """Return True if the F1 behavioral-sim gate runs for this design."""
+        fm = self._fmodel
+        return fm is not None and fm.enables_f1
 
     # ── Public properties ──────────────────────────────────────────────────────
 
@@ -754,16 +727,15 @@ class FunnelEnv:
     def _run_f0(self) -> None:
         """Run F0: free analytic validation + cycle model + accuracy table.
 
-        For TinyVAD designs: runs the analytic cycle model and accuracy table.
-        For other designs: F0 = legality only (cycles and accuracy both 0.0).
+        Functional-model designs: run the model's analytic cycle + accuracy model.
+        Generic designs: F0 = legality only (cycles and accuracy both 0.0).
         """
         assert self._config is not None
-        if self._f1_enabled():
-            # TinyVAD: use analytic cycle model + accuracy table
-            lanes  = int(self._config.get("mac_lanes", 4))
-            acc_w  = int(self._config.get("accumulator_width", 24))
-            self._f0_cycles   = _f0_cycles(lanes)
-            self._f0_accuracy = _f0_accuracy(lanes, acc_w)
+        fm = self._fmodel
+        if fm is not None:
+            # Functional-model design: use its analytic cycle + accuracy model
+            self._f0_cycles   = fm.f0_cycles(self._config)
+            self._f0_accuracy = fm.f0_accuracy(self._config)
         else:
             # Generic design: F0 = legality only
             self._f0_cycles   = 0.0
@@ -851,15 +823,14 @@ class FunnelEnv:
         return float(reward)
 
     def _run_f1(self) -> tuple[dict, str]:
-        """F1: behavioral Verilator sim (mock-aware via cascade._run_sim).
+        """F1: behavioral sim via the design's functional model.
 
-        Only called for TinyVAD designs (_f1_enabled() is True).  mac_lanes and
-        accumulator_width are always present in TinyVAD configs, but use .get()
-        defensively to avoid KeyError on unusual call paths.
+        Only called when ``_f1_enabled()`` is True, i.e. the design declares a
+        functional model whose ``enables_f1`` is set.  The model owns the sim
+        (mock and real paths); the env only handles table replay and failures.
         """
         assert self._config is not None
-        lanes = int(self._config.get("mac_lanes", 4))
-        acc_w = int(self._config.get("accumulator_width", 24))
+        fm = self._fmodel   # non-None when _f1_enabled() gated us here
 
         if self._table is not None:
             key = _config_key(self._config)
@@ -875,7 +846,7 @@ class FunnelEnv:
             }, "table_miss"
 
         try:
-            sim = _run_sim(lanes, acc_w)
+            sim = fm.run_f1(self._config, mock=bool(os.environ.get("PHYSICAL_MOCK")))
             obs = {
                 "avg_cycles": sim.get("avg_cycles", self._f0_cycles),
                 "accuracy":   sim.get("accuracy",   0.0),
@@ -956,7 +927,7 @@ class FunnelEnv:
             try:
                 kwargs["design"] = self._design_spec
             except Exception:   # noqa: BLE001
-                pass   # design resolution failed; fall back to tinymac behaviour
+                pass   # design resolution failed; the runner uses its own default
         # Forward only the SDC-owned knob subset so the F2 STA sees the same
         # timing constraints the F3 build will (audit F8).  Placement/routing
         # knobs stay out — the proxy can't use them.
@@ -1053,7 +1024,7 @@ class FunnelEnv:
             try:
                 kwargs["design"] = self._design_spec
             except Exception:   # noqa: BLE001
-                pass   # design resolution failed; fall back to tinymac behaviour
+                pass   # design resolution failed; the runner uses its own default
         if "knob_values" in sig.parameters and knob_values:
             kwargs["knob_values"] = knob_values
 
@@ -1163,13 +1134,15 @@ class FunnelEnv:
             # audit F1: score on the fixed-ruler reference-SDC timing metrics so
             # the reward can't be gamed by the sampled IO_DELAY/CLOCK_UNCERTAINTY.
             reward_obs = self._reward_obs_with_ref(obs)
-            if self._f1_enabled():
-                # TinyVAD design: speedup/accuracy/area composite (TinyMAC anchors).
+            fm = self._fmodel
+            if fm is not None:
+                # Functional-model design: its own composite reward (e.g. TinyVAD
+                # speedup/accuracy/area) — the plugin owns the anchors + model.
                 sim_cycles = None
                 if self._f1_obs is not None:
                     sim_cycles = self._f1_obs.get("avg_cycles")
-                scored = compute_physical_reward(reward_obs, self._reward_cfg,
-                                                 cycles=sim_cycles)
+                scored = fm.terminal_reward(reward_obs, self._reward_cfg,
+                                            cycles=sim_cycles)
             else:
                 # Generic design: pure PPA reward with per-design anchors (audit C1).
                 refs, weights = self._generic_reward_cfg(reward_obs)
@@ -1258,8 +1231,9 @@ class FunnelEnv:
 
     def _surrogate_reward_kind(self) -> tuple[str, dict]:
         """Return (reward_kind, refs) for surrogate UCB, matching the F3 reward."""
-        if self._f1_enabled():
-            return "tinyvad", {}
+        fm = self._fmodel
+        if fm is not None:
+            return fm.reward_kind, {}
         return "generic", dict(self._generic_refs.get(self.platform, {}))
 
     def _update_state(self) -> None:
@@ -1306,6 +1280,15 @@ if __name__ == "__main__":
     import sys
     import tempfile
 
+    # The self-test exercises the TinyVAD design explicitly (mac_lanes configs,
+    # F1 behavioral sim) — a design must always be named; there is no default.
+    from eda_rl.common.functional_models.tinyvad import (
+        AVG_CYCLES as _AVG_CYCLES,
+        behavioral_cycles as _behavioral_cycles,
+    )
+    from eda_rl.common.functional_models.tinyvad import TinyVADModel as _TinyVADModel
+    _tv_model = _TinyVADModel()
+
     print("=== FunnelEnv self-test ===")
 
     # ── Helper: make a minimal synthetic table ────────────────────────────────
@@ -1316,8 +1299,8 @@ if __name__ == "__main__":
             acc_w = int(cfg["accumulator_width"])
             clk   = float(cfg["clock_period_ns"])
 
-            cyc = float(AVG_CYCLES.get(lanes, _behavioral_cycles(lanes)))
-            acc = _f0_accuracy(lanes, acc_w)
+            cyc = float(_AVG_CYCLES.get(lanes, _behavioral_cycles(lanes)))
+            acc = _tv_model.f0_accuracy({"mac_lanes": lanes, "accumulator_width": acc_w})
 
             # F0 row
             f0_row = {"ts": 0.0, "config": cfg, "fidelity": "F0",
@@ -1381,7 +1364,7 @@ if __name__ == "__main__":
         print(f"  Table keys: {len(table)} configs, fidelities per key: "
               f"{[sorted(v.keys()) for v in table.values()]}")
 
-        env = FunnelEnv(space_yaml=SPACE, table=table,
+        env = FunnelEnv(space_yaml=SPACE, table=table, design="tinymac_accel",
                         results_path=rpath, budget_s=3600.0)
 
         # A1: kill at F0
@@ -1451,7 +1434,7 @@ if __name__ == "__main__":
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             rpath = Path(tmpdir) / "results_live.jsonl"
-            env = FunnelEnv(space_yaml=SPACE, table=None,
+            env = FunnelEnv(space_yaml=SPACE, table=None, design="tinymac_accel",
                             results_path=rpath, budget_s=3600.0)
             cfg = {"mac_lanes": 4, "accumulator_width": 24,
                    "clock_period_ns": 5.0, "abc_recipe": "plain"}
@@ -1475,6 +1458,17 @@ if __name__ == "__main__":
             print(f"  B live mode PASS  (total_r={total_r:.4f})")
     finally:
         del os.environ["PHYSICAL_MOCK"]
+
+    # ── TEST C: no design is an explicit error (no silent tinymac default) ─────
+    print("\n--- TEST C: missing design raises ValueError ---")
+    env_nodesign = FunnelEnv(space_yaml=SPACE, budget_s=3600.0)  # design=None
+    try:
+        env_nodesign.reset({"mac_lanes": 4, "accumulator_width": 24,
+                            "clock_period_ns": 5.0, "abc_recipe": "plain"})
+        raise AssertionError("C: expected ValueError for missing design")
+    except ValueError as e:
+        assert "design" in str(e).lower()
+        print(f"  C missing design → ValueError PASS")
 
     print("\n=== All self-tests PASSED ===")
     sys.exit(0)

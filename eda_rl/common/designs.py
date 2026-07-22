@@ -393,10 +393,19 @@ class DesignSpec:
                 parts += [rtl_name, str(config[param_name])]
         return " ".join(parts)
 
-    def is_tinyvad(self) -> bool:
-        """Return True if this design uses the TinyVAD functional evaluator."""
-        fe = self.functional_eval or {}
-        return fe.get("kind") == "tinyvad_sim"
+    def functional_model(self):
+        """Return the FunctionalModel this design opts into, or None.
+
+        A design opts in via ``functional_eval.kind`` in its YAML; the registry
+        (``common.functional_models``) maps that kind to a plugin.  ``None`` means
+        a generic design — pure-PPA reward, F1 skipped, default report rendering.
+        """
+        from eda_rl.common import functional_models
+        return functional_models.for_design(self)
+
+    def has_functional_model(self) -> bool:
+        """True if this design declares a registered functional model."""
+        return self.functional_model() is not None
 
     def __repr__(self) -> str:
         return (
@@ -482,7 +491,8 @@ if __name__ == "__main__":
         assert "nangate45" in tm.platforms
         assert "asap7" in tm.platforms
         assert tm.has_macros is False
-        assert tm.is_tinyvad()
+        assert tm.has_functional_model()
+        assert tm.functional_model().kind == "tinyvad_sim"
         print(f"  tinymac_accel: {len(tm.rtl_files)} RTL files, "
               f"params={list(tm.params.keys())}, has_macros={tm.has_macros}  PASS")
     except FileNotFoundError as e:
@@ -497,7 +507,7 @@ if __name__ == "__main__":
         assert len(gcd.rtl_files) >= 1
         assert gcd.params == {} or gcd.params is not None
         # gcd has no functional eval (generic design)
-        assert not gcd.is_tinyvad()
+        assert not gcd.has_functional_model()
         print(f"  gcd: {len(gcd.rtl_files)} RTL files, has_macros={gcd.has_macros}  PASS")
     except FileNotFoundError as e:
         print(f"  SKIP gcd load (YAML not yet written): {e}")

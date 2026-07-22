@@ -42,7 +42,9 @@ platforms:
     clock_range_ns: [0.7, 2.0]
     default_clock_ns: 1.0
   asap7:
-    clock_range_ns: [0.3, 1.0]
+    # Pinned to the ORFS asap7/aes autotuner.json _SDC_CLK_PERIOD [300,600] ps
+    # = [0.3,0.6] ns for head-to-head parity (PLATFORM_TIME_UNIT converts ns→ps).
+    clock_range_ns: [0.3, 0.6]
     default_clock_ns: 0.4
 # has_macros: false — aes is a pure std-cell design (no SRAM/macro instances).
 has_macros: false
@@ -52,3 +54,29 @@ has_macros: false
 # F0 is legality/validate_config only; F1 is skipped (functional_eval.kind != tinyvad_sim).
 functional_eval:
   kind: none
+
+# ── Head-to-head knob parity with ORFS AutoTuner (uncommitted experiment) ──
+# Mirrors flow/designs/asap7/aes/autotuner.json: the same 9 knobs over the same
+# ranges. Note aes's json has NO CORE_MARGIN but DOES tune CORE_UTILIZATION +
+# CORE_ASPECT_RATIO. Run eda-rl with --max-tier 3. AutoTuner's json allows
+# CORE_UTILIZATION 0; eda-rl uses [1,5] (0 is a degenerate/failing util for both).
+knobs:
+  exclude:
+    - abc_recipe
+    - CORE_MARGIN
+    - PLACE_DENSITY
+    - DETAILED_ROUTE_END_ITERATION
+    - MAX_PLACE_STEP_COEF
+    - MIN_PLACE_STEP_COEF
+    - RECOVER_POWER
+    - SETUP_SLACK_MARGIN
+    - TNS_END_PERCENT
+  override:                    # ranges copied from asap7/aes autotuner.json
+    CORE_UTILIZATION:                   { range: [1, 5],     default: 3 }
+    CORE_ASPECT_RATIO:                  { range: [0.9, 1.1], default: 1.0 }
+    CELL_PAD_IN_SITES_GLOBAL_PLACEMENT: { range: [0, 3],     default: 2 }
+    CELL_PAD_IN_SITES_DETAIL_PLACEMENT: { range: [0, 3],     default: 1 }
+    ROUTING_LAYER_ADJUSTMENT:           { range: [0.0, 0.1], default: 0.05 }  # = _FR_LAYER_ADJUST
+    PLACE_DENSITY_LB_ADDON:             { range: [0.0, 0.2], default: 0.1 }
+    CTS_CLUSTER_SIZE:                   { range: [10, 200],  default: 30 }
+    CTS_CLUSTER_DIAMETER:               { range: [20, 400],  default: 100 }
