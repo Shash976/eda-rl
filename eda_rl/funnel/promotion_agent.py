@@ -82,6 +82,9 @@ from eda_rl.funnel.state_spec import (  # noqa: E402,F401
 
 # ── LinUCB contextual bandit ──────────────────────────────────────────────────
 
+_N_DEPTHS = 4   # F0, F1, F2, F3 — see IDX_DEPTH_F0..F3 in state_spec.py
+
+
 class PromotionAgent:
     """LinUCB contextual bandit over the 4 funnel actions.
 
@@ -94,6 +97,46 @@ class PromotionAgent:
         A_a <- A_a + s s^T
         b_a <- b_a + r * s
 
+    Depth-conditioned arms (fixes Audit M6): each base action gets one linear
+    model PER DEPTH (F0/F1/F2/F3), keyed off the state's depth one-hot
+    (IDX_DEPTH_F0..F3). Without this, a single "promote" arm absorbed both the
+    tiny per-step shaping reward at F0->F1/F1->F2 AND the rare, huge-magnitude
+    F2->F3 terminal payoff — a real campaign (likith/asap7, 2026-07-10) showed
+    this collapse in practice: two early F2->F3 promotions that hit genuine
+    reference-SDC timing violations (reward ~-3.4) permanently zeroed the
+    "promote" arm's F2-depth estimate for the remaining 7884 episodes of an
+    8-hour budget (F2->F3 rate: 0.56% -> a hard 0.00%, never recovering),
+    while the same arm's F0-depth behaviour (rich, frequent, small-reward
+    data) stayed unaffected. Depth-conditioning gives F2->F3 its own linear
+    model so a couple of unlucky terminal outcomes can't poison F0->F2
+    shaping decisions or vice versa — each depth transition now has to earn
+    its own bad reputation from its own (still small) sample of outcomes.
+
+    Reward clipping (also Audit M6): terminal rewards span roughly
+    [-100, +4] (full/parse failures vs a good PPA score) while per-step
+    shaping rewards are O(1e-4). Feeding raw magnitudes into a ridge-
+    regularised linear model means a single outlier sample can dominate
+    theta for an arm that has seen only a handful of updates. Clipping the
+    reward fed to `update()` to [-reward_clip, +reward_clip] bounds any one
+    sample's influence while preserving its sign and rank among "bad"
+    outcomes.
+
+    Epsilon-greedy exploration floor (found necessary, not just theorised,
+    by stress-testing depth-conditioning against likith's actual reward
+    regime before shipping this): a combinational design's F2 proxy WNS
+    feature is pinned at exactly 0.0 (the real timing-margin signal only
+    exists after F3 runs), so the F2-depth "promote" arm sees a near-
+    identical context on every decision. Pure LinUCB is *rationally*
+    correct to converge fast there — under a stress test mirroring
+    likith's ~95%-catastrophic F2->F3 outcome rate, depth-conditioning
+    alone still locked to permanent "always kill" after just 1-3 samples,
+    and raising alpha only delayed that by a few samples, it didn't fix
+    the structural collapse. With probability `epsilon`, `act()` ignores
+    the UCB argmax and returns a uniformly random action instead,
+    guaranteeing the bandit keeps periodically re-checking every
+    (action, depth) arm for the whole campaign budget instead of
+    permanently writing one off from a handful of early unlucky draws.
+
     Parameters
     ----------
     dim   : context dimension (must match state vector; default 22)
@@ -102,6 +145,12 @@ class PromotionAgent:
     actions : tuple of action strings; must be a superset of the FunnelEnv actions
     lam   : ridge regularisation for initial A (A_a = lam * I); prevents
             singular A before observations arrive; default 1.0
+    depth_conditioned : maintain one linear model per (action, depth) pair
+            instead of one per action (default True; see class docstring).
+    reward_clip : clip |reward| fed to update() to this bound before the A/b
+            update (default 5.0; None disables clipping).
+    epsilon : probability of overriding the UCB argmax with a uniformly
+            random action in act() (default 0.03; 0.0 disables the floor).
     """
 
     def __init__(
@@ -111,43 +160,84 @@ class PromotionAgent:
         seed: int = 0,
         actions: _ActionTuple = _DEFAULT_ACTIONS,
         lam: float = 1.0,
+        depth_conditioned: bool = True,
+        reward_clip: float | None = 5.0,
+        epsilon: float = 0.03,
     ) -> None:
         self.dim = dim
         self.alpha = float(alpha)
         self.actions = tuple(actions)
         self.lam = float(lam)
+        self.depth_conditioned = bool(depth_conditioned)
+        self.reward_clip = float(reward_clip) if reward_clip is not None else None
+        self.epsilon = float(epsilon)
         self._rng = np.random.default_rng(seed)
         self._py_rng = random.Random(seed)
 
         n_actions = len(self.actions)
+        self._n_depths = _N_DEPTHS if self.depth_conditioned else 1
+        n_arms = n_actions * self._n_depths
         # Per-arm precision matrix A_a (dim × dim) and reward vector b_a (dim,)
-        # A_a starts as lam * I; b_a starts at zero.
-        self._A: list[np.ndarray] = [np.eye(dim) * lam for _ in range(n_actions)]
-        self._b: list[np.ndarray] = [np.zeros(dim) for _ in range(n_actions)]
+        # A_a starts as lam * I; b_a starts at zero. Arm index = depth * n_actions
+        # + action_idx when depth-conditioned, else just action_idx.
+        self._A: list[np.ndarray] = [np.eye(dim) * lam for _ in range(n_arms)]
+        self._b: list[np.ndarray] = [np.zeros(dim) for _ in range(n_arms)]
         # Cached inverse (invalidated on update)
-        self._A_inv: list[np.ndarray | None] = [None] * n_actions
+        self._A_inv: list[np.ndarray | None] = [None] * n_arms
         # Track update counts for logging
-        self._n_updates: list[int] = [0] * n_actions
+        self._n_updates: list[int] = [0] * n_arms
 
     # ── core interface ─────────────────────────────────────────────────────────
 
-    def act(self, state: np.ndarray) -> str:
-        """Select an action given the 22-dim state vector.
+    def _depth_of(self, s: np.ndarray) -> int:
+        """Read the current depth (0=F0..3=F3) off the state's one-hot slots.
 
-        Returns the action string with the highest UCB score, breaking ties
-        randomly (seeded) to ensure reproducibility.
+        Returns 0 (F0) if no depth bit is set (shouldn't happen in practice —
+        FunnelEnv always sets exactly one — but stay defensive rather than
+        index out of range).
         """
+        if not self.depth_conditioned:
+            return 0
+        depth_idxs = (IDX_DEPTH_F0, IDX_DEPTH_F1, IDX_DEPTH_F2, IDX_DEPTH_F3)
+        for depth, idx in enumerate(depth_idxs):
+            if idx < len(s) and s[idx] > 0.5:
+                return depth
+        return 0
+
+    def _arm(self, action_idx: int, depth: int) -> int:
+        return depth * len(self.actions) + action_idx if self.depth_conditioned else action_idx
+
+    def _to_state_vec(self, state: np.ndarray) -> np.ndarray:
         s = np.asarray(state, dtype=float).reshape(-1)
         if len(s) < self.dim:
             # Pad with zeros if state is shorter than expected (defensive)
             s = np.pad(s, (0, self.dim - len(s)))
         elif len(s) > self.dim:
             s = s[: self.dim]
+        return s
+
+    def act(self, state: np.ndarray) -> str:
+        """Select an action given the 22-dim state vector.
+
+        Returns the action string with the highest UCB score, breaking ties
+        randomly (seeded) to ensure reproducibility. With probability
+        `epsilon`, overrides the UCB argmax with a uniformly random action
+        (forced-exploration floor — see class docstring: pure LinUCB can
+        rationally converge to permanently avoiding an arm within a handful
+        of samples when its context is near-featureless, e.g. a
+        combinational design's always-zero F2 proxy WNS).
+        """
+        if self.epsilon > 0.0 and self._py_rng.random() < self.epsilon:
+            return self._py_rng.choice(self.actions)
+
+        s = self._to_state_vec(state)
+        depth = self._depth_of(s)
 
         ucb_scores = []
         for i, action in enumerate(self.actions):
-            A_inv = self._get_A_inv(i)
-            theta = A_inv @ self._b[i]
+            arm = self._arm(i, depth)
+            A_inv = self._get_A_inv(arm)
+            theta = A_inv @ self._b[arm]
             # UCB bonus: alpha * sqrt(s^T A_inv s)
             val = s @ A_inv @ s
             bonus = self.alpha * np.sqrt(max(float(val), 0.0))
@@ -162,43 +252,62 @@ class PromotionAgent:
     def update(self, state: np.ndarray, action: str, reward: float) -> None:
         """Update the chosen arm's linear model with (state, reward).
 
-        Only the arm corresponding to `action` is updated (disjoint LinUCB).
-        Invalid action strings are silently ignored (defensive).
+        Only the arm corresponding to `(action, depth)` is updated (disjoint
+        LinUCB; depth read off the state one-hot, see `_depth_of`). Invalid
+        action strings are silently ignored (defensive). `reward` is clipped
+        to `[-reward_clip, +reward_clip]` before the A/b update.
 
-        Audit M6 (experiment, not a fix): the "promote" arm absorbs both the big
-        terminal F3 payoff (at depth F2→F3) and tiny per-step shaping (at F0→F1,
-        F1→F2), and rewards span ~[-100, +4] unscaled.  If the benchmark shows the
-        bandit's myopia/mixed-regime estimate loses to fixed gates, try
-        depth-conditioned arms or reward normalisation here — but measure first.
+        Audit M6 (now fixed, not just an experiment): the "promote" arm used
+        to absorb both the big terminal F3 payoff (at depth F2→F3) and tiny
+        per-step shaping (at F0→F1, F1→F2), with rewards spanning ~[-100, +4]
+        unscaled. A real campaign (likith/asap7, 2026-07-10) showed the
+        predicted failure mode in practice: two early F2→F3 promotions that
+        hit genuine reference-SDC timing violations (reward ~-3.4) permanently
+        zeroed the shared "promote" arm's F2-depth estimate for the remaining
+        7884 episodes of an 8-hour budget. `depth_conditioned` arms (see
+        `_arm`) and `reward_clip` are the fix: F2→F3 now has its own linear
+        model, and no single terminal outcome can dominate it unboundedly.
         """
         if action not in self.actions:
             return
-        idx = self.actions.index(action)
-        s = np.asarray(state, dtype=float).reshape(-1)
-        if len(s) < self.dim:
-            s = np.pad(s, (0, self.dim - len(s)))
-        elif len(s) > self.dim:
-            s = s[: self.dim]
+        action_idx = self.actions.index(action)
+        s = self._to_state_vec(state)
+        depth = self._depth_of(s)
+        arm = self._arm(action_idx, depth)
 
-        self._A[idx] += np.outer(s, s)
-        self._b[idx] += float(reward) * s
-        self._A_inv[idx] = None   # invalidate cached inverse
-        self._n_updates[idx] += 1
+        r = float(reward)
+        if self.reward_clip is not None:
+            r = max(-self.reward_clip, min(self.reward_clip, r))
+
+        self._A[arm] += np.outer(s, s)
+        self._b[arm] += r * s
+        self._A_inv[arm] = None   # invalidate cached inverse
+        self._n_updates[arm] += 1
 
     # ── persistence ───────────────────────────────────────────────────────────
+
+    def _arm_key(self, action: str, depth: int) -> str:
+        key = action.replace("-", "_")   # "re-proxy" → "re_proxy"
+        return f"{key}_d{depth}" if self.depth_conditioned else key
 
     def save(self, path: str | Path) -> None:
         """Save agent parameters to a .npz file."""
         path = Path(path)
         arrays: dict[str, np.ndarray] = {}
-        for i, action in enumerate(self.actions):
-            key = action.replace("-", "_")   # "re-proxy" → "re_proxy"
-            arrays[f"A_{key}"] = self._A[i]
-            arrays[f"b_{key}"] = self._b[i]
+        for depth in range(self._n_depths):
+            for i, action in enumerate(self.actions):
+                key = self._arm_key(action, depth)
+                arm = self._arm(i, depth)
+                arrays[f"A_{key}"] = self._A[arm]
+                arrays[f"b_{key}"] = self._b[arm]
         # Metadata as 0-d arrays
         arrays["dim"] = np.array(self.dim)
         arrays["alpha"] = np.array(self.alpha)
         arrays["lam"] = np.array(self.lam)
+        arrays["depth_conditioned"] = np.array(self.depth_conditioned)
+        arrays["reward_clip"] = np.array(
+            self.reward_clip if self.reward_clip is not None else np.nan)
+        arrays["epsilon"] = np.array(self.epsilon)
         arrays["n_updates"] = np.array(self._n_updates)
         # Persist the action tuple itself — without this, load() always
         # reconstructs with _DEFAULT_ACTIONS regardless of what actions this
@@ -214,16 +323,31 @@ class PromotionAgent:
         dim = int(data["dim"])
         alpha = float(data["alpha"])
         lam = float(data["lam"])
+        # Older .npz files saved before depth-conditioning have no
+        # "depth_conditioned"/"reward_clip" keys — fall back to the pre-fix
+        # behaviour (single arm per action, no clipping) so old artifacts
+        # still load, rather than silently mis-keying A_*/b_* lookups.
+        depth_conditioned = bool(data["depth_conditioned"]) if "depth_conditioned" in data else False
+        if "reward_clip" in data:
+            rc = float(data["reward_clip"])
+            reward_clip = None if np.isnan(rc) else rc
+        else:
+            reward_clip = None
+        epsilon = float(data["epsilon"]) if "epsilon" in data else 0.0
         # Older .npz files saved before this fix have no "actions" key —
         # fall back to the default tuple for those (matches their save()-time
         # behaviour, since only the default tuple was ever used pre-fix).
         actions = tuple(data["actions"].tolist()) if "actions" in data else _DEFAULT_ACTIONS
-        agent = cls(dim=dim, alpha=alpha, seed=seed, actions=actions, lam=lam)
-        for i, action in enumerate(agent.actions):
-            key = action.replace("-", "_")
-            agent._A[i] = data[f"A_{key}"]
-            agent._b[i] = data[f"b_{key}"]
-            agent._A_inv[i] = None
+        agent = cls(dim=dim, alpha=alpha, seed=seed, actions=actions, lam=lam,
+                    depth_conditioned=depth_conditioned, reward_clip=reward_clip,
+                    epsilon=epsilon)
+        for depth in range(agent._n_depths):
+            for i, action in enumerate(agent.actions):
+                key = agent._arm_key(action, depth)
+                arm = agent._arm(i, depth)
+                agent._A[arm] = data[f"A_{key}"]
+                agent._b[arm] = data[f"b_{key}"]
+                agent._A_inv[arm] = None
         if "n_updates" in data:
             agent._n_updates = list(data["n_updates"].astype(int))
         return agent
@@ -240,9 +364,18 @@ class PromotionAgent:
         return self._A_inv[idx]
 
     def __repr__(self) -> str:
-        updates = dict(zip(self.actions, self._n_updates))
+        if self.depth_conditioned:
+            updates = {
+                f"{action}@F{depth}": self._n_updates[self._arm(i, depth)]
+                for depth in range(self._n_depths)
+                for i, action in enumerate(self.actions)
+            }
+        else:
+            updates = dict(zip(self.actions, self._n_updates))
         return (f"PromotionAgent(dim={self.dim}, alpha={self.alpha}, "
-                f"lam={self.lam}, updates={updates})")
+                f"lam={self.lam}, depth_conditioned={self.depth_conditioned}, "
+                f"reward_clip={self.reward_clip}, epsilon={self.epsilon}, "
+                f"updates={updates})")
 
 
 # ── FixedGateAgent ────────────────────────────────────────────────────────────
@@ -469,11 +602,128 @@ def _selftest() -> None:
         agent.save(p)
         agent2 = PromotionAgent.load(p)
         assert agent2.dim == dim
+        assert agent2.depth_conditioned == agent.depth_conditioned
+        assert agent2.reward_clip == agent.reward_clip
+        assert agent2.epsilon == agent.epsilon
         s_test = rng.standard_normal(dim)
-        # after load, the same state must produce the same action
+        # After load, the same state + same RNG state must produce the same
+        # action. Re-seed both agents' tie-break/epsilon RNGs identically
+        # first — `agent` has already consumed draws from its 50-iteration
+        # training loop above (including epsilon-floor draws), while `agent2`
+        # starts fresh from load(), so comparing without re-seeding would
+        # spuriously fail on nothing but RNG-position drift, not a real
+        # save/load bug.
+        agent._py_rng = random.Random(123)
+        agent2._py_rng = random.Random(123)
         a1 = agent.act(s_test)
         a2 = agent2.act(s_test)
         assert a1 == a2, f"save/load mismatch: {a1!r} vs {a2!r}"
+
+    # ── Regression: depth-conditioned arms isolate F2->F3 catastrophes ────────
+    # Reproduces the likith/asap7 2026-07-10 campaign collapse: 2 catastrophic
+    # F2->F3 terminal rewards (~-3.4, real reference-SDC timing violations)
+    # permanently zeroed the shared "promote" arm and killed F2->F3 promotion
+    # for the remaining 7884 episodes of an 8-hour budget, while F0->F2
+    # promotion (same shared arm, pre-fix) was untouched only by luck of
+    # feature separation. Assert the fix makes that isolation exact, not lucky.
+    dc_agent = PromotionAgent(dim=dim, alpha=1.0, seed=1)  # depth_conditioned=True default
+    action_idx_promote = dc_agent.actions.index("promote")
+    arm_f0_promote = dc_agent._arm(action_idx_promote, 0)
+    arm_f2_promote = dc_agent._arm(action_idx_promote, 2)
+    assert arm_f0_promote != arm_f2_promote, "F0/F2 promote must be distinct arms"
+
+    b_f0_before = dc_agent._b[arm_f0_promote].copy()
+    A_f0_before = dc_agent._A[arm_f0_promote].copy()
+
+    s_f2 = rng.standard_normal(dim).astype(float)
+    s_f2[IDX_DEPTH_F0] = s_f2[IDX_DEPTH_F1] = s_f2[IDX_DEPTH_F3] = 0.0
+    s_f2[IDX_DEPTH_F2] = 1.0
+    for catastrophic_reward in (-3.4, -3.49, -3.4, -3.49, -3.4):
+        dc_agent.update(s_f2, "promote", catastrophic_reward)
+
+    # F2's promote arm must have absorbed the damage...
+    assert dc_agent._n_updates[arm_f2_promote] == 5
+    assert not np.allclose(dc_agent._b[arm_f2_promote], 0.0), \
+        "F2 promote arm should have been updated by the catastrophic rewards"
+    # ...while F0's promote arm is untouched byte-for-byte (real isolation,
+    # not just "small effect" — these are disjoint parameter arrays).
+    assert np.array_equal(dc_agent._b[arm_f0_promote], b_f0_before), \
+        "F0 promote arm must be exactly unaffected by F2 promote updates"
+    assert np.array_equal(dc_agent._A[arm_f0_promote], A_f0_before), \
+        "F0 promote arm's A matrix must be exactly unaffected by F2 promote updates"
+    assert dc_agent._n_updates[arm_f0_promote] == 0
+
+    # ── Regression: reward clipping bounds a single outlier's influence ───────
+    clip_agent = PromotionAgent(dim=dim, alpha=1.0, seed=2, reward_clip=5.0)
+    s_clip = rng.standard_normal(dim).astype(float)
+    arm0 = clip_agent._arm(clip_agent.actions.index("kill"), 0)
+    clip_agent.update(s_clip, "kill", 1000.0)   # full-fail-scale outlier
+    assert np.allclose(clip_agent._b[arm0], 5.0 * s_clip), \
+        "reward_clip=5.0 must clip a +1000 reward to +5.0 before the b-update"
+    clip_agent2 = PromotionAgent(dim=dim, alpha=1.0, seed=2, reward_clip=None)
+    arm0b = clip_agent2._arm(clip_agent2.actions.index("kill"), 0)
+    clip_agent2.update(s_clip, "kill", 1000.0)
+    assert np.allclose(clip_agent2._b[arm0b], 1000.0 * s_clip), \
+        "reward_clip=None must disable clipping"
+
+    # ── Regression: epsilon floor prevents permanent collapse under a
+    # likith-like near-featureless, ~95%-catastrophic F2->F3 reward regime.
+    # Depth-conditioning + clipping alone were verified (above) to isolate
+    # the damage, but a stress test before shipping showed pure LinUCB still
+    # rationally locks the isolated F2 arm to "always kill" after 1-3 samples
+    # when every F2-depth decision sees the same near-identical context
+    # (true for combinational designs: the F2 proxy WNS feature is pinned at
+    # 0.0, so the real timing-margin signal doesn't exist until F3 runs).
+    # epsilon>0 must keep a nonzero long-run promotion rate regardless.
+    def _run_likith_like(epsilon: float, seed: int, n_episodes: int = 800) -> float:
+        a = PromotionAgent(dim=dim, alpha=1.0, seed=seed, epsilon=epsilon)
+        er = np.random.default_rng(seed + 500)
+        s_f2 = np.zeros(dim, dtype=float)
+        s_f2[IDX_DEPTH_F2] = 1.0
+        promotes_2nd_half = []
+        for ep in range(n_episodes):
+            act_choice = a.act(s_f2)
+            if act_choice == "promote":
+                r = er.normal(-3.4, 0.05) if er.random() < 0.95 else er.normal(1.0, 0.2)
+            else:
+                r = 0.0
+            a.update(s_f2, act_choice, r)
+            if ep >= n_episodes // 2:
+                promotes_2nd_half.append(1 if act_choice == "promote" else 0)
+        return float(np.mean(promotes_2nd_half))
+
+    no_floor_rate = _run_likith_like(epsilon=0.0, seed=7)
+    with_floor_rate = _run_likith_like(epsilon=0.03, seed=7)
+    assert no_floor_rate == 0.0, \
+        (f"expected epsilon=0.0 to reproduce the collapse (0% 2nd-half "
+         f"promote rate) under the likith-like stress regime, got {no_floor_rate}")
+    assert with_floor_rate > 0.0, \
+        (f"epsilon=0.03 must keep a nonzero F2->F3 promote rate under the "
+         f"same stress regime that collapses without it, got {with_floor_rate}")
+
+    # epsilon=0 must never override the UCB argmax: once one arm is trained to
+    # a clear, unambiguous winner (no tie), repeated act() calls on the same
+    # state must all return it. (An *untrained* agent's arms all start tied
+    # at theta=0 with identical A_inv, so ties — and their random
+    # tie-break — are expected there; that's unrelated to epsilon.)
+    det_agent = PromotionAgent(dim=dim, alpha=0.01, seed=0, epsilon=0.0)
+    s_det = np.zeros(dim, dtype=float); s_det[IDX_DEPTH_F0] = 1.0
+    for _ in range(10):
+        det_agent.update(s_det, "promote", 10.0)   # make "promote" the clear winner
+    votes = {det_agent.act(s_det) for _ in range(30)}
+    assert votes == {"promote"}, \
+        f"epsilon=0.0 with an unambiguous winner must always return it, got {votes}"
+
+    # ── Legacy (non-depth-conditioned) mode still selectable and functional ──
+    legacy_agent = PromotionAgent(dim=dim, alpha=1.0, seed=3,
+                                   depth_conditioned=False, reward_clip=None)
+    assert len(legacy_agent._A) == len(legacy_agent.actions), \
+        "legacy mode should have exactly one arm per action, no depth split"
+    for _ in range(20):
+        s = rng.standard_normal(dim)
+        a = legacy_agent.act(s)
+        assert a in actions
+        legacy_agent.update(s, a, rng.standard_normal())
 
     # FixedGateAgent — one state per depth level
     # Default threshold is -0.5 (normalised, matching FunnelEnv state[10]=wns_ns/5)

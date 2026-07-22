@@ -54,9 +54,14 @@ from typing import Any
 import numpy as np
 
 # ── CandidateGenerator (optional — absent before candidates.py lands) ─────────
+# This benchmark exercises the TinyVAD reward landscape, so it imports that
+# plugin's search space explicitly (a named dependency, not a core default).
 _CAND_AVAILABLE = False
 try:
-    from eda_rl.funnel.candidates import CandidateGenerator, _fallback_space
+    from eda_rl.funnel.candidates import CandidateGenerator
+    from eda_rl.common.functional_models.tinyvad import (
+        tinyvad_search_space as _fallback_space,
+    )
     _CAND_AVAILABLE = True
 except Exception:
     CandidateGenerator = None   # type: ignore[assignment,misc]
@@ -176,7 +181,11 @@ def _make_synthetic_table(n: int = 200, seed: int = 42) -> dict:
     # Dedup
     all_configs = list(dict.fromkeys(all_configs))[:n]
 
-    from eda_rl.common.constants import AVG_CYCLES, SW_BASELINE_CYCLES, behavioral_cycles
+    # Benchmark of the TinyVAD reward landscape → its cycle model, imported
+    # explicitly from the plugin (a named dependency, not a core default).
+    from eda_rl.common.functional_models.tinyvad import (
+        AVG_CYCLES, SW_BASELINE_CYCLES, behavioral_cycles,
+    )
     table: dict[str, dict[str, dict]] = {}
     for (lanes, acc_w, clk, recipe) in all_configs:
         true_r = _true_reward(lanes, acc_w, clk, recipe)
@@ -327,6 +336,7 @@ def _run_campaign(
             budget_s=budget_s,
             results_path=Path(tmpdir) / f"campaign_{seed}.jsonl",
             seed=seed,
+            design="tinymac_accel",   # synthetic TinyVAD reward landscape
         )
         # Seed the incumbent from caller-provided best (for state slot [16])
         # We can't set env._incumbent directly so we pass None; the env starts fresh
@@ -551,6 +561,7 @@ def run_benchmark(
             table=table,
             budget_s=float("inf"),
             results_path=Path(_tmpdir) / "scan.jsonl",
+            design="tinymac_accel",   # synthetic TinyVAD reward landscape
         )
         for _cfg in grid_configs:
             if "F3" not in (table.get(_ck(_cfg)) or {}):

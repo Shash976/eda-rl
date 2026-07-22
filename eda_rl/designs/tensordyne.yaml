@@ -1,0 +1,55 @@
+# designs/tensordyne.yaml — "Napier Chip" design from
+# Downloads/checkdesigns/tensordyne.
+#
+# NOT vendored — rtl_files are absolute paths into a local Downloads checkout,
+# machine-specific and not portable. Point EDA_RL_DESIGN_ROOT elsewhere or
+# edit these paths if the bundle moves.
+#
+# IMPORTANT — verified by reading the RTL, not just the README:
+#   - This bundle is the origin of the file names littering
+#     designs/tpu.yaml's sibling Makefile (napier_sim.cpp, systolic_array.v,
+#     riscv_decoder.v, etc. all really exist here). But napier_chip.v itself
+#     only instantiates compute_core — systolic_array.v, riscv_decoder.v,
+#     log_mac_unit.v, all_reduce_unit.v, and processing_element.v are ALL dead
+#     code w.r.t. the actual top-level hierarchy despite the README's "8-core
+#     compute cluster + RISC-V decoder + log-MAC PEs" claims. Deliberately
+#     excluded from rtl_files below; wire them into napier_chip.v first if you
+#     want to optimize the real thing.
+#   - compute_core.v declares an internal `parameter LATENCY = 8;` (not a
+#     module-parameter port), and napier_chip.v does not expose or override
+#     it — so it is NOT sweepable via VERILOG_TOP_PARAMS without editing the
+#     RTL to promote it to a real parameter port and thread it through.
+#   - sim/napier_sim.cpp has no golden-model/scoreboard check (same shape as
+#     TPU's testbench: fixed 1000-cycle loop, periodic writes, no comparison
+#     to an expected result) — hence functional_eval: none below.
+#   - obj_dir/ in this bundle is stale checked-in Verilator build output; not
+#     referenced here and not needed.
+
+name: tensordyne
+top:  napier_chip
+
+rtl_files:
+  - /home/shashwat/Downloads/checkdesigns/checkdesigns/tensordyne/rtl/napier_chip.v
+  - /home/shashwat/Downloads/checkdesigns/checkdesigns/tensordyne/rtl/compute_core.v
+
+clock_port: clk
+
+# No sweepable RTL chparam axes — see LATENCY note above.
+params: {}
+
+# UNVERIFIED — no ORFS reference SDC ships with this design. napier_chip
+# reduces to compute_core (an 8-cycle accumulator), comparably tiny to gcd;
+# this is a rough starting guess. Run
+# `eda-rl doctor --design tensordyne --platform nangate45 --probe-f3` and narrow it.
+platforms:
+  nangate45:
+    clock_range_ns: [0.5, 3.0]
+    default_clock_ns: 1.5
+
+# has_macros: false — no SRAM/macro instances in the instantiated hierarchy.
+has_macros: false
+
+# functional_eval: none — see note above; napier_sim.cpp has no correctness
+# check to build an F1 plugin against. F0 is legality/validate_config only.
+functional_eval:
+  kind: none

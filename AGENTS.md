@@ -41,8 +41,10 @@ Worked example designs (`eda_rl/designs/`):
 
 The superseded first-generation system lives in **repo-root `legacy/`** —
 outside the installed package, imported by nothing, frozen verbatim (see
-`legacy/README.md`). Its one live piece, the TinyVAD Verilator driver, was
-rescued to `common/verilator_sim.py`. Do not spend time under `legacy/`.
+`legacy/README.md`). Its one live piece, the TinyVAD Verilator driver, now
+lives in the TinyVAD plugin at
+`common/functional_models/tinyvad_verilator.py`. Do not spend time under
+`legacy/`.
 
 ## Operating it
 
@@ -57,14 +59,17 @@ eda-rl doctor --design likith --platform asap7 --probe-f3 # + real build, finds 
 eda-rl optimize --design gcd --platform nangate45 --budget-hours 4 \
        --sampler tpe|surrogate_ucb|random --promotion fixed|linucb|random \
        --max-tier N       # N must cover the design's declared knobs — doctor prints the minimum
-eda-rl report  --campaign latest --open        # static HTML (Pareto, funnel, importances…)
-eda-rl collect --campaign latest --render      # best GDS + before/after page
+eda-rl report    --design gcd --platform nangate45 --campaign latest --open  # static HTML (Pareto, funnel, importances…)
+eda-rl collect   --design gcd --platform nangate45 --campaign latest --render # best GDS + before/after page
+eda-rl dashboard --design gcd --platform nangate45 --campaign latest --port 8080  # live Optuna view
 eda-rl build-table --design gcd --max-tier 2   # offline F0–F2 table (resumable)
 eda-rl benchmark --seeds 20                    # promotion-policy table benchmark
-eda-rl dashboard --log <campaign jsonl> --port 8080   # live Optuna view; pass --log
-                                               # explicitly when >1 campaign runs (the
-                                               # default picks the most recently written log)
 eda-rl fit-surrogate                           # mine campaign logs, fit + CV the surrogate
+# report/collect/dashboard all accept --design/--platform (resolves the log for you,
+# no path/glob knowledge needed) or an explicit --log <jsonl> if you have one off to
+# the side; with neither, they fall back to the most-recently-written log anywhere
+# under eda_rl/campaigns/ — ambiguous once more than one design has been run, so
+# prefer --design/--platform whenever more than one campaign exists.
 
 # No ORFS? prefix any command with PHYSICAL_MOCK=1 (synthetic metrics).
 ```
@@ -84,7 +89,7 @@ python -m eda_rl.funnel.benchmark_funnel --selftest
 python -m eda_rl.common.knobs
 python3 tests/test_parsers.py                  # golden-log parser tests (REAL tool output)
 PHYSICAL_MOCK=1 eda-rl doctor --design gcd --platform nangate45
-PHYSICAL_MOCK=1 python -m eda_rl.funnel.build_table --subset strategic --limit 5  # auto-writes to a temp path under mock
+PHYSICAL_MOCK=1 python -m eda_rl.funnel.build_table --design tinymac_accel --subset strategic --limit 5  # --design required; auto-writes to a temp path under mock
 ```
 
 These are necessary, not sufficient. `PHYSICAL_MOCK` metrics are TinyMAC-
@@ -115,7 +120,7 @@ legacy/             # frozen history, outside the package: gen1/, dead modules,
 
 | File | Role |
 |---|---|
-| `env.py` | `FunnelEnv` — gym-style env over fidelity gates **F0 validate+cycle model → F1 behavioral sim (TinyVAD only) → F2 synth+STA proxy → F3 full ORFS flow**. `reset(config)` runs F0; `step(action)` with `{kill, re-proxy, promote, commit}`; terminal on kill/after F3. Live or table mode. Logs every `(config, fidelity, obs)` row. |
+| `env.py` | `FunnelEnv` — gym-style env over fidelity gates **F0 validate+cycle model → F1 behavioral sim (only when the design's functional model enables it) → F2 synth+STA proxy → F3 full ORFS flow**. F0/F1/terminal-reward/surrogate-kind all dispatch through `design.functional_model()`; **a design is REQUIRED** (no silent default). `reset(config)` runs F0; `step(action)` with `{kill, re-proxy, promote, commit}`; terminal on kill/after F3. Live or table mode. Logs every `(config, fidelity, obs)` row. |
 | `state_spec.py` | **Single source of truth** for the 22-dim state vector (`IDX_*`, normalization, `unrun = 0.0`). Everything imports from here. |
 | `candidates.py` | `CandidateGenerator` — Optuna TPE / surrogate-UCB / random. F3-only tell rule; kill-memo for non-F3 outcomes. |
 | `surrogate.py` | Per-metric quantile-GBT surrogate (area/period/power), conditioned on F2 obs. Learns the config-axis schema from its corpus; refuses cross-design predictions. |
@@ -132,16 +137,20 @@ legacy/             # frozen history, outside the package: gen1/, dead modules,
 `physical_runner.py` (drives ORFS `make` at F3, the yosys+OpenSTA proxy at F2,
 mock metrics, all report parsing — the extracted `_parse_synth_stat` /
 `_parse_sta_timing` / `_parse_metrics` are what `tests/test_parsers.py`
-covers, plus the F1 reference-STA `_reference_sta`), `physical_reward.py`
-(`compute_physical_reward` = TinyVAD composite, `compute_generic_reward` =
-pure PPA), `designs.py`
-(`DesignSpec.load`, SDC generation, injection validation), `knobs.py`
+covers, plus the F1 reference-STA `_reference_sta`; **every entry point requires
+an explicit design — no silent default**), `physical_reward.py`
+(`compute_generic_reward` = the design-agnostic PPA reward; family-specific
+composite rewards live behind the plugin), `designs.py`
+(`DesignSpec.load`, `functional_model()`, SDC generation, injection validation),
+`knobs.py`
 (`KnobRegistry`: **27 ORFS knobs in 4 tiers** — the original 24 plus opt-in
 `CLOCK_UNCERTAINTY`/`IO_DELAY`/`GR_SEED`; every knob carries an `affects` tag:
-`netlist | layout | constraints | environment`), `constants.py` (measured
-cycle model, TinyVAD SW-baseline constants, `acc_overflows`), `sim.py`
-(mock-aware behavioral-sim wrapper) + `verilator_sim.py` (the real TinyVAD
-Verilator driver, rescued from gen1), `recipe.py` (ABC recipe axis).
+`netlist | layout | constraints | environment`),
+`functional_models/` (the design functional-model **plugin registry** — a
+design opts in via `functional_eval.kind`; `base.py` is the interface,
+`tinyvad*.py` the TinyVAD plugin owning its cycle model / SW baseline /
+`acc_overflows` / composite reward / behavioral Verilator sim / report extras),
+`recipe.py` (ABC recipe axis).
 
 ## How a new design gets optimized (the part people get wrong)
 
@@ -193,10 +202,13 @@ Verilator driver, rescued from gen1), `recipe.py` (ABC recipe axis).
 - **F2 times under F3's ruler**: the SDC-owned sampled knobs
   (CLOCK_UNCERTAINTY, IO_DELAY) are forwarded to the F2 proxy; place/route
   knobs are not (the proxy has no floorplan/place/route).
-- **Design-aware reward.** TinyVAD designs → `compute_physical_reward`
-  (speedup/accuracy composite); generic designs → `compute_generic_reward`
+- **Design-aware reward via the plugin registry.** A design with a functional
+  model → that plugin's `terminal_reward` (e.g. TinyVAD's speedup/accuracy
+  composite); designs with no functional model → `compute_generic_reward`
   (PPA; refs auto-anchor from the first F3 build or the YAML `reward:`
-  block). Never hardcode TinyMAC constants for all designs.
+  block). `env._terminal_reward` dispatches on `design.functional_model()` —
+  never hardcode a design family's constants in core; add a plugin under
+  `common/functional_models/` instead.
 - **Reward bookkeeping.** Everything outside the promotion bandit uses
   `info["terminal_reward"]` (pure terminal PPA), not the shaped per-step
   accumulator: the driver for TPE/best/log, and the benchmark for scoring
@@ -209,11 +221,16 @@ Verilator driver, rescued from gen1), `recipe.py` (ABC recipe axis).
   mutates `_f2_obs`, and a prior taken afterwards equals the posterior,
   silently zeroing the shaping term for every step (this exact bug shipped
   once, too).
-- **The report is design-aware.** `viz/report.py` renders TinyMAC's
-  hand-picked baseline, SW-speedup KPI, Lanes/Acc_W columns, and knob-tier
-  table only when `_is_tinymac_campaign()`; generic designs anchor
-  before/after deltas to their own earliest F3 build. Never reintroduce an
-  unconditional TinyMAC reference.
+- **The report is design-aware via the plugin's report extension.**
+  `viz/report.py` resolves `_report_ext(rows)` — the campaign design's
+  `functional_model().report_extension()` (rows carry `design`; the canonical
+  `campaigns/<design>/<platform>/` path is authoritative and backfilled onto
+  old logs). A design with an extension renders its hand-picked baseline,
+  SW-speedup KPI, Lanes/Acc_W columns, speedup figure, and knob-tier table;
+  generic designs anchor before/after deltas to their own earliest F3 build.
+  The TinyMAC literals live in `functional_models/tinyvad_report.py`, not in the
+  report core — never reintroduce an unconditional reference or a `mac_lanes`
+  config-sniff discriminator.
 
 ### Knobs & search space
 - **Knob ontology is load-bearing.** `affects: constraints|environment`

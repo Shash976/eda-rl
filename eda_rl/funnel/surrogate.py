@@ -518,25 +518,23 @@ class Surrogate:
         self,
         x: dict,
         obs: dict | None = None,
-        reward_kind: str = "tinyvad",
+        reward_kind: str = "generic",
         refs: dict | None = None,
     ) -> tuple[float, float]:
         """Return (mu, sigma) of the final composite reward for config x.
 
-        The reward proxy mirrors physical_reward so the UCB acquisition signal
-        ranks configs the same way the real objective scores them.  All constants
-        are imported from the single sources of truth (constants.py /
-        physical_reward.py) rather than re-hardcoded — previously max_speedup was
-        576 here while the funnel's actual reward used 1024 from the YAML, so the
-        UCB signal was miscalibrated against the objective it ranks (audit H2).
+        The reward proxy mirrors the real objective so the UCB acquisition signal
+        ranks configs the same way it scores them.
 
         reward_kind:
-          "tinyvad" (default) — speedup/accuracy/area composite (TinyMAC).
-          "generic"           — pure PPA proxy (higher Fmax, lower area/power),
+          "generic" (default) — pure PPA proxy (higher Fmax, lower area/power),
                                  matching compute_generic_reward.  `refs` supplies
                                  the per-design anchors {area_ref_um2,
                                  fmax_ref_mhz, power_ref_mw}; falls back to the
                                  predicted values (self-normalised) when absent.
+          any other tag        — dispatched to the functional-model plugin whose
+                                 ``reward_kind`` matches (e.g. "composite" →
+                                 TinyVAD's speedup/accuracy/area composite).
         """
         preds = self.predict(x, obs)
         mu_area, sig_area = preds["area_um2"]
@@ -562,43 +560,16 @@ class Surrogate:
                 var += (w_pwr / max(float(power_ref), 1e-9) * sig_power) ** 2
             return (float(mu_reward), float(math.sqrt(var)))
 
-        # ── TinyVAD composite (mirrors compute_physical_reward) ───────────────
-        from eda_rl.common.constants import (
-            SW_BASELINE_CYCLES, MAX_SPEEDUP_FULL, behavioral_cycles,
-            SW_BASELINE_CLOCK_NS,   # audit F16: was gen1.reward
-        )
-        from eda_rl.common.physical_reward import AREA_REF_UM2, POWER_REF_MW
-
-        lanes = int(x.get("mac_lanes") or x.get("lanes") or 4)
-        acc_w = int(x.get("accumulator_width") or x.get("acc_w") or 24)
-
-        accuracy = 0.0 if acc_w <= 16 else 1.0   # matches acc_overflows (A16 overflows)
-        w_acc = 2.0
-        correctness = -50.0 * (1.0 - accuracy)
-
-        SW_BASELINE_NS = SW_BASELINE_CYCLES * SW_BASELINE_CLOCK_NS
-        cyc = behavioral_cycles(lanes)
-        mu_latency_ns = cyc * mu_period
-        mu_speedup = SW_BASELINE_NS / max(mu_latency_ns, 1.0)
-        max_spd = float(MAX_SPEEDUP_FULL)   # 1024 — matches the funnel YAML reward
-        norm_spd = math.log2(max(mu_speedup, 1e-3)) / math.log2(max_spd) if max_spd > 1 else 0.0
-        norm_spd = max(-1.0, min(1.0, norm_spd))
-        sig_speedup = (SW_BASELINE_NS / mu_latency_ns**2) * cyc * sig_period
-        sig_norm_spd = (sig_speedup / (mu_speedup * math.log(max_spd))) if mu_speedup > 0 else 0.1
-
-        mu_reward = (
-            w_acc * accuracy
-            + 3.0 * norm_spd
-            + (-0.4) * (mu_area / AREA_REF_UM2)
-            + (-0.4) * (mu_power / POWER_REF_MW)
-            + correctness
-        )
-        sig_reward = math.sqrt(
-            (3.0 * sig_norm_spd) ** 2
-            + (0.4 / AREA_REF_UM2 * sig_area) ** 2
-            + (0.4 / POWER_REF_MW * sig_power) ** 2
-        )
-        return (float(mu_reward), float(sig_reward))
+        # ── Functional-model composite ───────────────────────────────────────
+        # Dispatch to the design family's plugin (keyed on the reward_kind tag it
+        # declares, e.g. "composite" for TinyVAD).  The plugin mirrors its own
+        # compute-reward so the UCB signal ranks configs the way the objective
+        # scores them.  Unknown/absent kind → neutral (0, 0).
+        from eda_rl.common import functional_models
+        model = functional_models.for_reward_kind(reward_kind)
+        if model is None:
+            return (0.0, 0.0)
+        return model.surrogate_reward(x, preds)
 
     # ── Serialisation ─────────────────────────────────────────────────────────
 

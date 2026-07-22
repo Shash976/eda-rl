@@ -3,7 +3,7 @@
 
     eda-rl report                       # latest campaign
     eda-rl report --campaign all
-    eda-rl report --log tinymac_accel_run1.jsonl --open
+    eda-rl report --design gcd --platform nangate45 --open
     eda-rl report --out /tmp/run.html
 
 Produces one HTML file (Plotly CDN, no server) with:
@@ -27,11 +27,11 @@ from pathlib import Path
 # [eda_rl] bootstrap removed (installed package): sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from eda_rl.viz.campaign_data import (  # noqa: E402
-    DEFAULT_LOG,
     CampaignData,
     build_study,
     episode_value,
     obs_objective,
+    resolve_log_path,
 )
 
 _FIDELITY_COLORS = {
@@ -41,20 +41,6 @@ _FIDELITY_COLORS = {
     "F3": "#2ca02c",   # green — reached full flow
     None: "#7f7f7f",
 }
-
-# Asap7 baseline: first documented GDS (hand-picked, Stage 6, CLAUDE.md)
-_ASAP7_BASELINE = {
-    "area_um2": 1433,
-    "fmax_mhz": 509,
-    "wns_ns": -0.96,
-    "timing_met": False,
-    "config": {"mac_lanes": 4, "accumulator_width": 24, "clock_period_ns": 1.0, "abc_recipe": "orfs_speed"},
-    "label": "Baseline (L4_A24 @ 1.0 ns)",
-}
-
-# Qualitative palette for mac_lanes values
-_LANES_PALETTE = {1: "#1f77b4", 2: "#ff7f0e", 4: "#2ca02c", 8: "#d62728", 16: "#9467bd", 32: "#8c564b"}
-
 
 def _running_max(xs):
     best = float("-inf")
@@ -229,10 +215,23 @@ def _pareto_front(pts: list[tuple]) -> list[tuple]:
     return sorted(front, key=lambda t: (t[0], t[1]))  # ascending area
 
 
-def _is_tinymac_campaign(rows: list[dict]) -> bool:
-    """True if any row's config declares mac_lanes — the axis the hand-picked
-    _ASAP7_BASELINE and SW-speedup KPI are calibrated against."""
-    return any("mac_lanes" in (r.get("config") or {}) for r in rows)
+def _report_ext(rows: list[dict]):
+    """Resolve the campaign design's report extension, or None (generic report).
+
+    Design-driven (rows carry ``design``): loads the DesignSpec and asks its
+    functional model for a report extension — the hand-picked baseline, SW-speedup
+    KPI, and speedup figure live there, not in this core.  Returns None for generic
+    designs, which get the default (design-agnostic) rendering everywhere.
+    """
+    design_name = next((r.get("design") for r in rows if r.get("design")), None)
+    if not design_name:
+        return None
+    try:
+        from eda_rl.common.designs import DesignSpec
+        model = DesignSpec.load(design_name).functional_model()
+        return model.report_extension() if model is not None else None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _earliest_f3(rows: list[dict]) -> dict | None:
@@ -243,7 +242,7 @@ def _earliest_f3(rows: list[dict]) -> dict | None:
 
 
 def _cfg_label(cfg: dict) -> str:
-    """Short human label for a config: TinyMAC's L/A form, else clock-based."""
+    """Short human label for a config: an L/A form when it has mac_lanes, else clock-based."""
     if "mac_lanes" in cfg:
         return f"L{cfg.get('mac_lanes')}_A{cfg.get('accumulator_width')}"
     clk = cfg.get("clock_period_ns")
@@ -266,7 +265,7 @@ def build_pareto_figure(rows: list[dict]) -> tuple[str, object]:
         return ("pareto", fig)
 
     pts = [(r["obs"]["area_um2"], r["obs"]["fmax_mhz"], r) for r in f3]
-    tinymac = _is_tinymac_campaign(rows)
+    ext = _report_ext(rows)
 
     def _trace(subset, name, color=None):
         hover = [
@@ -294,13 +293,13 @@ def build_pareto_figure(rows: list[dict]) -> tuple[str, object]:
             hovertext=hover, hoverinfo="text",
         ))
 
-    if tinymac:
+    if ext is not None:
         # One trace per mac_lanes value (grouped for legend)
         for lanes in sorted({r["config"].get("mac_lanes", 0) for r in f3}):
             subset = [(a, fmax, r) for a, fmax, r in pts
                       if r["config"].get("mac_lanes") == lanes]
             if subset:
-                _trace(subset, f"L={lanes}", _LANES_PALETTE.get(lanes, "#aaa"))
+                _trace(subset, f"L={lanes}", ext.palette.get(lanes, "#aaa"))
     else:
         # Generic design: no mac_lanes axis to group by
         _trace(pts, "F3 builds")
@@ -318,11 +317,12 @@ def build_pareto_figure(rows: list[dict]) -> tuple[str, object]:
             showlegend=True,
         ))
 
-    # Baseline marker — the hand-picked _ASAP7_BASELINE is a TinyMAC data
-    # point; plotting it on another design's Pareto stretches the axes by an
-    # unrelated build orders of magnitude off scale.
-    if tinymac:
-        b = _ASAP7_BASELINE
+    # Baseline marker — the extension's hand-picked baseline is a design-specific
+    # data point; plotting it on another design's Pareto stretches the axes by an
+    # unrelated build orders of magnitude off scale, so only when an extension
+    # supplies one.
+    if ext is not None and getattr(ext, "baseline", None):
+        b = ext.baseline
         fig.add_trace(go.Scatter(
             x=[b["area_um2"]], y=[b["fmax_mhz"]],
             mode="markers+text",
@@ -339,7 +339,7 @@ def build_pareto_figure(rows: list[dict]) -> tuple[str, object]:
         title="Pareto Frontier: Area vs Fmax — marker size = power",
         xaxis_title="Area (µm²)",
         yaxis_title="Fmax (MHz)",
-        legend=dict(title="mac_lanes") if tinymac else None,
+        legend=dict(title="mac_lanes") if ext is not None else None,
     )
     return ("pareto", fig)
 
@@ -359,7 +359,7 @@ def build_iteration_figure(rows: list[dict]) -> tuple[str, object]:
 
     run_nums = list(range(1, len(f3) + 1))
     fmaxes = [r["obs"]["fmax_mhz"] for r in f3]
-    tinymac = _is_tinymac_campaign(rows)
+    ext = _report_ext(rows)
 
     hover = [
         f"Run #{i}<br>"
@@ -370,7 +370,7 @@ def build_iteration_figure(rows: list[dict]) -> tuple[str, object]:
         for i, r in zip(run_nums, f3)
     ]
 
-    if tinymac:
+    if ext is not None:
         # All F3 scatter points (colored by lanes)
         for lanes in sorted({r["config"].get("mac_lanes", 0) for r in f3}):
             xs = [n for n, r in zip(run_nums, f3) if r["config"].get("mac_lanes") == lanes]
@@ -379,7 +379,7 @@ def build_iteration_figure(rows: list[dict]) -> tuple[str, object]:
             if xs:
                 fig.add_trace(go.Scatter(
                     x=xs, y=ys, mode="markers", name=f"L={lanes}",
-                    marker=dict(color=_LANES_PALETTE.get(lanes, "#aaa"), size=9, opacity=0.85),
+                    marker=dict(color=ext.palette.get(lanes, "#aaa"), size=9, opacity=0.85),
                     hovertext=ht, hoverinfo="text",
                 ))
     else:
@@ -409,7 +409,7 @@ def build_iteration_figure(rows: list[dict]) -> tuple[str, object]:
                 ax=30, ay=-35, font=dict(size=10, color="#1f2937"),
             )
 
-    if tinymac:
+    if ext is not None:
         # Vertical dashed line where L8 cluster begins (first run where L8 dominates remaining)
         lanes_seq = [r["config"].get("mac_lanes", 0) for r in f3]
         # Find the first run where >=60% of the remaining runs are L8
@@ -424,19 +424,21 @@ def build_iteration_figure(rows: list[dict]) -> tuple[str, object]:
                           annotation_text="L8 cluster", annotation_position="top right",
                           annotation_font=dict(color="#9467bd"))
 
-        # Baseline reference line — TinyMAC's hand-picked 509 MHz point; drawing
-        # it on another design's plot is a fabricated reference.
-        fig.add_hline(y=_ASAP7_BASELINE["fmax_mhz"],
-                      line=dict(color="red", width=1.5, dash="dash"),
-                      annotation_text=f"Baseline {_ASAP7_BASELINE['fmax_mhz']} MHz",
-                      annotation_position="bottom right",
-                      annotation_font=dict(color="red"))
+        # Baseline reference line — the extension's hand-picked point; drawing it
+        # on another design's plot would be a fabricated reference.
+        if getattr(ext, "baseline", None):
+            b = ext.baseline
+            fig.add_hline(y=b["fmax_mhz"],
+                          line=dict(color="red", width=1.5, dash="dash"),
+                          annotation_text=f"Baseline {b['fmax_mhz']} MHz",
+                          annotation_position="bottom right",
+                          annotation_font=dict(color="red"))
 
     fig.update_layout(
         title=f"Fmax Progression Over {len(f3)} Full P&R Runs (chronological)",
         xaxis_title="Run # (chronological by timestamp)",
         yaxis_title="Fmax (MHz)",
-        legend=dict(title="mac_lanes") if tinymac else None,
+        legend=dict(title="mac_lanes") if ext is not None else None,
     )
     return ("iteration", fig)
 
@@ -449,7 +451,7 @@ def build_comparison_table(rows: list[dict]) -> tuple[str, object]:
     pts = [(r["obs"]["area_um2"], r["obs"]["fmax_mhz"], r) for r in f3] if f3 else []
     pareto = _pareto_front(pts)  # sorted by ascending area
 
-    tinymac = _is_tinymac_campaign(rows)
+    ext = _report_ext(rows)
 
     def _delta(val, base, higher_better=True):
         pct = (val - base) / base * 100
@@ -462,12 +464,12 @@ def build_comparison_table(rows: list[dict]) -> tuple[str, object]:
     col_dfmax, col_darea = [], []
     row_colors = []
 
-    # Baseline row: TinyMAC campaigns use the hand-picked _ASAP7_BASELINE;
+    # Baseline row: designs with a report extension use its hand-picked baseline;
     # generic designs anchor to the campaign's own earliest F3 build — a real
     # logged data point, never a fabricated reference from another design.
     base_area = base_fmax = None
-    if tinymac:
-        b = _ASAP7_BASELINE
+    if ext is not None and getattr(ext, "baseline", None):
+        b = ext.baseline
         b_cfg = b["config"]
         base_area, base_fmax = b["area_um2"], b["fmax_mhz"]
         col_config.append(b["label"])
@@ -504,8 +506,8 @@ def build_comparison_table(rows: list[dict]) -> tuple[str, object]:
         cfg = r["config"]
         obs = r["obs"]
         col_config.append(f"{_cfg_label(cfg)} @ {cfg.get('clock_period_ns', 0):.2f} ns"
-                          if tinymac else _cfg_label(cfg))
-        if tinymac:
+                          if ext is not None else _cfg_label(cfg))
+        if ext is not None:
             col_lanes.append(cfg.get("mac_lanes", ""))
             col_accw.append(cfg.get("accumulator_width", ""))
         col_clk.append(f"{cfg.get('clock_period_ns', 0):.3f}")
@@ -521,7 +523,7 @@ def build_comparison_table(rows: list[dict]) -> tuple[str, object]:
 
     # Transpose for Plotly (it wants column-major). Generic designs have no
     # Lanes/Acc_W axes — drop those columns instead of rendering blanks.
-    if tinymac:
+    if ext is not None:
         headers = ["Config", "Lanes", "Acc_W", "Clock (ns)", "Area (µm²)",
                    "Cells", "Fmax (MHz)", "WNS (ns)", "Recipe", "ΔFmax", "ΔArea"]
         all_cols = [col_config, col_lanes, col_accw, col_clk, col_area,
@@ -626,82 +628,6 @@ def build_knob_tier_figure() -> tuple[str, object]:
     return ("full-knob-tiers", fig)
 
 
-def build_speedup_figure(rows: list[dict]) -> tuple[str, object]:
-    """Area vs real-speedup-at-Fmax scatter for all F3 results.
-
-    Real speedup = SW_LATENCY / accel_latency_at_fmax, where
-      SW_LATENCY  = 11,196,638 cycles × 10 ns  (100 MHz PicoRV32, no accel)
-      accel_latency = AVG_CYCLES[lanes] × (1000 / fmax_mhz) ns
-    """
-    import plotly.graph_objects as go
-
-    _SW_LATENCY_NS = 11_196_638 * 10.0
-    _AVG_CYCLES = {1: 273_130, 2: 152_140, 4: 91_650, 8: 61_400, 16: 46_670, 32: 39_310}
-
-    f3 = _f3_ok_rows(rows)
-    fig = go.Figure()
-
-    if not f3:
-        fig.add_annotation(text="No F3 data", xref="paper", yref="paper",
-                           x=0.5, y=0.5, showarrow=False, font=dict(size=18))
-        fig.update_layout(title="Area vs Real Speedup")
-        return ("speedup", fig)
-
-    for lanes in sorted({r["config"].get("mac_lanes", 0) for r in f3}):
-        subset = [r for r in f3 if r["config"].get("mac_lanes") == lanes]
-        acyc = _AVG_CYCLES.get(lanes, 91_650)
-        xs, ys, hover = [], [], []
-        for r in subset:
-            fmax = r["obs"]["fmax_mhz"]
-            area = r["obs"]["area_um2"]
-            period_ns = 1000.0 / fmax
-            speedup = _SW_LATENCY_NS / (acyc * period_ns)
-            xs.append(area)
-            ys.append(speedup)
-            hover.append(
-                f"L{r['config'].get('mac_lanes')}_A{r['config'].get('accumulator_width')}<br>"
-                f"clk={r['config'].get('clock_period_ns', 0):.2f} ns · {r['config'].get('abc_recipe')}<br>"
-                f"Fmax={fmax:.0f} MHz · area={area:.0f} µm²<br>"
-                f"<b>Speedup = {speedup:.0f}×</b>"
-            )
-        fig.add_trace(go.Scatter(
-            x=xs, y=ys, mode="markers", name=f"L={lanes}",
-            marker=dict(color=_LANES_PALETTE.get(lanes, "#aaa"), size=10,
-                        opacity=0.85, line=dict(width=1, color="white")),
-            hovertext=hover, hoverinfo="text",
-        ))
-
-    # Baseline marker
-    b = _ASAP7_BASELINE
-    b_lanes = b["config"]["mac_lanes"]
-    b_fmax = b["fmax_mhz"]
-    b_area = b["area_um2"]
-    b_speedup = _SW_LATENCY_NS / (_AVG_CYCLES.get(b_lanes, 91_650) * (1000.0 / b_fmax))
-    fig.add_trace(go.Scatter(
-        x=[b_area], y=[b_speedup],
-        mode="markers+text", name=b["label"],
-        marker=dict(color="red", size=16, symbol="star",
-                    line=dict(width=2, color="darkred")),
-        text=["Baseline"], textposition="top right",
-        hovertext=f"{b['label']}<br>area={b_area} µm² · fmax={b_fmax} MHz<br>Speedup={b_speedup:.0f}×",
-        hoverinfo="text",
-    ))
-
-    fig.update_layout(
-        title=dict(text="Area vs Inference Speedup (at Fmax) — vs SW Baseline (112 ms @ 100 MHz)", font=dict(size=14)),
-        xaxis_title="Area (µm²)",
-        yaxis_title="Speedup over SW baseline",
-        legend=dict(title="mac_lanes"),
-        annotations=[dict(
-            text="<i>Higher-left = smaller chip, faster inference</i>",
-            xref="paper", yref="paper", x=0.01, y=0.99,
-            showarrow=False, font=dict(size=11, color="#6b7280"),
-            align="left",
-        )],
-    )
-    return ("speedup", fig)
-
-
 _CSS = """
 body {
   font-family: system-ui, -apple-system, sans-serif;
@@ -783,9 +709,6 @@ header p.subtitle {
 
 def build_summary_banner(rows: list[dict]) -> tuple[str, str]:
     """Return a raw-HTML KPI banner (label='--html:banner', fig=html_string)."""
-    _SW_LATENCY_NS = 11_196_638 * 10.0
-    _AVG_CYCLES = {1: 273_130, 2: 152_140, 4: 91_650, 8: 61_400, 16: 46_670, 32: 39_310}
-
     f3 = _f3_ok_rows(rows)
 
     if not f3:
@@ -800,35 +723,13 @@ def build_summary_banner(rows: list[dict]) -> tuple[str, str]:
     <div class='kpi-label'>{len(f3)} full P&amp;R runs in {total_h:.1f} h &nbsp;·&nbsp; {n_vars} variables searched</div>
   </div>"""
 
-    if _is_tinymac_campaign(rows):
-        b = _ASAP7_BASELINE
-        # Best speedup across all F3 results (TinyMAC cycle model)
-        best_speedup = 0.0
-        for r in f3:
-            lanes = r["config"].get("mac_lanes", 4)
-            fmax  = r["obs"]["fmax_mhz"]
-            sp = _SW_LATENCY_NS / (_AVG_CYCLES.get(lanes, 91_650) * (1000.0 / fmax))
-            best_speedup = max(best_speedup, sp)
-
-        fmax_delta = (best_fmax - b["fmax_mhz"]) / b["fmax_mhz"] * 100
-        area_delta = (min_area  - b["area_um2"])  / b["area_um2"]  * 100
-
-        html = f"""<div class='banner'>
-  <div class='kpi'>
-    <div class='kpi-val green'>{best_fmax:.0f} MHz</div>
-    <div class='kpi-label'>Best Fmax found &nbsp;·&nbsp; <b>+{fmax_delta:.1f}%</b> vs hand-picked baseline</div>
-  </div>
-  <div class='kpi'>
-    <div class='kpi-val green'>{best_speedup:.0f}×</div>
-    <div class='kpi-label'>Peak inference speedup vs software baseline (112 ms @ 100 MHz)</div>
-  </div>
-  <div class='kpi'>
-    <div class='kpi-val'>{min_area:.0f} µm²</div>
-    <div class='kpi-label'>Minimum area found &nbsp;·&nbsp; <b>{area_delta:+.1f}%</b> vs baseline</div>
-  </div>
-{builds_kpi}
-</div>"""
-        return ("--html:banner", html)
+    ext = _report_ext(rows)
+    if ext is not None and hasattr(ext, "summary_kpi_cards"):
+        # The design's report extension owns the design-specific KPI cards
+        # (e.g. TinyVAD's Fmax-vs-baseline / peak-speedup / area-vs-baseline).
+        cards = ext.summary_kpi_cards(f3, best_fmax, min_area)
+        banner = f"<div class='banner'>\n{cards}{builds_kpi}\n</div>"
+        return ("--html:banner", banner)
 
     # Generic design: no hand-picked baseline, no software-speedup model —
     # anchor deltas to the campaign's own first F3 build; fabricate nothing.
@@ -909,10 +810,14 @@ def write_html(figs, out_path: Path, title: str, subtitle: str = ""):
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Static HTML report for a campaign log")
-    ap.add_argument("--log",
-                    default=str(DEFAULT_LOG) if DEFAULT_LOG is not None else None,
-                    required=(DEFAULT_LOG is None),
-                    help="campaign JSONL path (required when no results_funnel_campaigns.jsonl exists)")
+    ap.add_argument("--design", default=None,
+                    help="design name, e.g. 'sagar' — resolves the campaign log for you "
+                         "(pair with --platform; preferred over --log)")
+    ap.add_argument("--platform", default=None,
+                    help="platform name, e.g. 'sky130hd' (pair with --design)")
+    ap.add_argument("--log", default=None,
+                    help="campaign JSONL path (overrides --design/--platform; "
+                         "default: most-recently-modified log under eda_rl/campaigns/)")
     ap.add_argument("--campaign", default="latest",
                     help="campaign_id | 'latest' | 'all'")
     ap.add_argument("--out", default=None, help="output HTML path")
@@ -922,6 +827,7 @@ def main() -> None:
                     help="skip supervisor overview section (Pareto, comparison table, etc.)")
     ap.add_argument("--open", action="store_true", help="open the report in a browser")
     args = ap.parse_args()
+    args.log = str(resolve_log_path(args.log, args.design, args.platform))
 
     data = CampaignData.load(args.log, args.campaign)
     if not data.rows:
@@ -936,6 +842,12 @@ def main() -> None:
     log_path = Path(args.log)
     platform = log_path.parent.name
     design   = log_path.parent.parent.name
+    # Backfill the design onto rows that predate the self-describing-rows
+    # convention so the design-driven report extension (_report_ext) resolves
+    # even for old logs — the canonical campaigns/<design>/<platform>/ path is
+    # authoritative.
+    for r in data.rows:
+        r.setdefault("design", design)
     title    = f"{design} · {platform} · {f3_count} Full P&R Builds"
     subtitle = (f"Multi-fidelity funnel optimizer · {len(data.rows):,} candidate evaluations"
                 f" · {len(data.specs)} search variables · campaign {data.campaign_id}")
@@ -949,13 +861,14 @@ def main() -> None:
         figs.append(build_comparison_table(data.rows))
         figs.append(build_pareto_figure(data.rows))
         figs.append(build_iteration_figure(data.rows))
-        # The speedup figure assumes the TinyMAC accelerator cycle model
-        # (AVG_CYCLES per mac_lanes); only meaningful for designs that expose a
-        # mac_lanes axis. Skip it for generic designs so the numbers stay honest.
-        # The static knob-tier table likewise describes the TinyMAC search
-        # space (mac_lanes/accumulator_width tiers) — not another design's.
-        if _is_tinymac_campaign(data.rows):
-            figs.append(build_speedup_figure(data.rows))
+        # The speedup figure assumes a software-baseline cycle model, and the
+        # static knob-tier table describes a specific design's search space —
+        # both come from the design's report extension, so they only appear for
+        # designs that supply one (generic designs stay honest without them).
+        ext = _report_ext(data.rows)
+        if ext is not None:
+            if hasattr(ext, "speedup_figure"):
+                figs.append(ext.speedup_figure(_f3_ok_rows(data.rows)))
             figs.append(build_knob_tier_figure())
 
     figs.append(("section:Optimization History", None))

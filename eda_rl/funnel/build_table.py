@@ -69,12 +69,8 @@ try:
 except ImportError:
     RECIPES = ("orfs_speed", "orfs_area", "plain")
 
-# ── constants ─────────────────────────────────────────────────────────────────
-from eda_rl.common.constants import (
-    AVG_CYCLES,
-    SW_BASELINE_CYCLES,
-    behavioral_cycles,
-)
+# F0/F1 analytic + behavioral models come from the design's functional-model
+# plugin (design.functional_model()); this builder never names a design family.
 
 # ── search space definition ───────────────────────────────────────────────────
 
@@ -268,41 +264,23 @@ def _write_row(out_path: Path, config: dict, fidelity: str, obs: dict,
 # ── F0: analytic (free) ───────────────────────────────────────────────────────
 
 def _eval_f0(config: dict, design: "Any | None" = None) -> tuple[dict, str]:
-    """Analytic evaluation: cycles from constants.py + accuracy gate.
+    """Analytic evaluation via the design's functional model + accuracy gate.
 
     F0 obs keys: cycles, accuracy_flag, cycle_speedup
 
-    Accepts both canonical (mac_lanes / accumulator_width) and legacy (lanes / acc_w)
-    key names so this function works regardless of which grid-builder produced config.
-
-    design: when given and not TinyVAD (design.is_tinyvad() is False), the
-    TinyMAC-specific analytic cycle/accuracy model does not apply — mirrors
-    FunnelEnv._run_f0's generic-design branch (legality only, no phantom
-    cycle count).
+    design: when the design declares no functional model (or is None), the
+    analytic cycle/accuracy model does not apply — mirrors FunnelEnv._run_f0's
+    generic-design branch (legality only, no phantom cycle count).
     """
-    if design is not None and not design.is_tinyvad():
+    model = design.functional_model() if design is not None else None
+    if model is None:
         return {"cycles": 0.0, "accuracy_flag": 0.0, "cycle_speedup": 0.0}, "ok"
 
-    lanes  = int(config.get("mac_lanes") or config.get("lanes") or 0)
-    acc_w  = int(config.get("accumulator_width") or config.get("acc_w") or 0)
-
-    # Cycles: use measured table if available, else analytic fit
-    cyc = float(AVG_CYCLES[lanes]) if lanes in AVG_CYCLES else behavioral_cycles(lanes)
-    # Accuracy flag: use the LANES-dependent measured table (V13) so the F0 row
-    # agrees with FunnelEnv._f0_accuracy (audit M1) instead of a lanes-independent
-    # approximation.  Fall back to the simple acc_w rule only if funnel is absent.
-    try:
-        from eda_rl.funnel.env import _f0_accuracy
-        acc = _f0_accuracy(lanes, acc_w)
-    except ImportError:
-        acc = 1.0 if acc_w >= 24 else (0.92 if acc_w >= 20 else 47.0 / 64.0)
-    speedup = SW_BASELINE_CYCLES / max(cyc, 1.0)
-
-    obs = {
-        "cycles":         cyc,
-        "accuracy_flag":  acc,
-        "cycle_speedup":  round(speedup, 3),
-    }
+    cyc = float(model.f0_cycles(config))
+    acc = float(model.f0_accuracy(config))
+    obs = {"cycles": cyc, "accuracy_flag": acc}
+    if model.sw_baseline_cycles:
+        obs["cycle_speedup"] = round(model.sw_baseline_cycles / max(cyc, 1.0), 3)
     return obs, "ok"
 
 
@@ -322,47 +300,39 @@ def _eval_f1(config: dict, design: "Any | None" = None) -> tuple[dict, str]:
     once per lanes value and reuse.  The accuracy obs comes from the F0 analytic
     model (same gate logic, already consistent with cascade.py _run_sim mock).
 
-    design: F1 (Verilator behavioral sim) is TinyVAD-specific — mirrors
-    FunnelEnv._f1_enabled(), which only runs F1 for design.is_tinyvad().
+    design: F1 (behavioral sim) runs only when the design declares a functional
+    model whose ``enables_f1`` is set — mirrors FunnelEnv._f1_enabled().
     """
-    if design is not None and not design.is_tinyvad():
-        return {"note": "F1 skipped: design has no TinyVAD functional evaluator"}, "skipped"
+    model = design.functional_model() if design is not None else None
+    if model is None or not model.enables_f1:
+        return {"note": "F1 skipped: design has no functional evaluator"}, "skipped"
 
     lanes = int(config.get("mac_lanes") or config.get("lanes") or 0)
     acc_w = int(config.get("accumulator_width") or config.get("acc_w") or 0)
 
     if lanes not in _F1_CACHE:
-        if os.environ.get("PHYSICAL_MOCK"):
-            # Mock mode: return analytic value (same as F0 but "measured")
-            cyc = float(AVG_CYCLES[lanes]) if lanes in AVG_CYCLES else behavioral_cycles(lanes)
-            obs_sim = {"avg_cycles": cyc, "accuracy": 1.0 if acc_w >= 24 else 47.0 / 64.0}
-            _F1_CACHE[lanes] = (obs_sim, "mock")
-        else:
-            try:
-                from eda_rl.common.sim import run_sim  # audit F16: was gen1.runner
-                raw = run_sim(lanes, acc_width=32)   # acc_width=32 → guaranteed correct
-                obs_sim = {
-                    "avg_cycles": float(raw.get("avg_cycles", behavioral_cycles(lanes))),
-                    "accuracy":   float(raw.get("accuracy", 1.0)),
-                }
-                _F1_CACHE[lanes] = (obs_sim, "ok")
-            except Exception as exc:  # noqa: BLE001
-                # Sim not available — fall back to analytic (marks as "fallback")
-                cyc = float(AVG_CYCLES[lanes]) if lanes in AVG_CYCLES else behavioral_cycles(lanes)
-                _F1_CACHE[lanes] = (
-                    {"avg_cycles": cyc, "accuracy": 1.0, "fallback_reason": str(exc)},
-                    "fallback",
-                )
+        mock = bool(os.environ.get("PHYSICAL_MOCK"))
+        try:
+            # acc_width=32 → guaranteed correct; accuracy is overridden per-acc_w below.
+            raw = model.run_f1({"mac_lanes": lanes, "accumulator_width": 32}, mock=mock)
+            obs_sim = {
+                "avg_cycles": float(raw.get("avg_cycles", model.f0_cycles(config))),
+                "accuracy":   float(raw.get("accuracy", 1.0)),
+            }
+            _F1_CACHE[lanes] = (obs_sim, "mock" if mock else "ok")
+        except Exception as exc:  # noqa: BLE001
+            # Sim not available — fall back to the analytic cycle model.
+            _F1_CACHE[lanes] = (
+                {"avg_cycles": float(model.f0_cycles(config)), "accuracy": 1.0,
+                 "fallback_reason": str(exc)},
+                "fallback",
+            )
 
     base_obs, base_status = _F1_CACHE[lanes]
-    # Override accuracy with acc_w-specific value (the per-lanes cache assumed acc_w=32).
-    # Uses funnel's measured (lanes, acc_w) table (V13: acc16 accuracy is LANES-dependent)
-    # so table F1 rows agree with FunnelEnv's F0 analytic accuracy.
-    try:
-        from eda_rl.funnel.env import _f0_accuracy
-        acc = _f0_accuracy(lanes, acc_w)
-    except ImportError:
-        acc = 1.0 if acc_w >= 24 else (0.92 if acc_w >= 20 else 47.0 / 64.0)
+    # Override accuracy with the acc_w-specific value (the per-lanes cache assumed
+    # acc_w=32), from the model's analytic accuracy so table F1 rows agree with
+    # FunnelEnv's F0 analytic accuracy.
+    acc = float(model.f0_accuracy(config))
 
     obs = dict(base_obs)
     obs["accuracy"] = acc
@@ -383,10 +353,8 @@ def _eval_f2(config: dict, platform: str, design: "Any | None" = None) -> tuple[
     F2 cache key = (lanes, acc_w, clk, recipe, design name) — util/density are fixed.
 
     The abc_recipe/design parameters are passed to run_synth_sta only if the
-    function signature accepts them. design=None means "use tinymac_accel
-    behaviour" (run_synth_sta's own default) — passing it explicitly for
-    non-tinymac designs is what makes `build-table --design <x>` actually
-    synthesize <x>'s RTL instead of silently falling back to tinymac_accel.
+    function signature accepts them.  Passing the resolved design is what makes
+    `build-table --design <x>` synthesize <x>'s RTL.
     """
     lanes  = int(config.get("mac_lanes") or config.get("lanes") or 0)
     acc_w  = int(config.get("accumulator_width") or config.get("acc_w") or 0)
@@ -505,15 +473,20 @@ def run_table_builder(
 ) -> None:
     """Run the table builder.
 
-    When `design` is specified, KnobRegistry.space(design_spec, max_tier, platform)
-    augments the base YAML space with knob axes.  For designs without TinyVAD
-    functional eval, F1 is skipped automatically in FunnelEnv.
+    A `design` is REQUIRED (name or YAML path); there is no default.
+    KnobRegistry.space(design, max_tier, platform) derives the search space and
+    the DesignSpec is threaded into _eval_f0/_eval_f1/_eval_f2.  Designs that
+    declare no functional model skip F1 automatically.
     """
+    if design is None:
+        raise ValueError(
+            "build_table requires a design (name or YAML path); there is no "
+            "default design. Pass --design <name>."
+        )
     space = _load_space(space_path)
 
     # Resolved DesignSpec, threaded into _eval_f0/_eval_f1/_eval_f2 so F0-F2
-    # actually evaluate this design's RTL instead of silently falling back to
-    # tinymac_accel (run_synth_sta's design=None default).
+    # actually evaluate this design's RTL.
     design_spec: "Any | None" = None
 
     # When --design is provided, derive the space entirely from KnobRegistry.space()
@@ -746,13 +719,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--design",
-        default=None,
+        required=True,
         help=(
             "Design name or YAML path (e.g. 'gcd' or 'eda_rl/designs/gcd.yaml'). "
-            "Default: tinymac_accel (unchanged behaviour). "
-            "Grid enumeration uses KnobRegistry.space(design, max_tier, platform) "
-            "when --design is specified. "
-            "For generic designs (no tinyvad_sim functional_eval), F1 is skipped."
+            "REQUIRED — there is no default design. Grid enumeration uses "
+            "KnobRegistry.space(design, max_tier, platform). Designs that declare "
+            "no functional model skip F1."
         ),
     )
     parser.add_argument(

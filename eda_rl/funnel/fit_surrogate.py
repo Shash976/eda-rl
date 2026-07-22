@@ -398,8 +398,11 @@ def mine_training_rows(design: str | None = None,
         seen.add(key)
         rows.append(r)
 
-    # Source 2: legacy report variant dirs (nangate45/tinymac only)
-    if platform in (None, "nangate45"):
+    # Source 2: legacy report variant dirs (a nangate45/tinymac_accel build tree).
+    # These are a design-specific legacy source, so only mine them when the caller
+    # asked for that design (or no filter) — never fold tinymac rows into another
+    # design's training set.
+    if platform in (None, "nangate45") and design in (None, "tinymac_accel"):
         variant_dirs = sorted(_RPT_DIR.iterdir()) if _RPT_DIR.is_dir() else []
         for vdir in variant_dirs:
             vname = vdir.name
@@ -422,7 +425,10 @@ def mine_training_rows(design: str | None = None,
             seen.add(key)
             rows.append(row)
 
-    # Source 3: sweep CSV (legacy)
+    # Source 3: sweep CSV (a legacy nangate45/tinymac_accel sweep) — same
+    # design-specific gate as Source 2.
+    if design not in (None, "tinymac_accel"):
+        return rows
     for csv_path in sorted(_MAKE_DIR.glob("sweep_results*.csv")):
         for r in _read_sweep_csv(csv_path):
             r.setdefault("platform", "nangate45")

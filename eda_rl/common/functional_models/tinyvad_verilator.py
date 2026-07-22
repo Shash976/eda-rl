@@ -1,7 +1,9 @@
-"""verilator_sim.py — run one Verilator simulation trial and return parsed metrics.
+"""tinyvad_verilator.py — run one TinyVAD Verilator trial and return metrics.
 
-(Formerly gen1/runner.py — the one live piece rescued when gen1 retired to
-legacy/: it drives the TinyVAD Verilator harness the F1 fidelity gate needs.)
+Plugin-internal to the TinyVAD functional model (functional_models/tinyvad.py);
+nothing in the design-agnostic core imports this module.  (Formerly
+``common/verilator_sim.py`` — the one live piece rescued when gen1 retired to
+``legacy/``: it drives the TinyVAD Verilator harness the F1 fidelity gate needs.)
 
 Key design decisions
 --------------------
@@ -28,16 +30,12 @@ import warnings
 from functools import lru_cache
 from pathlib import Path
 
-_REPO    = Path(__file__).resolve().parent.parent.parent
+_REPO    = Path(__file__).resolve().parents[3]
 SIM_DIR  = _REPO / "sim" / "verilator"
 SIM_BIN  = SIM_DIR / "sim_picorv32"
 FIRMWARE = _REPO / "firmware" / "picorv32_baremetal" / "firmware.bin"
 
 SIM_TIMEOUT = 120   # seconds
-
-# Stage-3 pure-SW per-inference baseline: import from constants.py (single source).
-# Re-measure via legacy/measure_real.py whenever the model, test vectors, or firmware changes.
-from eda_rl.common.constants import SW_BASELINE_CYCLES  # noqa: E402 (after path setup)
 
 
 @lru_cache(maxsize=None)
@@ -58,6 +56,10 @@ def run_sim(mac_lanes: int, acc_width: int = 32) -> dict:
     FileNotFoundError   if the sim binary or firmware.bin are missing
     RuntimeError        if the sim exits non-zero or output can't be parsed
     """
+    # Stage-3 pure-SW per-inference baseline — imported lazily to avoid an
+    # import cycle with the tinyvad plugin module that owns the constant.
+    from eda_rl.common.functional_models.tinyvad import SW_BASELINE_CYCLES
+
     if not SIM_BIN.exists():
         raise FileNotFoundError(
             f"Sim binary not found: {SIM_BIN}\n"

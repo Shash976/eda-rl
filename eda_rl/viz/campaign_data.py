@@ -54,6 +54,57 @@ except FileNotFoundError:
 _FIDELITY_ORDER = ["F0", "F1", "F2", "F3"]
 
 
+def _campaigns_root() -> Path:
+    return Path(__file__).resolve().parents[1] / "campaigns"
+
+
+def list_campaign_logs() -> list[Path]:
+    """Every results_funnel_campaigns.jsonl under eda_rl/campaigns/, sorted."""
+    root = _campaigns_root()
+    if not root.exists():
+        return []
+    return sorted(root.rglob("results_funnel_campaigns.jsonl"))
+
+
+def resolve_log_path(
+    log: str | Path | None,
+    design: str | None = None,
+    platform: str | None = None,
+) -> Path:
+    """Resolve which campaign log to read, in order of preference:
+
+    1. ``--log`` (explicit path) wins outright.
+    2. ``--design``/``--platform`` (the recommended path) resolves to the
+       canonical ``eda_rl/campaigns/<design>/<platform>/results_funnel_campaigns.jsonl``
+       — no ambiguity from stray/duplicate directories elsewhere in the tree.
+    3. Falls back to ``DEFAULT_LOG``, the most-recently-modified log anywhere
+       under ``eda_rl/campaigns/`` (only sensible when there's one design in play).
+    """
+    if log:
+        return Path(log)
+
+    if design or platform:
+        if not (design and platform):
+            raise SystemExit("pass --design and --platform together (or use --log)")
+        candidate = _campaigns_root() / design / platform / "results_funnel_campaigns.jsonl"
+        if candidate.exists():
+            return candidate
+        pairs = sorted({(p.parent.parent.name, p.parent.name) for p in list_campaign_logs()})
+        avail = ", ".join(f"{d}/{plat}" for d, plat in pairs) or "(none found)"
+        raise SystemExit(
+            f"no campaign log for design={design!r} platform={platform!r} "
+            f"(looked at {candidate})\navailable design/platform pairs: {avail}"
+        )
+
+    if DEFAULT_LOG is not None:
+        return DEFAULT_LOG
+
+    raise SystemExit(
+        "no campaign log found — pass --design/--platform, or --log explicitly "
+        f"(searched under {_campaigns_root()})"
+    )
+
+
 # ── row loading ───────────────────────────────────────────────────────────────
 
 def load_campaign_rows(

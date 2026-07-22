@@ -58,7 +58,7 @@ except Exception as _e:
     _FUNNEL_ERR = str(_e)
 
 try:
-    from eda_rl.funnel.candidates import CandidateGenerator, _fallback_space
+    from eda_rl.funnel.candidates import CandidateGenerator
     _CAND_OK = True
 except Exception as _e:
     _CAND_OK = False
@@ -137,22 +137,22 @@ def _build_space(
     max_tier: int,
     space_yaml: "str | Path | None" = None,
 ) -> dict:
-    """Return a space dict, trying KnobRegistry+DesignSpec first then _fallback_space.
+    """Return the design's knob space from KnobRegistry+DesignSpec.
 
     KnobRegistry.space() normalizes str designs via DesignSpec.load() and emits
-    design.params axes under their canonical names (mac_lanes, accumulator_width for
-    tinymac; empty for designs like gcd that have no RTL params).
+    design.params axes under their canonical names (mac_lanes, accumulator_width
+    for tinymac; empty for designs like gcd that have no RTL params).
 
-    Knob fixing/exclusion/overrides are now design-authoritative: they come from
-    the design YAML's ``knobs:`` block (applied inside ``KnobRegistry.space()``),
-    so a design is fully described by its own YAML and the user never edits
+    Knob fixing/exclusion/overrides are design-authoritative: they come from the
+    design YAML's ``knobs:`` block (applied inside ``KnobRegistry.space()``), so a
+    design is fully described by its own YAML and the user never edits
     search_space_funnel.yaml.  A design with no ``knobs:`` block optimizes every
-    knob up to ``--max-tier``.  TinyMAC reproduces its historical fixed-knob set
-    via ``knobs.fix`` in tinymac_accel.yaml.  ``space_yaml`` is retained for
-    signature compatibility but no longer governs the live knob space.
+    knob up to ``--max-tier``.  ``space_yaml`` is retained for signature
+    compatibility but no longer governs the live knob space.
 
-    Fallback: if KnobRegistry/DesignSpec are unavailable, use _fallback_space()
-    (hardcoded 4-axis tinymac space).
+    Raises RuntimeError if the space can't be resolved — there is no silent
+    design-shaped fallback (that used to substitute a tinymac space for any
+    design whose registry lookup failed).
     """
     try:
         from eda_rl.common.knobs import KnobRegistry
@@ -163,11 +163,12 @@ def _build_space(
         sp = reg.space(max_tier=max_tier, design=design, platform=platform)
         if sp:
             return sp
-    except (ImportError, AttributeError, Exception):
-        pass
-
-    # Fallback: hardcoded 4-axis tinymac space (only appropriate for tinymac)
-    return _fallback_space()
+        raise RuntimeError("KnobRegistry.space() returned an empty space")
+    except Exception as exc:
+        raise RuntimeError(
+            f"could not resolve the knob space for design={design!r} "
+            f"platform={platform!r}: {exc}"
+        ) from exc
 
 
 # ── helper: build promotion agent ─────────────────────────────────────────────
@@ -275,8 +276,8 @@ def run_campaign(
 
     # ── build agents ───────────────────────────────────────────────────────────
     # surrogate_ucb must rank candidates with the same reward formula
-    # FunnelEnv._terminal_reward will actually use for this design (audit: was
-    # unconditionally "tinyvad", uncalibrated for non-TinyVAD designs like gcd/aes).
+    # FunnelEnv._terminal_reward will actually use for this design (the env
+    # derives the reward_kind from the design's functional model, or "generic").
     _ucb_kind, _ = env._surrogate_reward_kind()
     gen = CandidateGenerator(
         space=space,
@@ -546,8 +547,8 @@ def main() -> None:
         description="Gen2 funnel optimizer campaign driver",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--design", default="tinymac_accel",
-                   help="Design identifier (for KnobRegistry; falls back to hardcoded space)")
+    p.add_argument("--design", required=True,
+                   help="Design name or YAML path (REQUIRED — no default design)")
     p.add_argument("--platform", default="nangate45",
                    help="Target platform (nangate45 or asap7)")
     p.add_argument("--budget-hours", type=float, default=4.0, dest="budget_hours",

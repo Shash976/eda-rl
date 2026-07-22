@@ -27,13 +27,13 @@ Sampler modes
 grid_snap
 ---------
 When grid_snap=True, float axes that DECLARE a `_snap_step` are snapped to that
-grid so table-mode FunnelEnv lookups hit stored rows (e.g. `_fallback_space()`'s
-clock axis declares `_snap_step: 0.5`).  Float axes without a `_snap_step` are
-left continuous — an earlier version applied a hardcoded 0.5 ns step to every
-float axis, pinning sub-range axes to their lower bound (audit F6).
+grid so table-mode FunnelEnv lookups hit stored rows (a clock axis that declares
+`_snap_step: 0.5`, say).  Float axes without a `_snap_step` are left continuous —
+an earlier version applied a hardcoded 0.5 ns step to every float axis, pinning
+sub-range axes to their lower bound (audit F6).
 
-Space dict schema (from KnobRegistry.space or _fallback_space)
----------------------------------------------------------------
+Space dict schema (from KnobRegistry.space)
+-------------------------------------------
 {
   axis_name: {
     "type": "int" | "float" | "categorical" | "bool",
@@ -58,40 +58,6 @@ from typing import Any
 # ── bootstrap (historical; removed for the installed package) ───────────────────────────────────────
 # [eda_rl] bootstrap removed (installed package): sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-# ── Fallback space (4-axis tinymac space) ─────────────────────────────────────
-
-def _fallback_space() -> dict:
-    """Minimal 4-axis tinymac design space used when KnobRegistry is unavailable.
-
-    Matches search_space_funnel.yaml exactly so offline tests and live campaigns
-    use the same domain.
-    """
-    return {
-        "mac_lanes": {
-            "type": "categorical",
-            "choices": [1, 2, 4, 8, 16, 32],
-            "default": 4,
-        },
-        "accumulator_width": {
-            "type": "categorical",
-            "choices": [16, 24, 32],
-            "default": 24,
-        },
-        "clock_period_ns": {
-            "type": "float",
-            "range": [3.0, 8.0],
-            "default": 5.0,
-            # grid_snap step (used when grid_snap=True)
-            "_snap_step": 0.5,
-        },
-        "abc_recipe": {
-            "type": "categorical",
-            "choices": ["orfs_speed", "orfs_area", "plain"],
-            "default": "plain",
-        },
-    }
-
-
 # ── Grid-snap helper ──────────────────────────────────────────────────────────
 
 
@@ -109,9 +75,8 @@ def _snap_config(config: dict, space: dict) -> dict:
     axis with no ``_snap_step`` is left untouched — the previous behaviour applied
     a hardcoded 0.5 ns default step to *every* float axis, which pinned sub-range
     axes (e.g. likith's IO_DELAY [0.0005, 0.002] or clock_period_ns [0.045, 0.070])
-    to their lower bound whenever grid_snap was on.  `_fallback_space()`'s clock
-    axis still declares ``_snap_step: 0.5`` so tinymac table-mode lookups keep
-    hitting stored rows.
+    to their lower bound whenever grid_snap was on.  A space whose clock axis
+    declares ``_snap_step`` keeps table-mode lookups hitting stored rows.
     """
     out = dict(config)
     for name, spec in space.items():
@@ -138,17 +103,17 @@ class CandidateGenerator:
 
     Parameters
     ----------
-    space      : axis-spec dict (from KnobRegistry.space or _fallback_space()).
+    space      : axis-spec dict (from KnobRegistry.space).
     sampler    : "tpe" | "surrogate_ucb" | "random".
     surrogate  : optional fitted Surrogate instance (funnel.surrogate.Surrogate).
                  Required for sampler="surrogate_ucb"; ignored for others.
     seed       : RNG seed (ensures deterministic campaigns).
     kappa      : UCB exploration coefficient μ + κ·σ (surrogate_ucb only).
     grid_snap  : if True, continuous axes are snapped to table-grid resolution.
-    reward_kind: "tinyvad" (default) or "generic" — must match the design's
-                 actual FunnelEnv._terminal_reward branch (design.is_tinyvad()),
-                 else surrogate_ucb ranks candidates with the wrong reward
-                 formula (TinyMAC anchors on a non-TinyVAD design).
+    reward_kind: "generic" (default) or a functional-model tag (e.g. "composite")
+                 — must match the design's actual FunnelEnv._terminal_reward
+                 branch (whether design.functional_model() is None), else
+                 surrogate_ucb ranks candidates with the wrong reward formula.
     refs       : PPA anchors for reward_kind="generic" — either a dict
                  ({area_ref_um2, fmax_ref_mhz, power_ref_mw}) or a zero-arg
                  callable returning one, so callers whose anchors update over
@@ -164,7 +129,7 @@ class CandidateGenerator:
         seed: int = 0,
         kappa: float = 1.0,
         grid_snap: bool = True,
-        reward_kind: str = "tinyvad",
+        reward_kind: str = "generic",
         refs: "dict | Any | None" = None,
     ) -> None:
         if sampler not in ("tpe", "surrogate_ucb", "random"):
@@ -592,7 +557,10 @@ if __name__ == "__main__":
     print("CandidateGenerator self-test")
     print("=" * 60)
 
-    space = _fallback_space()
+    # The self-test exercises the sampler on a concrete space; use the TinyVAD
+    # search space (imported explicitly — no design-family default in core).
+    from eda_rl.common.functional_models.tinyvad import tinyvad_search_space
+    space = tinyvad_search_space()
 
     # ── TEST 1: TPE finds near-optimum on synthetic quadratic ─────────────────
     print("\n--- TEST 1: TPE synthetic quadratic (seed=0) ---")
@@ -729,12 +697,12 @@ if __name__ == "__main__":
     assert snapped == probe, \
         f"_snap_config must not touch axes lacking _snap_step; got {snapped} from {probe}"
     # And a declared _snap_step axis IS still snapped.
-    fb = _fallback_space()
+    fb = tinyvad_search_space()
     snapped_clk = _snap_config({"clock_period_ns": 5.2, **{k: fb[k]["default"]
                                for k in ("mac_lanes", "accumulator_width", "abc_recipe")}}, fb)
     assert snapped_clk["clock_period_ns"] == 5.0, \
         f"declared _snap_step clock axis should snap 5.2->5.0, got {snapped_clk['clock_period_ns']}"
-    print("  _snap_config: sub-range likith axes pass through, tinymac clock still snaps  PASS")
+    print("  _snap_config: sub-range axes pass through, declared _snap_step clock still snaps  PASS")
 
     print("\n" + "=" * 60)
     print("All CandidateGenerator self-tests PASSED")
