@@ -12,9 +12,18 @@ Design-agnostic: works for any design that reached F3 — the metrics and the GD
 path are read straight from each episode's logged ``obs`` (area_um2, fmax_mhz,
 power_mw, timing_met, gds), so no variant names are re-derived.
 
-    eda-rl collect                                  # latest campaign, best picks
+Baseline comparison: by default collect also builds a **stock-default** version
+of the design — every knob pinned to its registry/YAML default (the "original,
+unoptimized" configuration) — runs it through the full F3 flow, and renders it
+as a BASELINE card. Every best-config card then shows its %-delta vs that
+baseline for area / Fmax / power. The baseline build needs ORFS (or
+PHYSICAL_MOCK=1 for a metrics-only baseline with no GDS); if it can't be built
+the page is produced without it. Disable with --no-baseline.
+
+    eda-rl collect                                  # latest campaign, best picks + baseline
     eda-rl collect --campaign all --top 5 --open
     eda-rl collect --out /tmp/best --render         # render layout PNGs (needs klayout)
+    eda-rl collect --no-baseline                    # skip the stock-default build
 """
 
 from __future__ import annotations
@@ -52,6 +61,16 @@ def _is_buildable(r: dict) -> bool:
         and _area(r) is not None
         and _fmax(r) is not None
     )
+
+
+# Mock F3 metrics are synthetic (TinyMAC-shaped, design-agnostic); a real ("ok")
+# build measures the actual chip.  The two live on different rulers, so a %-delta
+# between a mock and a real number is meaningless — collect refuses to draw it.
+_MOCK_STATUS = frozenset({"mock", "mock-proxy"})
+
+def _ruler(r: dict) -> str:
+    """'mock' if this F3 row's metrics are synthetic, else 'real'."""
+    return "mock" if _obs(r).get("status") in _MOCK_STATUS else "real"
 
 
 def _variant_of(r: dict) -> str:
@@ -114,6 +133,86 @@ def select_best(rows: list[dict], top: int = 3) -> list[dict]:
     return out
 
 
+# ── stock-default baseline build ──────────────────────────────────────────────
+
+def _default_config(space: dict) -> dict:
+    """Construct the 'original, unoptimized' config: every axis at its default.
+
+    Mirrors run_funnel_optimizer._surrogate_covers' probe config — default →
+    first choice → range low — so the result is a valid point in the design's
+    own space (including YAML overrides like likith's PDN-safe CORE_UTILIZATION
+    default). Int axes are rounded so the sampler/log/emission agree.
+    """
+    cfg: dict = {}
+    for axis, spec in space.items():
+        if "default" in spec:
+            val = spec["default"]
+        elif spec.get("choices"):
+            val = spec["choices"][0]
+        elif spec.get("range"):
+            val = spec["range"][0]
+        else:
+            continue
+        if spec.get("type") == "int" and isinstance(val, (int, float)):
+            val = int(round(float(val)))
+        cfg[axis] = val
+    return cfg
+
+
+def build_baseline(design: str | None, platform: str, max_tier: int,
+                   results_path: Path) -> dict | None:
+    """Build the stock-default design and return it as a collect-style pick row.
+
+    Runs one real F3 (RTL→GDS) build of the all-defaults config via FunnelEnv's
+    ``commit`` action and reads back ``env.terminal_obs`` — the same obs shape
+    (area_um2/fmax_mhz/power_mw/gds/…) the campaign log carries, so it flows
+    through the existing copy/render/manifest path unchanged.
+
+    Returns None (and prints why) if the funnel is unavailable, the knob space
+    can't be built, or the F3 build produced no usable metrics — the caller then
+    renders the page without a baseline. Needs ORFS unless PHYSICAL_MOCK=1 (which
+    yields a metrics-only baseline with no GDS).
+    """
+    try:
+        from eda_rl.funnel.env import FunnelEnv
+        from eda_rl.funnel.run_funnel_optimizer import _build_space
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [baseline] funnel env unavailable ({exc}); omitting baseline.", file=sys.stderr)
+        return None
+
+    try:
+        space = _build_space(design, platform, max_tier)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [baseline] could not build knob space ({exc}); omitting baseline.", file=sys.stderr)
+        return None
+
+    cfg = _default_config(space)
+    results_path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"  [baseline] building stock-default config (max_tier={max_tier}) — a full F3 flow, this can take minutes…")
+    try:
+        env = FunnelEnv(
+            platform=platform, design=design, max_tier=max_tier,
+            active_space=space, budget_s=1e9, results_path=results_path,
+        )
+        env.reset(cfg)
+        env.step("commit")          # jump straight to F3 (terminal)
+        obs = env.terminal_obs
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [baseline] F3 build failed ({exc}); omitting baseline.", file=sys.stderr)
+        return None
+
+    if (obs.get("status") not in ("ok", "mock", "mock-proxy")
+            or obs.get("area_um2") is None or obs.get("fmax_mhz") is None):
+        print(f"  [baseline] build produced no usable metrics "
+              f"(status={obs.get('status')!r}); omitting baseline.", file=sys.stderr)
+        return None
+
+    row = {"config": cfg, "obs": obs, "fidelity": "F3", "status": obs.get("status")}
+    row["_badge"], row["_sublabel"], row["_variant"] = (
+        "BASELINE", "stock default (all knobs at default)", _variant_of(row))
+    return row
+
+
 # ── GDS rendering (optional) ──────────────────────────────────────────────────
 
 def _render_gds(gds: Path, platform: str, out_png: Path, size: int = 1400) -> bool:
@@ -154,9 +253,15 @@ header .sub{font-size:13px;color:#64748b;margin-top:5px}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:16px;padding:20px 32px 32px}
 .card{background:#1e293b;border-radius:12px;overflow:hidden;border:2px solid #2563eb;display:flex;flex-direction:column}
 .card.best{border-color:#059669}
+.card.base{border-color:#d97706}
 .chead{padding:14px 16px 12px;background:#0f172a}
 .badge{display:inline-block;font-size:10px;font-weight:800;letter-spacing:.08em;color:#fff;background:#1e3a8a;padding:3px 8px;border-radius:4px;margin-bottom:8px}
 .card.best .badge{background:#065f46}
+.card.base .badge{background:#b45309}
+.dlt{font-size:10px;font-weight:700;margin-left:6px}
+.dlt.good{color:#34d399}
+.dlt.bad{color:#f87171}
+.dlt.neu{color:#64748b}
 .title{font-size:16px;font-weight:700;color:#f8fafc}
 .csub{font-size:11px;color:#64748b;margin-top:2px}
 .limg{padding:10px 12px 4px}
@@ -168,15 +273,35 @@ td{padding:4px 12px;color:#cbd5e1}
 .v{font-family:'SF Mono',monospace;font-size:11.5px;color:#e2e8f0}
 tr:hover td{background:rgba(255,255,255,.03)}
 .foot{padding:14px 32px;border-top:1px solid #1e293b;color:#475569;font-size:12px}
+.warn{margin:16px 32px 0;padding:11px 15px;background:#3b2410;border:1px solid #b45309;border-radius:8px;color:#fbbf24;font-size:12.5px;line-height:1.5}
 """
 
 
-def _card(r: dict, img_b64: str | None) -> str:
+def _delta_span(v, base, lower_is_better: bool) -> str:
+    """Return a `<span>` with the %-delta of v vs the baseline, coloured
+    good/bad by whether the change is an improvement. Empty string when either
+    value is missing or the baseline is zero."""
+    if v is None or base is None or base == 0:
+        return ""
+    pct = (v - base) / abs(base) * 100.0
+    if abs(pct) < 0.05:
+        return " <span class='dlt neu'>±0.0%</span>"
+    improved = (pct < 0) if lower_is_better else (pct > 0)
+    cls = "good" if improved else "bad"
+    return f" <span class='dlt {cls}'>{pct:+.1f}%</span>"
+
+
+def _card(r: dict, img_b64: str | None, baseline: dict | None = None) -> str:
     o = _obs(r)
     cfg = r.get("config") or {}
+    is_base = r["_badge"] == "BASELINE"
     best = r["_badge"] in ("BEST OVERALL", "TOP-1")
+    cls = "base" if is_base else ("best" if best else "")
+    # Deltas are shown on every non-baseline card once a baseline exists.
+    bo = (baseline or {}) if not is_base else {}
     img = (f'<img src="data:image/png;base64,{img_b64}" alt="layout">' if img_b64
            else '<div class="noimg">layout not rendered<br>(run with --render + klayout)</div>')
+    title = "stock default" if is_base else _cfg_label(r)
     rows = [("Config", _cfg_label(r)), ("Variant", r["_variant"])]
     # show a few salient config knobs
     for k in ("mac_lanes", "accumulator_width", "clock_period_ns", "abc_recipe"):
@@ -184,39 +309,55 @@ def _card(r: dict, img_b64: str | None) -> str:
             v = cfg[k]
             rows.append((k, f"{v:.3f}" if isinstance(v, float) else str(v)))
     rows += [
-        ("Area", f"{_area(r):,.0f} µm²"),
-        ("Fmax", f"{_fmax(r):,.0f} MHz"),
+        ("Area", f"{_area(r):,.0f} µm²" + _delta_span(_area(r), bo.get("area_um2"), True)),
+        ("Fmax", f"{_fmax(r):,.0f} MHz" + _delta_span(_fmax(r), bo.get("fmax_mhz"), False)),
     ]
     if _cells(r) is not None:
-        rows.append(("Cells", f"{_cells(r):,.0f}"))
+        rows.append(("Cells", f"{_cells(r):,.0f}" + _delta_span(_cells(r), bo.get("cell_count"), True)))
     if _ffs(r) is not None:
         rows.append(("FFs", f"{_ffs(r):,.0f}"))
     if _power(r) is not None:
-        rows.append(("Power", f"{_power(r):.1f} mW"))
+        rows.append(("Power", f"{_power(r):.1f} mW" + _delta_span(_power(r), bo.get("power_mw"), True)))
     rows.append(("Timing", "✅ met" if _timing(r) else "❌ not met"))
     sc = episode_value(r)
     if sc is not None:
         rows.append(("Score", f"{sc:.3f}"))
     body = "".join(f"<tr><td class='k'>{k}</td><td class='v'>{v}</td></tr>" for k, v in rows)
     return (
-        f'<div class="card{" best" if best else ""}">'
+        f'<div class="card{" " + cls if cls else ""}">'
         f'<div class="chead"><span class="badge">{r["_badge"]}</span>'
-        f'<div class="title">{_cfg_label(r)}</div><div class="csub">{r["_sublabel"]}</div></div>'
+        f'<div class="title">{title}</div><div class="csub">{r["_sublabel"]}</div></div>'
         f'<div class="limg">{img}</div><table><tbody>{body}</tbody></table></div>'
     )
 
 
-def build_page(picks: list[dict], design: str, platform: str, imgs: dict[str, str | None]) -> str:
-    cards = "".join(_card(r, imgs.get(r["_variant"])) for r in picks)
+def build_page(picks: list[dict], design: str, platform: str, imgs: dict[str, str | None],
+               baseline: dict | None = None, deltas: bool = True,
+               ruler_warning: str | None = None) -> str:
+    # Deltas are only drawn when the baseline and the campaign were measured on
+    # the same ruler (both real, or both mock); `deltas=False` keeps the baseline
+    # card but drops the misleading %-annotations.
+    baseline_obs = _obs(baseline) if (baseline and deltas) else None
+    cards = "".join(_card(r, imgs.get(r["_variant"]), baseline_obs) for r in picks)
+    sub = (f'{len(picks)} standout designs harvested from the funnel optimizer · '
+           f'GDS + reports collected alongside this page')
+    if baseline is not None:
+        sub += (' · deltas vs the stock-default baseline' if deltas
+                else ' · baseline shown for reference (deltas suppressed)')
+    banner = (f'<div class="warn">⚠ {ruler_warning}</div>' if ruler_warning else '')
+    foot = ("Each card's 6_final.gds and ORFS report were copied into this folder. "
+            "See best_configs.json for the full manifest.")
+    if baseline is not None and deltas:
+        foot = ("The BASELINE card is the stock-default design (all knobs at default); "
+                "every other card's %-deltas are measured against it. ") + foot
     return (
         f'<!doctype html><html><head><meta charset="utf-8">'
         f'<title>{design} — best optimized configs</title><style>{_CSS}</style></head><body>'
         f'<header><h1>{design} · {platform} · best optimized configurations</h1>'
-        f'<p class="sub">{len(picks)} standout designs harvested from the funnel optimizer · '
-        f'GDS + reports collected alongside this page</p></header>'
+        f'<p class="sub">{sub}</p></header>'
+        f'{banner}'
         f'<div class="grid">{cards}</div>'
-        f'<div class="foot">Each card\'s 6_final.gds and ORFS report were copied into this folder. '
-        f'See best_configs.json for the full manifest.</div></body></html>'
+        f'<div class="foot">{foot}</div></body></html>'
     )
 
 
@@ -232,6 +373,10 @@ def main() -> None:
     ap.add_argument("--out", default=None, help="output directory (default: best_configs/<design>_<platform>)")
     ap.add_argument("--top", type=int, default=3, help="how many top-by-score configs to include (default 3)")
     ap.add_argument("--render", action="store_true", help="render layout PNGs with KLayout (needs klayout + ORFS_DIR)")
+    ap.add_argument("--no-baseline", action="store_true",
+                    help="skip building the stock-default baseline (no F3 baseline build / delta comparison)")
+    ap.add_argument("--max-tier", type=int, default=None,
+                    help="knob tier for the baseline's default config (default: read from the campaign log)")
     ap.add_argument("--open", action="store_true", help="open the comparison page in a browser")
     args = ap.parse_args()
 
@@ -252,10 +397,27 @@ def main() -> None:
     out_dir = Path(args.out) if args.out else Path.cwd() / "best_configs" / f"{design}_{platform}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # ── stock-default baseline (built here, prepended so it flows through the
+    # same copy/render/manifest path and lands as the first card) ──────────────
+    baseline: dict | None = None
+    if not args.no_baseline:
+        # The campaign log records the design identifier and knob tier it ran
+        # under; prefer them (design.name from the path may be the yosys top,
+        # not the DesignSpec.load key the campaign used).
+        meta = next((r for r in rows if r.get("max_tier") is not None), {})
+        design_id = meta.get("design") or design
+        max_tier = args.max_tier if args.max_tier is not None else int(meta.get("max_tier", 1))
+        baseline = build_baseline(
+            design_id, platform, max_tier,
+            out_dir / "_baseline_build" / "funnel_baseline.jsonl",
+        )
+
+    render_picks = ([baseline] if baseline is not None else []) + picks
+
     manifest = []
     imgs: dict[str, str | None] = {}
-    print(f"Collecting {len(picks)} configs → {out_dir}")
-    for r in picks:
+    print(f"Collecting {len(render_picks)} configs → {out_dir}")
+    for r in render_picks:
         v = r["_variant"]
         cdir = out_dir / f"{r['_badge'].replace(' ', '_')}__{v}"
         cdir.mkdir(parents=True, exist_ok=True)
@@ -289,8 +451,32 @@ def main() -> None:
         print(f"  [{r['_badge']:<12}] {_cfg_label(r):<14} "
               f"area={_area(r):>8,.0f}µm²  fmax={_fmax(r):>6,.0f}MHz  → {status}")
 
+    # Deltas are only meaningful when the baseline and the campaign's best
+    # configs were measured the same way.  The baseline is always freshly built
+    # here (real ORFS, or mock under PHYSICAL_MOCK=1); the picks come from the
+    # log and may be the other ruler (e.g. a mock-generated campaign vs a real
+    # baseline).  Mixing them yields nonsense %-deltas — the exact "measure the
+    # chip, not the ruler" trap — so detect the mismatch and suppress deltas.
+    deltas = True
+    ruler_warning: str | None = None
+    if baseline is not None:
+        base_ruler = _ruler(baseline)
+        pick_rulers = {_ruler(p) for p in picks}
+        if pick_rulers != {base_ruler}:
+            deltas = False
+            ruler_warning = (
+                f"Deltas suppressed: the baseline was built on the "
+                f"'{base_ruler}' ruler but the campaign's best configs are "
+                f"'{'/'.join(sorted(pick_rulers))}'. A real-vs-mock (or "
+                f"cross-ruler) %-delta is meaningless. Re-run the campaign with "
+                f"real ORFS — or collect with PHYSICAL_MOCK=1 to match a mock "
+                f"campaign — for comparable numbers."
+            )
+            print(f"  [WARNING] {ruler_warning}", file=sys.stderr)
+
     (out_dir / "best_configs.json").write_text(json.dumps(manifest, indent=2))
-    html = build_page(picks, design, platform, imgs)
+    html = build_page(render_picks, design, platform, imgs, baseline=baseline,
+                      deltas=deltas, ruler_warning=ruler_warning)
     html_path = out_dir / "best_configs.html"
     html_path.write_text(html, encoding="utf-8")
     print(f"\nManifest → {out_dir / 'best_configs.json'}")

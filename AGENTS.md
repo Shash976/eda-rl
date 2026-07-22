@@ -58,7 +58,17 @@ eda-rl optimize --design gcd --platform nangate45 --budget-hours 4 \
        --sampler tpe|surrogate_ucb|random --promotion fixed|linucb|random \
        --max-tier N       # N must cover the design's declared knobs — doctor prints the minimum
 eda-rl report  --campaign latest --open        # static HTML (Pareto, funnel, importances…)
-eda-rl collect --campaign latest --render      # best GDS + before/after page
+eda-rl collect --campaign latest --render      # best GDS + comparison page.
+                                               # Also builds a stock-default
+                                               # BASELINE (all knobs at default,
+                                               # a real F3 build; needs ORFS or
+                                               # PHYSICAL_MOCK=1) and shows each
+                                               # best config's %-delta vs it.
+                                               # Deltas are auto-suppressed (with
+                                               # a warning) when baseline and
+                                               # campaign are on different rulers
+                                               # (real vs mock). --no-baseline
+                                               # skips the baseline build.
 eda-rl build-table --design gcd --max-tier 2   # offline F0–F2 table (resumable)
 eda-rl benchmark --seeds 20                    # promotion-policy table benchmark
 eda-rl dashboard --log <campaign jsonl> --port 8080   # live Optuna view; pass --log
@@ -123,7 +133,7 @@ legacy/             # frozen history, outside the package: gen1/, dead modules,
 | `run_funnel_optimizer.py` | Live campaign driver (`eda-rl optimize`). Probes any auto-loaded surrogate against the campaign design's space; drops it loudly on schema mismatch. |
 | `build_table.py` | Resumable offline F0–F2 table builder. |
 | `benchmark_funnel.py` | Table-simulator benchmark: random vs fixed vs LinUCB. Scores the **pure terminal reward** (`info["terminal_reward"]`), never the shaped accumulator. |
-| `collect_best.py` | `eda-rl collect` — harvest best F3 builds. |
+| `collect_best.py` | `eda-rl collect` — harvest best F3 builds; also builds a stock-default BASELINE (all knobs at default, real F3) and renders each best config's %-delta vs it, suppressing deltas on a real-vs-mock ruler mismatch. |
 | `fit_surrogate.py` | `eda-rl fit-surrogate` — mine campaign logs, fit + CV-validate the surrogate. |
 | `doctor.py` | `eda-rl doctor` — per-design preflight (parsers, knob-range coherence, PDN util floor). |
 
