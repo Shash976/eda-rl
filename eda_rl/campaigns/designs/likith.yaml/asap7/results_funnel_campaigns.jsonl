@@ -1,0 +1,1 @@
+{"campaign_summary": {"campaign_id": "campaign_0_1783716843", "best_config": null, "best_reward": null, "n_episodes": 0, "n_f3": 0, "n_killed": 0, "per_fidelity": {"F0": 0, "F1": 0, "F2": 0, "F3": 0}, "elapsed_s": 0.3, "simulated_s": 0.0, "sampler": "tpe", "promotion": "linucb", "seed": 0, "platform": "asap7", "design": "designs/likith.yaml", "max_tier": 3}}
