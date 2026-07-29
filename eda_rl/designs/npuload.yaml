@@ -1,0 +1,80 @@
+# designs/npuload.yaml — "NPUload" prefill-accelerator design from
+# Downloads/checkdesigns/NPUload.
+#
+# NOT vendored — rtl_files are absolute paths into a local Downloads checkout,
+# machine-specific and not portable. Point EDA_RL_DESIGN_ROOT elsewhere or
+# edit this path if the bundle moves.
+#
+# IMPORTANT — verified by reading the RTL, not just the README/npu_config.yaml:
+#   - Of the three checkdesigns bundles (tpu, tensordyne, npuload), this is
+#     the only one with no dead RTL: npu_prefill_core.v is a single
+#     self-contained leaf module (no further submodules to wire up).
+#   - top is npu_prefill_core directly, NOT the bundle's own npu_system_top
+#     wrapper. npu_system_top hardcodes all four of core's parameters at its
+#     instantiation (.MATRIX_SIZE(32), .DATA_WIDTH(16), …) and only exists to
+#     give the bundle's own testbench fixed test-stimulus ports — going
+#     through it would make the real parameters unreachable via
+#     VERILOG_TOP_PARAMS chparam overrides.
+#   - Of the four declared module parameters, MATRIX_SIZE is DEAD — grepped
+#     the whole file, it's referenced nowhere in the logic body (only in the
+#     port comment and the parameter declaration itself). Excluded from
+#     params below. DATA_WIDTH, SRAM_DEPTH, NUM_CLUSTERS are all real (they
+#     size actual register arrays / loop bounds at lines 66/77-82/217 etc.).
+#   - `power_estimate`/`thermal_estimate` output ports (wired to
+#     power_out/thermal_out in npu_system_top) are the design's OWN
+#     self-reported RTL registers, not anything OpenSTA/OpenROAD measures —
+#     eda-rl ignores them entirely and scores real post-synthesis
+#     area/Fmax/power instead.
+#   - sim/npu_tb.cpp has no golden-model/scoreboard check (drives a scripted
+#     phase sequence, records the self-reported power/thermal signals above,
+#     never reads back `result` or compares it to an expected value) — hence
+#     functional_eval: none below.
+#   - CAUTION: at the as-shipped default SRAM_DEPTH=4096, `sram` (line 66) is
+#     a 4096 x DATA_WIDTH flip-flop array (no macro/SRAM-compiler flow is
+#     configured for this design) — that's ~64K flops for a "trivial" design,
+#     likely very slow/large at F2/F3. Default below is deliberately reduced
+#     to 256 for a tractable first doctor probe; 4096 is kept in `choices` as
+#     the as-shipped point once you've confirmed synthesis time is acceptable.
+
+name: npuload
+top:  npu_prefill_core
+
+rtl_files:
+  - /home/shashwat/Downloads/checkdesigns/checkdesigns/NPUload/npu_prefill_core.v
+
+clock_port: clk
+
+# RTL chparam axes via VERILOG_TOP_PARAMS. rtl_param_name gives the actual
+# Verilog parameter name; MATRIX_SIZE omitted (dead, see note above).
+params:
+  data_width:
+    choices: [8, 16, 32]
+    default: 16
+    rtl_param_name: DATA_WIDTH
+  sram_depth:
+    choices: [64, 128, 256, 512, 1024, 4096]
+    default: 256
+    rtl_param_name: SRAM_DEPTH
+  num_clusters:
+    choices: [1, 2, 4, 8, 16]
+    default: 8
+    rtl_param_name: NUM_CLUSTERS
+
+# UNVERIFIED — no ORFS reference SDC ships with this design.
+# npu_config.yaml (the bundle's own PowerTool spec, not an ORFS artifact)
+# claims a 500 MHz target (2.0 ns) — used only as a rough anchor here, not a
+# validated number. Run
+# `eda-rl doctor --design npuload --platform nangate45 --probe-f3` and narrow it.
+platforms:
+  nangate45:
+    clock_range_ns: [1.0, 4.0]
+    default_clock_ns: 2.0
+
+# has_macros: false — the `sram` array is a plain reg array (flip-flops via
+# generic synth), not a macro/SRAM-compiler instance; see CAUTION above.
+has_macros: false
+
+# functional_eval: none — see note above; npu_tb.cpp has no correctness check
+# to build an F1 plugin against. F0 is legality/validate_config only.
+functional_eval:
+  kind: none
