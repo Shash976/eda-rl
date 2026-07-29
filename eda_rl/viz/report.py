@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """report.py — static self-contained HTML report for a funnel-optimizer campaign.
 
-    eda-rl report                       # latest campaign
+    eda-rl report                                    # latest campaign
     eda-rl report --campaign all
-    eda-rl report --log tinymac_accel_run1.jsonl --open
-    eda-rl report --out /tmp/run.html
+    eda-rl report --design gcd --platform nangate45 --open
+    eda-rl report --log some_campaign.jsonl --out /tmp/run.html
 
 Produces one HTML file (Plotly CDN, no server) with:
   - optimization history: per-episode reward + best-so-far, vs episode and vs
@@ -27,11 +27,11 @@ from pathlib import Path
 # [eda_rl] bootstrap removed (installed package): sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from eda_rl.viz.campaign_data import (  # noqa: E402
-    DEFAULT_LOG,
     CampaignData,
     build_study,
     episode_value,
     obs_objective,
+    resolve_log_path,
 )
 
 _FIDELITY_COLORS = {
@@ -909,10 +909,14 @@ def write_html(figs, out_path: Path, title: str, subtitle: str = ""):
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Static HTML report for a campaign log")
-    ap.add_argument("--log",
-                    default=str(DEFAULT_LOG) if DEFAULT_LOG is not None else None,
-                    required=(DEFAULT_LOG is None),
-                    help="campaign JSONL path (required when no results_funnel_campaigns.jsonl exists)")
+    ap.add_argument("--design", default=None,
+                    help="design name, e.g. 'sagar' — resolves the campaign log for you "
+                         "(pair with --platform; preferred over --log)")
+    ap.add_argument("--platform", default=None,
+                    help="platform name, e.g. 'sky130hd' (pair with --design)")
+    ap.add_argument("--log", default=None,
+                    help="campaign JSONL path (overrides --design/--platform; "
+                         "default: most-recently-modified log under eda_rl/campaigns/)")
     ap.add_argument("--campaign", default="latest",
                     help="campaign_id | 'latest' | 'all'")
     ap.add_argument("--out", default=None, help="output HTML path")
@@ -923,9 +927,10 @@ def main() -> None:
     ap.add_argument("--open", action="store_true", help="open the report in a browser")
     args = ap.parse_args()
 
-    data = CampaignData.load(args.log, args.campaign)
+    log_path = resolve_log_path(args.log, args.design, args.platform)
+    data = CampaignData.load(log_path, args.campaign)
     if not data.rows:
-        print(f"No episodes found in {args.log} for campaign={args.campaign!r}")
+        print(f"No episodes found in {log_path} for campaign={args.campaign!r}")
         sys.exit(1)
 
     f3_count = sum(1 for r in data.rows if r.get("fidelity") == "F3" and _f3_status_ok(r))
@@ -933,7 +938,6 @@ def main() -> None:
           f"{len(data.specs)} params, {f3_count} F3 results)")
 
     # ── infer design / platform from the log path for a human-readable title ──
-    log_path = Path(args.log)
     platform = log_path.parent.name
     design   = log_path.parent.parent.name
     title    = f"{design} · {platform} · {f3_count} Full P&R Builds"

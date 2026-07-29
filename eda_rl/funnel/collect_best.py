@@ -21,6 +21,7 @@ PHYSICAL_MOCK=1 for a metrics-only baseline with no GDS); if it can't be built
 the page is produced without it. Disable with --no-baseline.
 
     eda-rl collect                                  # latest campaign, best picks + baseline
+    eda-rl collect --design gcd --platform nangate45  # pick a campaign by design/platform
     eda-rl collect --campaign all --top 5 --open
     eda-rl collect --out /tmp/best --render         # render layout PNGs (needs klayout)
     eda-rl collect --no-baseline                    # skip the stock-default build
@@ -36,7 +37,7 @@ import sys
 import webbrowser
 from pathlib import Path
 
-from eda_rl.viz.campaign_data import DEFAULT_LOG, load_campaign_rows, episode_value
+from eda_rl.viz.campaign_data import load_campaign_rows, episode_value, resolve_log_path
 
 
 # ── metric accessors ──────────────────────────────────────────────────────────
@@ -366,9 +367,14 @@ def build_page(picks: list[dict], design: str, platform: str, imgs: dict[str, st
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="Collect the best configs from a campaign: GDS + report + comparison page")
-    ap.add_argument("--log", default=str(DEFAULT_LOG) if DEFAULT_LOG is not None else None,
-                    required=(DEFAULT_LOG is None),
-                    help="campaign JSONL path (default: latest under campaigns/)")
+    ap.add_argument("--design", default=None,
+                    help="design name, e.g. 'sagar' — resolves the campaign log for you "
+                         "(pair with --platform; preferred over --log)")
+    ap.add_argument("--platform", default=None,
+                    help="platform name, e.g. 'sky130hd' (pair with --design)")
+    ap.add_argument("--log", default=None,
+                    help="campaign JSONL path (overrides --design/--platform; "
+                         "default: most-recently-modified log under eda_rl/campaigns/)")
     ap.add_argument("--campaign", default="latest", help="campaign_id | 'latest' | 'all'")
     ap.add_argument("--out", default=None, help="output directory (default: best_configs/<design>_<platform>)")
     ap.add_argument("--top", type=int, default=3, help="how many top-by-score configs to include (default 3)")
@@ -380,9 +386,10 @@ def main() -> None:
     ap.add_argument("--open", action="store_true", help="open the comparison page in a browser")
     args = ap.parse_args()
 
-    rows = load_campaign_rows(args.log, args.campaign)
+    log_path = resolve_log_path(args.log, args.design, args.platform)
+    rows = load_campaign_rows(log_path, args.campaign)
     if not rows:
-        print(f"No episodes found in {args.log} for campaign={args.campaign!r}", file=sys.stderr)
+        print(f"No episodes found in {log_path} for campaign={args.campaign!r}", file=sys.stderr)
         sys.exit(1)
 
     picks = select_best(rows, top=args.top)
@@ -391,7 +398,6 @@ def main() -> None:
               file=sys.stderr)
         sys.exit(1)
 
-    log_path = Path(args.log)
     platform = log_path.parent.name
     design = log_path.parent.parent.name
     out_dir = Path(args.out) if args.out else Path.cwd() / "best_configs" / f"{design}_{platform}"
