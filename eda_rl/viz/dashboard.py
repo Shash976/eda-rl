@@ -11,7 +11,7 @@ run_funnel_optimizer.py runs.
     eda-rl dashboard
 
     # follow a live run (in another terminal, while the optimizer writes the log)
-    eda-rl dashboard --live --log tinymac_accel_run1.jsonl
+    eda-rl dashboard --live --design gcd --platform nangate45
 
     # just rebuild the study file without launching the server
     eda-rl dashboard --no-serve --storage /tmp/funnel.db
@@ -23,6 +23,7 @@ it live; deleting it forces a clean rebuild (or pass --rebuild).
 from __future__ import annotations
 
 import argparse
+import socket
 import subprocess
 import sys
 import time
@@ -30,7 +31,25 @@ from pathlib import Path
 
 # [eda_rl] bootstrap removed (installed package): sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from eda_rl.viz.campaign_data import DEFAULT_LOG, build_study, load_campaign_rows  # noqa: E402
+from eda_rl.viz.campaign_data import build_study, load_campaign_rows, resolve_log_path  # noqa: E402
+
+
+def _free_port(host: str, port: int, tries: int = 100) -> int:
+    """Return the first bindable port at/after `port` on `host`.
+
+    Lets a second dashboard come up instead of dying on
+    'Address already in use' when another one already owns the port.
+    """
+    for candidate in range(port, port + tries):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind((host, candidate))
+                return candidate
+            except OSError:
+                continue
+    raise SystemExit(
+        f"no free port in [{port}, {port + tries}) on {host}")
 
 
 def _make_storage(path: Path):
@@ -49,7 +68,14 @@ def _sync(storage, log_path: Path, campaign: str, study_name: str) -> int:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Live Optuna dashboard for a campaign log")
-    ap.add_argument("--log", default=str(DEFAULT_LOG), help="campaign JSONL")
+    ap.add_argument("--design", default=None,
+                    help="design name, e.g. 'sagar' — resolves the campaign log for you "
+                         "(pair with --platform; preferred over --log)")
+    ap.add_argument("--platform", default=None,
+                    help="platform name, e.g. 'sky130hd' (pair with --design)")
+    ap.add_argument("--log", default=None,
+                    help="campaign JSONL path (overrides --design/--platform; "
+                         "default: most-recently-modified log under eda_rl/campaigns/)")
     ap.add_argument("--campaign", default="latest",
                     help="campaign_id | 'latest' | 'all'")
     ap.add_argument("--storage", default=None,
@@ -67,7 +93,7 @@ def main() -> None:
                     help="build/sync the study but do not launch the dashboard")
     args = ap.parse_args()
 
-    log_path = Path(args.log)
+    log_path = resolve_log_path(args.log, args.design, args.platform)
     if not log_path.exists():
         print(f"campaign log not found: {log_path}")
         sys.exit(1)
@@ -88,11 +114,16 @@ def main() -> None:
     if args.no_serve:
         return
 
-    # Launch optuna-dashboard against the journal storage.
+    # Launch optuna-dashboard against the journal storage. If the requested
+    # port is taken (e.g. another dashboard is already running), roll forward
+    # to the next free one instead of crashing.
+    port = _free_port(args.host, args.port)
+    if port != args.port:
+        print(f"port {args.port} busy → using {port}")
     cmd = ["optuna-dashboard", str(storage_path),
-           "--host", args.host, "--port", str(args.port)]
+           "--host", args.host, "--port", str(port)]
     print(f"Launching: {' '.join(cmd)}")
-    print(f"  → open http://{args.host}:{args.port}/  (study: {study_name})")
+    print(f"  → open http://{args.host}:{port}/  (study: {study_name})")
     proc = subprocess.Popen(cmd)
 
     try:
