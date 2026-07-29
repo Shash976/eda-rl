@@ -1,0 +1,50 @@
+# designs/tpu.yaml — "TPU Reference" design from Downloads/checkdesigns/TPU.
+#
+# NOT vendored — rtl_files are absolute paths into a local Downloads checkout,
+# machine-specific and not portable (unlike gcd.yaml/likith.yaml). Point
+# EDA_RL_DESIGN_ROOT elsewhere or edit these paths if the bundle moves.
+#
+# IMPORTANT — verified by reading the RTL, not just the README:
+#   - The bundle's README/Makefile advertise a "256x256 systolic array" TPU
+#     with a matrix_engine.v + host_interface.v. tpu_top.v does NOT instantiate
+#     either module — it is a standalone ~5-register FSM. Those two files are
+#     dead code w.r.t. the actual top-level hierarchy and are deliberately
+#     EXCLUDED below; only wire them in (and add them here) if you first fix
+#     tpu_top.v to actually instantiate them.
+#   - The bundle's own Makefile references RTL/sim files that don't exist in
+#     this bundle at all (systolic_array.v, riscv_decoder.v, napier_sim.cpp,
+#     …) — those belong to the separate "tensordyne" bundle (designs/
+#     tensordyne.yaml); this Makefile is stale/copy-pasted and eda-rl ignores
+#     it entirely (eda-rl drives ORFS itself, never this design's own
+#     Makefile/synth/inputs/sim).
+#   - sim/tpu_sim.cpp has no golden-model/scoreboard check (fixed 1000-cycle
+#     loop, one write, one read, no comparison to an expected result) — hence
+#     functional_eval: none below; there is nothing for an F1 plugin to parse.
+
+name: tpu
+top:  tpu_top
+
+rtl_files:
+  - /home/shashwat/Downloads/checkdesigns/checkdesigns/TPU/rtl/tpu_top.v
+
+clock_port: clk
+
+# No RTL chparam axes — tpu_top.v declares no module parameters.
+params: {}
+
+# UNVERIFIED — no ORFS reference SDC ships with this design and no real
+# synthesis run has been done. tpu_top is a tiny handful of registers (smaller
+# than gcd), so this range is a rough starting guess; run
+# `eda-rl doctor --design tpu --platform nangate45 --probe-f3` and narrow it.
+platforms:
+  nangate45:
+    clock_range_ns: [0.5, 3.0]
+    default_clock_ns: 1.5
+
+# has_macros: false — no SRAM/macro instances in tpu_top.v.
+has_macros: false
+
+# functional_eval: none — see note above; tpu_sim.cpp has no correctness
+# check to build an F1 plugin against. F0 is legality/validate_config only.
+functional_eval:
+  kind: none
