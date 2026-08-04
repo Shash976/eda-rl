@@ -392,6 +392,24 @@ design opts in via `functional_eval.kind`; `base.py` is the interface,
     `--memory-limit-gb` (ulimit -v) makes a greedy build fail cleanly instead of
     OOM-killing its peers.
   - `W=1` runs the serial code path verbatim — no threads, no scheduler.
+  - **Measured, and it is not a free win.** On this 4-core box (sagar/sky130hd,
+    `--max-f3 4`, isolated `EDA_RL_WORK` per run so nothing is cache-shared):
+
+    | | builds | Σ build time | wall | overlap |
+    |---|---|---|---|---|
+    | `--jobs 1` | 5 | 143.1 s | 143.1 s | 1.00× |
+    | `--jobs 2` | 6 | 244.6 s | 137.0 s | **1.79×** |
+
+    The scheduler works — 1.79× of a theoretical 2× overlap. But wall clock
+    improved only 4 %, because `--openroad-threads` defaults to
+    `cpu_count // jobs`, so each build drops from 4 threads to 2 and slows from
+    ~33 s to ~63 s. This flow scales near-linearly with cores, so on a saturated
+    4-core box 1 build × 4 threads ≈ 2 builds × 2 threads. **`--jobs` pays off
+    when you have cores a single build cannot saturate** (AutoTuner's Ray-cluster
+    regime), not on a small box. Benchmark it on your hardware before assuming a
+    speedup — and never benchmark two runs that share a work dir, since
+    `run_physical` reuses an existing `6_final.gds` and cache hits (~0.9 s) will
+    fake a 3× win.
 - **All tool subprocesses are process-group-killed on timeout/failure**
   (`_run_capture`/`_killpg` for the proxy/elaborate/reference-STA paths, the
   same pattern `run_physical` uses). No detached yosys/openroad survivors.
