@@ -462,9 +462,19 @@ seconds).
 
 - **Branch before committing on `main`.** Commit messages end with a
   `Done by an AI agent` line instead of a co-author trailer.
-- **Don't commit run artifacts.** Per-fidelity traces (`funnel_*.jsonl`) are
-  gitignored; only small example campaign logs under `campaigns/` are
-  committed. `eda_rl/results/funnel/*.joblib` is gitignored.
+- **Don't commit run artifacts.** Per-fidelity traces are gitignored under
+  `campaigns/**` in all three naming schemes the repo has used — `funnel_*.jsonl`
+  (current), `campaign_<ts>.jsonl` and `run<N>.jsonl` (older). This rule was
+  stated here long before it was enforced: 8.5 MB of traces were tracked anyway,
+  including a 5.2 MB and a 3.0 MB file, and are now untracked. Only the
+  per-episode `results_funnel_campaigns.jsonl` belongs in git.
+  `eda_rl/results/funnel/*.joblib` is gitignored.
+- **Self-tests never write to tracked corpora.** `FunnelEnv`'s default
+  `results_path` is the tracked `results/funnel/results_funnel.jsonl`, so any
+  self-test constructing an env without an explicit path silently appends mock
+  rows to it (this happened; caught only because the file showed up dirty in
+  `git status`). Pass a `tempfile.TemporaryDirectory()` path, as
+  `build_table` already does under `PHYSICAL_MOCK`.
 - A non-TinyMAC design needs RTL resolvable on the machine (gcd/likith/sagar
   RTL is vendored; aes/tinymac RTL is not).
 - Keep this file true. Every audit round found stale claims here being

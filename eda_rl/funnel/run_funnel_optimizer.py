@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -179,6 +180,43 @@ def _build_space(
             f"could not resolve the knob space for design={design!r} "
             f"platform={platform!r}: {exc}"
         ) from exc
+
+
+_SAFE_SLUG_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
+
+
+def _design_slug(design: str | None) -> str:
+    """Canonical campaign-directory name for a --design argument.
+
+    `--design` takes either a bare name (`sagar`) or a YAML path
+    (`eda_rl/designs/sagar.yaml`); both must map to the SAME campaign directory.
+    Before this, the raw string became the path, so passing a path produced
+    `campaigns/eda_rl/designs/sagar.yaml/<platform>/` — four such ghost trees are
+    committed in this repo (see campaigns/eda_rl/README.md).
+
+    The slug is the file STEM, deliberately not `DesignSpec.name`: sagar.yaml
+    declares name "alu4b" and likith.yaml declares "id", but their campaign
+    directories are `sagar/` and `likith/`. Switching to `.name` would relocate
+    every future log away from its existing history.
+    """
+    raw = (design or "").strip()
+    if not raw:
+        raise ValueError("--design is required; got an empty value")
+    # Path(...).name strips every separator, so a traversal attempt collapses to
+    # a plain filename and cannot escape campaigns/ — and a design that does not
+    # actually exist fails earlier, in _build_space's DesignSpec.load().
+    stem = Path(raw).name
+    for suffix in (".yaml", ".yml"):
+        if stem.lower().endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
+    # The slug becomes a filesystem path; refuse anything that could escape it.
+    if not stem or not _SAFE_SLUG_RE.match(stem):
+        raise ValueError(
+            f"--design {design!r} does not yield a safe campaign directory name "
+            f"(got {stem!r}); expected a bare design name or a path to its YAML."
+        )
+    return stem
 
 
 # ── helper: build promotion agent ─────────────────────────────────────────────
@@ -745,7 +783,19 @@ def main() -> None:
     if args.out is not None:
         out_path = Path(args.out)
     else:
-        design_slug = args.design or "unknown"
+        # Normalise the design identity before it becomes a path.  --design
+        # accepts a bare name OR a YAML path, and the raw string used to be
+        # pasted straight into the log path — so
+        # `--design eda_rl/designs/sagar.yaml` created
+        # campaigns/eda_rl/designs/sagar.yaml/sky130hd/.  Four such ghost trees
+        # (~31 MB, two holding real 7-hour campaigns) are committed here.
+        #
+        # The slug is the YAML STEM, not DesignSpec.name: sagar.yaml declares
+        # name "alu4b" and likith.yaml declares "id", while their campaign
+        # directories have always been campaigns/sagar/ and campaigns/likith/.
+        # Using .name here would silently relocate every future log and orphan
+        # every existing one.
+        design_slug = _design_slug(args.design)
         out_path = _CAMPAIGNS_ROOT / design_slug / args.platform / "results_funnel_campaigns.jsonl"
 
     # Neither limit given → the historical default (4 h of tool time), so bare

@@ -1721,14 +1721,21 @@ if __name__ == "__main__":
 
     # ── TEST C: no design is an explicit error (no silent tinymac default) ─────
     print("\n--- TEST C: missing design raises ValueError ---")
-    env_nodesign = FunnelEnv(space_yaml=SPACE, budget_s=3600.0)  # design=None
-    try:
-        env_nodesign.reset({"mac_lanes": 4, "accumulator_width": 24,
-                            "clock_period_ns": 5.0, "abc_recipe": "plain"})
-        raise AssertionError("C: expected ValueError for missing design")
-    except ValueError as e:
-        assert "design" in str(e).lower()
-        print(f"  C missing design → ValueError PASS")
+    # results_path MUST be a temp file: the default is the tracked
+    # results/funnel/results_funnel.jsonl, and running the self-test appended
+    # mock rows to it (caught in review after the file showed up dirty twice in
+    # one session).  Self-tests never write to tracked corpora — same rule
+    # build_table already follows under PHYSICAL_MOCK.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        env_nodesign = FunnelEnv(space_yaml=SPACE, budget_s=3600.0,  # design=None
+                                 results_path=Path(tmpdir) / "results_nodesign.jsonl")
+        try:
+            env_nodesign.reset({"mac_lanes": 4, "accumulator_width": 24,
+                                "clock_period_ns": 5.0, "abc_recipe": "plain"})
+            raise AssertionError("C: expected ValueError for missing design")
+        except ValueError as e:
+            assert "design" in str(e).lower()
+            print(f"  C missing design → ValueError PASS")
 
     print("\n=== All self-tests PASSED ===")
     sys.exit(0)

@@ -26,5 +26,16 @@ funnel_campaign_*.jsonl
 *_run[0-9]*.jsonl
 *_trial.jsonl
 
+# ─── Per-fidelity traces written alongside every campaign log ─────────────────
+# FunnelEnv logs one row per (config, fidelity, obs) to
+# campaigns/<design>/<platform>/funnel_<campaign_id>.jsonl (older runs named
+# these campaign_<ts>.jsonl).  They are large — 5.2 MB and 3.0 MB copies were
+# tracked despite AGENTS.md already declaring them ignored — and are raw
+# artifacts, not curated evidence.  Only the per-episode
+# results_funnel_campaigns.jsonl belongs in git.
+eda_rl/campaigns/**/funnel_*.jsonl
+eda_rl/campaigns/**/campaign_[0-9]*.jsonl
+eda_rl/campaigns/**/run[0-9]*.jsonl
+
 # ─── Generated output of `eda-rl collect` (GDS + comparison page) ──────────────
 best_configs/
