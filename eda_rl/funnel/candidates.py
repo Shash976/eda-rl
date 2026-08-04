@@ -131,6 +131,8 @@ class CandidateGenerator:
         grid_snap: bool = True,
         reward_kind: str = "generic",
         refs: "dict | Any | None" = None,
+        storage_path: "str | Path | None" = None,
+        study_name: str | None = None,
     ) -> None:
         if sampler not in ("tpe", "surrogate_ucb", "random"):
             raise ValueError(
@@ -176,9 +178,37 @@ class CandidateGenerator:
             # TPE with seeded reproducibility; n_startup_trials=10 for cold start
             _sampler = optuna.samplers.TPESampler(seed=seed, n_startup_trials=10)
 
+        # Persist the study when asked, so a killed campaign can be resumed
+        # instead of re-exploring from scratch.  Without storage= the study is
+        # purely in-memory: kill a campaign and the entire TPE model is gone,
+        # and because the sampler is seeded a restart deterministically re-walks
+        # the same cold-start trials.  viz/dashboard.py already builds exactly
+        # this JournalStorage for read-only replay; here it is the live study.
+        storage = None
+        if storage_path is not None:
+            try:
+                from optuna.storages import JournalStorage
+                from optuna.storages.journal import JournalFileBackend
+                Path(storage_path).parent.mkdir(parents=True, exist_ok=True)
+                storage = JournalStorage(JournalFileBackend(str(storage_path)))
+            except Exception as exc:   # noqa: BLE001
+                # A campaign must never fail to start because its resume journal
+                # is unavailable; fall back to in-memory and say so.
+                print(f"  [WARNING] could not open Optuna journal at "
+                      f"{storage_path} ({exc}); running without resume support.")
+                storage = None
+
         self._study = optuna.create_study(
             direction="maximize",
             sampler=_sampler,
+            storage=storage,
+            study_name=study_name if storage is not None else None,
+            load_if_exists=storage is not None,
+        )
+        self._resumed_trials = (
+            len([t for t in self._study.get_trials(deepcopy=False)
+                 if t.state == optuna.trial.TrialState.COMPLETE])
+            if storage is not None else 0
         )
 
     # ── Public interface ───────────────────────────────────────────────────────

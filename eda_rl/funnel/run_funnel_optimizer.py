@@ -252,6 +252,7 @@ def run_campaign(
     space_yaml: str | Path,
     verbose: bool = True,
     jobs: int = 1,
+    resume: bool = False,
 ) -> dict:
     """Run one funnel optimizer campaign.
 
@@ -339,6 +340,13 @@ def run_campaign(
     # FunnelEnv._terminal_reward will actually use for this design (the env
     # derives the reward_kind from the design's functional model, or "generic").
     _ucb_kind, _ = env._surrogate_reward_kind()
+    # Resume support: persist the Optuna study next to the campaign log so a
+    # killed run continues its search instead of restarting cold.  The journal is
+    # keyed on (design, platform, sampler, tier) — resuming into a study fitted on
+    # a different space would be worse than starting over.
+    _study_key = f"{_design_slug(design)}_{platform}_{sampler}_t{max_tier}"
+    _storage_path = (results_path.parent / f"study_{_study_key}.optuna-journal"
+                     if resume else None)
     gen = CandidateGenerator(
         space=space,
         sampler=sampler,
@@ -347,6 +355,8 @@ def run_campaign(
         kappa=1.0,
         grid_snap=(table is not None),   # snap to table grid in table mode
         reward_kind=_ucb_kind,
+        storage_path=_storage_path,
+        study_name=_study_key,
         # refs is a live getter: FunnelEnv auto-anchors generic-design refs
         # from the first F3 build, so a frozen dict here would go stale.
         refs=(lambda: env._surrogate_reward_kind()[1]) if _ucb_kind == "generic" else None,
@@ -389,6 +399,11 @@ def run_campaign(
         print(f"  sampler={sampler} promotion={promotion} seed={seed} "
               f"table={'yes' if table else 'no'}")
         print(f"  budget: {budget.summary_line()}")
+        if resume and _storage_path is not None:
+            _prior = getattr(gen, "_resumed_trials", 0)
+            _what = (f"reloaded {_prior} prior F3 trials from" if _prior
+                     else "new journal at")
+            print(f"  resume: {_what} {_storage_path.name}")
         print(f"  {'Episode':>8} {'Fidelity':>8} {'Reward':>9} {'Best':>9} "
               f"{'Spent(h)':>9} {'Config'}")
         print(f"  {'-'*8} {'-'*8} {'-'*9} {'-'*9} {'-'*9} {'-'*40}")
@@ -768,6 +783,11 @@ def main() -> None:
                    help="Per-build address-space cap (ulimit -v). Unset = no cap. "
                         "Worth setting with --jobs so one greedy build fails "
                         "cleanly instead of OOM-killing its peers")
+    p.add_argument("--resume", action="store_true",
+                   help="Persist the Optuna study beside the campaign log and "
+                        "reload it if present, so a killed campaign continues its "
+                        "search instead of re-exploring from scratch. The journal "
+                        "is keyed on (design, platform, sampler, max-tier)")
     p.add_argument("--quiet", action="store_true",
                    help="Suppress per-episode output")
 
@@ -846,6 +866,7 @@ def main() -> None:
         space_yaml=Path(args.space_yaml),
         verbose=not args.quiet,
         jobs=jobs,
+        resume=args.resume,
     )
 
 
