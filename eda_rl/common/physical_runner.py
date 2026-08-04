@@ -88,6 +88,34 @@ ORFS_DIR     = Path(os.environ.get("ORFS_DIR", "/opt/OpenROAD-flow-scripts"))
 ORFS_TIMEOUT = int(os.environ.get("ORFS_TIMEOUT", "2400"))   # seconds; P&R is slow
 PROXY_TIMEOUT = int(os.environ.get("PROXY_TIMEOUT", "300"))  # synth+STA is fast
 
+
+def _default_num_cores() -> int:
+    """Threads to hand ORFS for one build.
+
+    Until this existed the make line carried no NUM_CORES at all, so every build
+    ran at whatever OpenROAD defaults to rather than at the size of the machine —
+    a straight throughput loss on every campaign ever run.  AutoTuner has always
+    passed the equivalent (`--openroad_threads`, utils.py:368).
+
+    Default: all cores.  With concurrent builds the caller divides
+    (see the campaign driver's --jobs / --openroad-threads).
+    """
+    try:
+        return max(1, int(os.environ.get("EDA_RL_NUM_CORES") or (os.cpu_count() or 1)))
+    except (TypeError, ValueError):
+        return 1
+
+
+NUM_CORES = _default_num_cores()
+
+# Per-build address-space cap in GB (ulimit -v), mirroring AutoTuner's
+# --memory_limit.  Unset = no cap.  Matters once builds run concurrently: an
+# OOM-killed peer is far worse than a build that fails cleanly.
+try:
+    MEMORY_LIMIT_GB: float | None = float(os.environ["EDA_RL_MEMORY_LIMIT_GB"])
+except (KeyError, ValueError):
+    MEMORY_LIMIT_GB = None
+
 # Std-cell liberty file(s) per platform, for the fast synth+STA proxy.
 # nangate45/sky130hd each ship one merged .lib; asap7 has no merged liberty —
 # its cells are split across per-cell-type NLDM libs (4 gzipped + the plain
@@ -774,7 +802,9 @@ def run_physical(lanes: int, acc_w: int, clk_ns: float, platform: str = "nangate
                  util: int = 40, density: float = 0.60,
                  abc: str | None = None, abc_recipe: str | None = None,
                  design: "Any | None" = None,
-                 knob_values: "dict | None" = None) -> dict:
+                 knob_values: "dict | None" = None,
+                 num_cores: int | None = None,
+                 memory_limit_gb: float | None = None) -> dict:
     """Run the full RTL→GDS flow for one config and return parsed metrics.
 
     Deterministic for a fixed RTL + PDK + flow params, so cached in an explicit
@@ -865,11 +895,23 @@ def run_physical(lanes: int, acc_w: int, clk_ns: float, platform: str = "nangate
                     "fmax_mhz": None, "period_min_ns": None,
                     "timing_met": None, "gds": None, "report": str(log_path)}
 
+        # NUM_CORES tells OpenROAD how many threads it may use for this build.
+        # Until this was added the make line carried none, so every build ran at
+        # OpenROAD's default rather than the size of the machine.  With
+        # concurrent builds the caller passes a divided count so W builds x T
+        # threads does not oversubscribe the box.
+        threads = int(num_cores) if num_cores else NUM_CORES
+        mem_gb = MEMORY_LIMIT_GB if memory_limit_gb is None else memory_limit_gb
+        # ulimit -v caps the build's address space (AutoTuner's --memory_limit).
+        # A build that dies on its own limit fails cleanly; one that trips the
+        # kernel OOM killer can take a concurrent peer down with it.
+        ulimit_prefix = f"ulimit -v {int(mem_gb * 1_000_000)}; " if mem_gb else ""
         make_cmd = (
-            f"source '{env_sh}' && "
+            f"source '{env_sh}' && {ulimit_prefix}"
             f"make --file='{ORFS_DIR}/flow/Makefile' "
             f"FLOW_HOME='{ORFS_DIR}/flow' WORK_HOME='{RUN_DIR}' "
-            f"DESIGN_CONFIG='{gen_cfg}' FLOW_VARIANT='{var}'"
+            f"DESIGN_CONFIG='{gen_cfg}' FLOW_VARIANT='{var}' "
+            f"NUM_CORES={threads}"
         )
         # F13: hold an exclusive per-variant lock across the make invocation so
         # two identical configs (e.g. two seeds sharing this EDA_RL_WORK) don't
