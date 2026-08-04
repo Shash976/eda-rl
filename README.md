@@ -40,8 +40,14 @@ Four steps. Try the whole thing with no tools installed by prefixing `PHYSICAL_M
 ### 1. Run a campaign (the optimizer)
 
 ```bash
-eda-rl optimize --design gcd --platform nangate45 --budget-hours 4
+eda-rl optimize --design gcd --platform nangate45 --budget-hours 4   # bound by time
+eda-rl optimize --design gcd --platform nangate45 --max-f3 50        # bound by build count
 ```
+
+Bound the run by **time**, by **number of full builds**, or both — whichever limit
+trips first ends the campaign. `--max-f3 N` counts only builds that *succeeded*, so
+failed and aborted builds are free retries and `--max-f3 50` really does give you 50
+usable data points.
 
 Toggle the search however you like:
 
@@ -49,7 +55,9 @@ Toggle the search however you like:
 |------|-------------------|--------------|
 | `--design` | name or path to a YAML | the design to optimize |
 | `--platform` | `nangate45`, `asap7`, … | target PDK |
-| `--budget-hours` | float, `4` | wall-clock budget; the optimizer stops when spent |
+| `--budget-hours` | float, `4` | time budget. Alone: tool time. With `--max-f3`: a wall-clock safety cap (default 24 h) |
+| `--max-f3` | int, off | stop after this many **successful** full (F3) builds |
+| `--max-f3-attempts` | int, `3 × --max-f3` | hard cap on build attempts, so a design that fails everything still terminates |
 | `--max-tier` | `1`–`4`, `1` | how many ORFS knob tiers to search — tiers are cumulative (see [ORFS knob tiers](#orfs-knob-tiers) below). Tier-2+ knobs flow all the way to the F3 full build, not just the F2 proxy |
 | `--sampler` | `tpe` \| `surrogate_ucb` \| `random` | how candidates are proposed |
 | `--promotion` | `fixed` \| `linucb` \| `random` | the policy that decides what advances F0→F3 |

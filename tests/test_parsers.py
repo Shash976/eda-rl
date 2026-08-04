@@ -109,8 +109,11 @@ def test_sta_slack_fallback_never_fires_when_timing_met():
 
 # ── _parse_metrics: 6_report.json / 6_report.log / 6_finish.rpt (F3 tail, F17) ─
 
-def _metrics_tree(tmp: Path, *, sequential: bool) -> Path:
-    """Build a minimal fake ORFS results tree for _parse_metrics."""
+def _metrics_tree(tmp: Path, *, sequential: bool, drc: str = "json") -> Path:
+    """Build a minimal fake ORFS results tree for _parse_metrics.
+
+    drc: "json" (METRICS2.1 stage json), "rpt" (text fallback), or "none".
+    """
     plat, design, var = "nangate45", "gcd", "gcd_c1_x"
     (tmp / "reports" / plat / design / var).mkdir(parents=True)
     (tmp / "logs" / plat / design / var).mkdir(parents=True)
@@ -127,6 +130,17 @@ def _metrics_tree(tmp: Path, *, sequential: bool) -> Path:
     if sequential:
         jd["finish__design__instance__count__class:sequential_cell"] = 34
     (tmp / "logs" / plat / design / var / "6_report.json").write_text(json.dumps(jd))
+    if drc == "json":
+        (tmp / "logs" / plat / design / var / "5_3_route.json").write_text(
+            json.dumps({"detailedroute__route__drc_errors": 7})
+        )
+    elif drc == "rpt":
+        (tmp / "reports" / plat / design / var / "5_route_drc.rpt").write_text(
+            "  violation type: Metal1 Spacing\n"
+            "    srcs: net1 net2\n"
+            "  violation type: Metal2 Short\n"
+            "    srcs: net3 net4\n"
+        )
     return tmp
 
 
@@ -146,6 +160,49 @@ def test_parse_metrics_combinational_ff_none_is_legit():
         work = _metrics_tree(Path(td), sequential=False)
         out = _parse_metrics(work, "nangate45", "gcd_c1_x", 4.0, design_name="gcd")
     assert out["cell_count"] == 812 and out["ff_count"] is None, out
+
+
+# ── power decomposition + DRC (audit F18/F19) ─────────────────────────────────
+
+def test_parse_metrics_power_split():
+    """The report_power Total row is internal/switching/leakage/total.  The reward
+    needs the split to normalise dynamic power to a fixed frequency, so all four
+    must survive the parse, and internal+switching+leakage must equal total."""
+    with tempfile.TemporaryDirectory() as td:
+        work = _metrics_tree(Path(td), sequential=True)
+        out = _parse_metrics(work, "nangate45", "gcd_c1_x", 4.0, design_name="gcd")
+    assert abs(out["power_mw"] - 14.5) < 1e-9, out
+    assert abs(out["power_internal_mw"] - 11.3) < 1e-9, out
+    assert abs(out["power_switching_mw"] - 3.16) < 1e-9, out
+    assert abs(out["power_leakage_mw"] - 0.0542) < 1e-9, out
+    parts = (out["power_internal_mw"] + out["power_switching_mw"]
+             + out["power_leakage_mw"])
+    assert abs(parts - out["power_mw"]) < 0.02, (parts, out["power_mw"])
+
+
+def test_parse_metrics_drc_from_stage_json():
+    """DRC count comes from OpenROAD's own METRICS2.1 key, not a regex."""
+    with tempfile.TemporaryDirectory() as td:
+        work = _metrics_tree(Path(td), sequential=True, drc="json")
+        out = _parse_metrics(work, "nangate45", "gcd_c1_x", 4.0, design_name="gcd")
+    assert out["drc_count"] == 7, out
+
+
+def test_parse_metrics_drc_rpt_fallback():
+    """With no stage JSON, fall back to counting markers in 5_route_drc.rpt."""
+    with tempfile.TemporaryDirectory() as td:
+        work = _metrics_tree(Path(td), sequential=True, drc="rpt")
+        out = _parse_metrics(work, "nangate45", "gcd_c1_x", 4.0, design_name="gcd")
+    assert out["drc_count"] == 2, out
+
+
+def test_parse_metrics_drc_absent_is_none_not_zero():
+    """No DRC evidence at all means 'not measured'.  Reporting 0 here would
+    silently certify an unrouted build as DRC-clean."""
+    with tempfile.TemporaryDirectory() as td:
+        work = _metrics_tree(Path(td), sequential=True, drc="none")
+        out = _parse_metrics(work, "nangate45", "gcd_c1_x", 4.0, design_name="gcd")
+    assert out["drc_count"] is None, out
 
 
 # ── plain-python runner ─────────────────────────────────────────────────────────

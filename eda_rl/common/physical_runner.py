@@ -382,6 +382,16 @@ def _parse_metrics(work: Path, platform: str, variant: str, clk_ns: float,
         "setup_viol": None, "power_mw": None, "fmax_mhz": None,
         "period_min_ns": None, "timing_met": None,
         "cell_count": None, "ff_count": None,
+        # Power decomposition (audit F18).  power_mw alone is measured AT THE
+        # SAMPLED CLOCK, so it is not comparable across builds that requested
+        # different clock periods — dynamic power scales with frequency.  Keeping
+        # the split lets the reward re-normalise to a fixed reference frequency
+        # (see FunnelEnv._reward_obs_with_ref).
+        "power_internal_mw": None, "power_switching_mw": None,
+        "power_leakage_mw": None,
+        # Post-route DRC violation count.  None means "not measured" (e.g. the
+        # flow stopped before detailed route) and must NEVER be conflated with 0.
+        "drc_count": None,
         "gds": str(gds) if gds.exists() else None,
         "report": str(rpt) if rpt.exists() else None,
     }
@@ -433,13 +443,45 @@ def _parse_metrics(work: Path, platform: str, variant: str, clk_ns: float,
     if m:
         out["setup_viol"] = int(m.group(1))
 
-    # total power (report_power "Total" row, 5th column = Total Watts)
+    # Power, from the report_power "Total" row:
+    #   Total   1.13e-02  3.16e-03  5.42e-05  1.45e-02  100.0%
+    #           internal  switching leakage   total     %
+    # We keep the full decomposition, not just the total (audit F18): internal +
+    # switching is the frequency-dependent (dynamic) part, leakage is not, and
+    # the reward needs to separate them to normalise power to a fixed frequency.
     for line in rpt_txt.splitlines():
         if line.strip().startswith("Total"):
             nums = re.findall(r"\d+\.?\d*(?:[eE][-+]?\d+)?", line)
             if len(nums) >= 4:                      # internal, switching, leakage, total[, %]
-                out["power_mw"] = float(nums[3]) * 1000.0
+                out["power_internal_mw"]  = float(nums[0]) * 1000.0
+                out["power_switching_mw"] = float(nums[1]) * 1000.0
+                out["power_leakage_mw"]   = float(nums[2]) * 1000.0
+                out["power_mw"]           = float(nums[3]) * 1000.0
             break
+
+    # Post-route DRC violations.  Primary source is OpenROAD's own METRICS2.1
+    # emission: detail_route.tcl sets the stage prefix "detailedroute__" and
+    # FlexDR logs metric "route__drc_errors", so the merged key in the stage JSON
+    # is "detailedroute__route__drc_errors".  That is authoritative and integral;
+    # the text .rpt is only a fallback for trees where the JSON is absent.
+    for jf in sorted((work / "logs" / platform / design_name / variant).glob("5_*.json")):
+        try:
+            import json as _json
+            jd = _json.loads(jf.read_text())
+        except (OSError, ValueError):
+            continue
+        v = jd.get("detailedroute__route__drc_errors", jd.get("route__drc_errors"))
+        if v is not None:
+            try:
+                out["drc_count"] = int(v)
+            except (TypeError, ValueError):
+                pass
+    if out["drc_count"] is None:
+        drc_rpt = work / "reports" / platform / design_name / variant / "5_route_drc.rpt"
+        if drc_rpt.exists():
+            # TritonRoute's -output_drc report: one "violation type:" per marker.
+            # An existing but empty report legitimately means zero violations.
+            out["drc_count"] = len(re.findall(r"violation type:", _read(drc_rpt)))
 
     # timing met: prefer the explicit violation count, else sign of WNS
     if out["setup_viol"] is not None:
@@ -1352,7 +1394,16 @@ def _mock_metrics(lanes: int, acc_w: int, clk_ns: float) -> dict:
     period_min = round(1000.0 / fmax, 2)
     met = clk_ns >= period_min
     wns = round(clk_ns - 3.82, 3)                           # crit path ≈ 3.82 ns
-    power = round(900.0 + 30.0 * lanes, 1)                  # rough lane scaling, mW
+    # Power: dynamic scales with frequency (1/clk), leakage does not — the same
+    # physics the reward's frequency ruler assumes, so mock exercises that path
+    # instead of falling back and warning.  Anchored so total ≈ the historical
+    # flat value at the nominal 5 ns clock.
+    leakage = round(0.05 * (900.0 + 30.0 * lanes), 3)
+    dyn_at_5ns = (900.0 + 30.0 * lanes) - leakage
+    dynamic = dyn_at_5ns * (5.0 / max(clk_ns, 1e-9))
+    internal = round(dynamic * 0.6, 3)
+    switching = round(dynamic * 0.4, 3)
+    power = round(internal + switching + leakage, 1)
     cell_count = round(cell_area / 1.4)                     # ~µm²/cell at nangate45
     ff_count = round(cell_count * 0.15)                     # plausible sequential share
     return {
@@ -1360,6 +1411,13 @@ def _mock_metrics(lanes: int, acc_w: int, clk_ns: float) -> dict:
         "wns_ns": wns, "tns_ns": round(min(wns, 0.0) * 15, 2),
         "setup_viol": 0 if met else 40,
         "power_mw": power, "fmax_mhz": fmax, "period_min_ns": period_min,
+        # audit F18: the decomposition the reward needs to normalise power to a
+        # fixed frequency.  Fabricated here for the same reason the reference
+        # timing metrics below are: so mock runs take the real reward path.
+        "power_internal_mw": internal, "power_switching_mw": switching,
+        "power_leakage_mw": leakage,
+        # audit F19: mock builds are clean by construction.
+        "drc_count": 0,
         "timing_met": met,
         # audit F1: fabricate the fixed-ruler reference metrics so mock-mode
         # self-tests exercise the same reward path as real runs.  Mock metrics are

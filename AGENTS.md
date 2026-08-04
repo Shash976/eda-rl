@@ -56,9 +56,12 @@ export ORFS_DIR=/opt/OpenROAD-flow-scripts      # real runs; or PHYSICAL_MOCK=1
 eda-rl doctor --design likith --platform asap7            # seconds
 eda-rl doctor --design likith --platform asap7 --probe-f3 # + real build, finds the PDN util floor
 
+# Bound a campaign by TIME or by BUILD COUNT (or both — first limit wins):
 eda-rl optimize --design gcd --platform nangate45 --budget-hours 4 \
        --sampler tpe|surrogate_ucb|random --promotion fixed|linucb|random \
        --max-tier N       # N must cover the design's declared knobs — doctor prints the minimum
+eda-rl optimize --design gcd --platform nangate45 --max-f3 50   # 50 SUCCESSFUL full builds
+eda-rl optimize --design gcd --platform nangate45 --max-f3 50 --budget-hours 8  # …but stop at 8h
 eda-rl report    --design gcd --platform nangate45 --campaign latest --open  # static HTML (Pareto, funnel, importances…)
 eda-rl collect   --design gcd --platform nangate45 --campaign latest --render # best GDS + before/after page
 eda-rl dashboard --design gcd --platform nangate45 --campaign latest --port 8080  # live Optuna view
@@ -87,7 +90,9 @@ python -m eda_rl.funnel.promotion_agent
 python -m eda_rl.funnel.candidates
 python -m eda_rl.funnel.benchmark_funnel --selftest
 python -m eda_rl.common.knobs
+python -m eda_rl.funnel.budget
 python3 tests/test_parsers.py                  # golden-log parser tests (REAL tool output)
+python3 tests/test_reward.py                   # reward property tests (anti-gaming invariants)
 PHYSICAL_MOCK=1 eda-rl doctor --design gcd --platform nangate45
 PHYSICAL_MOCK=1 python -m eda_rl.funnel.build_table --design tinymac_accel --subset strategic --limit 5  # --design required; auto-writes to a temp path under mock
 ```
@@ -192,6 +197,31 @@ design opts in via `functional_eval.kind`; `base.py` is the interface,
   reward; sampled-SDC metrics stay in the obs for flow visibility only.
   (Without this, the optimizer's best reward came from loosening its own
   timing budget: corr(reward, IO_DELAY) = −0.83 in a real campaign.)
+- **Power is scored at a fixed reference frequency, never the sampled clock**
+  (audit F18). OpenROAD reports power *at the requested clock*, so dynamic
+  power falls simply by asking for a slower one. `_parse_metrics` keeps the
+  `report_power` decomposition (`power_internal_mw` / `power_switching_mw` /
+  `power_leakage_mw`) and `FunnelEnv._power_at_ref_freq` re-normalises
+  `leakage + dynamic·(clk_ns / default_clock_ns)`. **Area is left raw** — it
+  is genuinely frequency-independent (measured corr(clk, area) = −0.13).
+  (Without this: corr(reward, clock_period_ns) = **+0.76** on a real 178-build
+  sagar campaign, whose best config sat at 7.995 ns against a range ceiling of
+  8.0 — the optimizer's answer to "design a good chip" was "ask for the
+  slowest clock allowed". The tell: corr(clk, power) = −0.69 but
+  corr(clk, power×period) = −0.04, i.e. the whole effect was the frequency
+  confound. This is the audit-F1 hole reopening in the one term F1 left raw.)
+- **DRC violations gate the reward** (audit F19). `drc_count` is parsed from
+  OpenROAD's own METRICS2.1 key `detailedroute__route__drc_errors` (stage
+  JSON; the `5_route_drc.rpt` text is a fallback) and penalised via `w_drc`,
+  so a dirty build can never outscore a clean one and `collect_best` never
+  ships an unmanufacturable GDS as BEST OVERALL. **`drc_count is None` means
+  "not measured" and must never be treated as zero** — that would certify an
+  unrouted build as clean.
+- **Reward semantics are versioned.** `physical_reward.REWARD_VERSION` is
+  stamped on every episode row and campaign summary; a row without the key is
+  v1. v1 corpora (raw sampled-clock power, no DRC gate) are **not comparable**
+  with v2 — `fit-surrogate` refuses to fit across a mixed corpus rather than
+  averaging two rulers.
 - **Combinational F2 fmax is `None` + a `combinational` marker, never a
   1000/clk echo.** An inferred (slack-fallback) fmax carries
   `fmax_inferred=True`. The honest combinational speed number is the
@@ -286,6 +316,27 @@ design opts in via `functional_eval.kind`; `base.py` is the interface,
   author-controlled YAML); revisit if that changes.
 
 ### Operational
+- **`funnel/budget.py` owns what bounds a campaign.** One `budget_s` float used
+  to serve three unrelated roles — stop condition, shaping normaliser
+  (`-λ·cost/budget_s`), and state slot [17] — which is why a build-count budget
+  was inexpressible. `Budget` separates them. Rules:
+  - `--max-f3 N` counts **successful** F3 builds only; a FAIL/TIMEOUT/
+    PARSE_FAIL/config_abort is a free retry, so N really means N data points.
+    A `max_f3_attempts` cap (default 3·N) stops a design that fails everything.
+  - `--budget-hours` alone keeps its historical **tool-time** meaning, so old
+    invocations and saved agents are bit-identical (`budget.py`'s self-test
+    asserts `remaining_fraction`/`shaping_normalizer_s` against the old
+    formulas — do not break those assertions). With `--max-f3` it becomes a
+    **wall-clock** safety cap, defaulting to 24 h.
+  - Note `spent_s` is tool time and always understates wall clock (nothing
+    charges candidate generation, Optuna, or logging); `env.wall_elapsed_s` is
+    the real thing, and both are in the summary row.
+  - **No-progress guard**: 2000 consecutive episodes with no F3 attempt aborts
+    with a diagnostic. Without it, a count-bounded campaign whose policy kills
+    everything spins to the wall cap producing nothing — the exact observed
+    LinUCB-collapse shape (7,884 consecutive kills in a real likith run). The
+    threshold is sized from real logs: the longest legitimate streak on record
+    is 1,202.
 - **All tool subprocesses are process-group-killed on timeout/failure**
   (`_run_capture`/`_killpg` for the proxy/elaborate/reference-STA paths, the
   same pattern `run_physical` uses). No detached yosys/openroad survivors.

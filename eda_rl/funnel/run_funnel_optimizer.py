@@ -57,6 +57,15 @@ except Exception as _e:
     _FUNNEL_OK = False
     _FUNNEL_ERR = str(_e)
 
+# Reward semantics version — stamped on every log row (audit F18/F19).  Imported
+# defensively so a broken reward module can't take down the whole driver.
+try:
+    from eda_rl.common.physical_reward import REWARD_VERSION
+except Exception:   # noqa: BLE001
+    REWARD_VERSION = None
+
+from eda_rl.funnel.budget import Budget
+
 try:
     from eda_rl.funnel.candidates import CandidateGenerator
     _CAND_OK = True
@@ -193,7 +202,7 @@ def run_campaign(
     *,
     design: str | None,
     platform: str,
-    budget_s: float,
+    budget: "Budget",
     max_tier: int,
     sampler: str,
     promotion: str,
@@ -264,7 +273,7 @@ def run_campaign(
     env = FunnelEnv(
         space_yaml=space_yaml,
         platform=platform,
-        budget_s=budget_s,
+        budget=budget,
         surrogate=surrogate,
         table=table,
         results_path=results_path.parent / f"funnel_{campaign_id}.jsonl",
@@ -318,19 +327,33 @@ def run_campaign(
         "promotion": promotion,
         "max_tier":  max_tier,
         "seed":      seed,
+        # audit F18/F19: reward semantics are versioned so corpora produced under
+        # different rulers are never silently averaged together.  Absent key on an
+        # old row == version 1.
+        "reward_version": REWARD_VERSION,
     }
 
     if verbose:
         print(f"\n  Campaign {campaign_id}")
-        print(f"  sampler={sampler} promotion={promotion} budget={budget_s/3600:.2f}h "
-              f"seed={seed} table={'yes' if table else 'no'}")
+        print(f"  sampler={sampler} promotion={promotion} seed={seed} "
+              f"table={'yes' if table else 'no'}")
+        print(f"  budget: {budget.summary_line()}")
         print(f"  {'Episode':>8} {'Fidelity':>8} {'Reward':>9} {'Best':>9} "
               f"{'Spent(h)':>9} {'Config'}")
         print(f"  {'-'*8} {'-'*8} {'-'*9} {'-'*9} {'-'*9} {'-'*40}")
 
     log_rows: list[dict] = []
 
-    while env.spent_s < budget_s:
+    # Episodes since the last F3 attempt — feeds the Budget's no-progress guard.
+    # Without it a count-bounded campaign whose promotion policy kills everything
+    # spins to the wall cap and produces nothing (observed: 7,884 consecutive
+    # kills in a real likith campaign).
+    episodes_since_f3 = 0
+
+    # The single stop test.  FunnelEnv owns every counter the Budget needs
+    # (wall clock, tool seconds, successful/attempted F3 builds), so both this
+    # loop and the mid-episode check below ask the same question.
+    while not env.budget_exhausted(episodes_since_f3):
         # ── generate candidate ─────────────────────────────────────────────────
         try:
             config = gen.suggest()
@@ -372,12 +395,13 @@ def run_campaign(
         episode_t0 = time.time()
 
         while not episode_done:
-            if env.spent_s >= budget_s:
+            if env.budget_exhausted(episodes_since_f3):
                 # Over budget mid-episode.  env.spent_s already includes this
                 # episode's accumulated cost (FunnelEnv._charge adds every cost to
                 # both _spent_s and _episode_spent_s), so adding _episode_spent_s
                 # here double-counted the episode spend and stopped campaigns early
-                # (audit F15).
+                # (audit F15).  In count mode this also stops the moment the last
+                # required F3 build lands, rather than starting another episode.
                 break
 
             action = promo.act(state)
@@ -420,6 +444,9 @@ def run_campaign(
         per_fidelity_counts[fidelity_reached] = (
             per_fidelity_counts.get(fidelity_reached, 0) + 1
         )
+        # Reset on any episode that actually entered F3, successful or not — the
+        # guard is about the policy refusing to promote, not about build quality.
+        episodes_since_f3 = 0 if fidelity_reached == "F3" else episodes_since_f3 + 1
 
         # F3 terminal reward: use the PURE terminal PPA reward (no shaping), and
         # only count a real F3 commit (status ok, not a table_miss) as an F3
@@ -492,6 +519,26 @@ def run_campaign(
 
     # ── summary ────────────────────────────────────────────────────────────────
     elapsed_s = time.time() - t0
+
+    # A campaign that stopped because nothing was ever promoted has produced no
+    # data.  Say so loudly rather than leaving a silent empty log: this is the
+    # observed LinUCB-collapse / mis-tuned-gate failure, and it looks identical
+    # to a normal finish in the summary row alone.
+    _stop = env.budget_stop_reason(episodes_since_f3)
+    if _stop == "no_f3_progress":
+        print(f"\n  [ABORT] {episodes_since_f3} consecutive episodes without a single "
+              f"F3 build — stopping.")
+        print(f"          The promotion policy (--promotion {promotion}) is killing "
+              f"every candidate before F3,")
+        print(f"          so this campaign cannot make progress toward its budget. "
+              f"Check the gate thresholds")
+        print(f"          against this design's real F2 metrics "
+              f"(`eda-rl doctor --design {design} --platform {platform}`).")
+    elif budget.is_count_mode and env.n_f3_ok < (budget.max_f3_ok or 0):
+        print(f"\n  [WARNING] stopped at {env.n_f3_ok}/{budget.max_f3_ok} successful "
+              f"F3 builds (reason: {_stop}); "
+              f"{env.n_f3_attempts} attempts were made.")
+
     summary = {
         "campaign_id":        campaign_id,
         "best_config":        best_config,
@@ -508,6 +555,14 @@ def run_campaign(
         "platform":           platform,
         "design":             design,
         "max_tier":           max_tier,
+        "reward_version":     REWARD_VERSION,
+        # What bounded this campaign, and which limit actually ended it — so a
+        # log can be compared against another only when the bounds match.
+        "budget":             budget.describe(),
+        "stop_reason":        env.budget_stop_reason(episodes_since_f3),
+        "wall_elapsed_s":     round(env.wall_elapsed_s, 1),
+        "n_f3_ok":            env.n_f3_ok,
+        "n_f3_attempts":      env.n_f3_attempts,
     }
 
     # audit F15: persist the summary as a final self-describing row so a campaign
@@ -551,8 +606,19 @@ def main() -> None:
                    help="Design name or YAML path (REQUIRED — no default design)")
     p.add_argument("--platform", default="nangate45",
                    help="Target platform (nangate45 or asap7)")
-    p.add_argument("--budget-hours", type=float, default=4.0, dest="budget_hours",
-                   help="Campaign budget in hours (real or simulated)")
+    p.add_argument("--budget-hours", type=float, default=None, dest="budget_hours",
+                   help="Time budget in hours. Alone: the historical tool-time "
+                        "budget (default 4.0). With --max-f3: a wall-clock safety "
+                        "cap (default 24h)")
+    p.add_argument("--max-f3", type=int, default=None, dest="max_f3",
+                   help="Stop after this many SUCCESSFUL full (F3) builds. Failed, "
+                        "timed-out and aborted builds do not consume the quota, so "
+                        "--max-f3 50 yields 50 usable data points. Combines with "
+                        "--budget-hours; whichever limit trips first ends the run")
+    p.add_argument("--max-f3-attempts", type=int, default=None, dest="max_f3_attempts",
+                   help="Hard cap on F3 build attempts regardless of outcome "
+                        "(default: 3x --max-f3), so a design that fails every build "
+                        "still terminates")
     p.add_argument("--max-tier", type=int, default=1, dest="max_tier",
                    help="Maximum knob tier from KnobRegistry (1 = core axes only)")
     p.add_argument("--sampler", choices=["tpe", "surrogate_ucb", "random"],
@@ -590,7 +656,18 @@ def main() -> None:
         design_slug = args.design or "unknown"
         out_path = _CAMPAIGNS_ROOT / design_slug / args.platform / "results_funnel_campaigns.jsonl"
 
-    budget_s = args.budget_hours * 3600.0
+    # Neither limit given → the historical default (4 h of tool time), so bare
+    # `eda-rl optimize` behaves exactly as before.
+    budget_hours = args.budget_hours
+    if budget_hours is None and args.max_f3 is None:
+        budget_hours = 4.0
+    try:
+        budget = Budget.from_args(budget_hours=budget_hours, max_f3=args.max_f3,
+                                  max_f3_attempts=args.max_f3_attempts)
+    except ValueError as exc:
+        print(f"ERROR: {exc}")
+        sys.exit(2)
+
     is_mock = os.environ.get("PHYSICAL_MOCK", "").strip() in ("1", "true", "True", "yes")
     if is_mock:
         print(f"  [MOCK MODE] PHYSICAL_MOCK=1 — using mock metrics")
@@ -598,7 +675,7 @@ def main() -> None:
     run_campaign(
         design=args.design,
         platform=args.platform,
-        budget_s=budget_s,
+        budget=budget,
         max_tier=args.max_tier,
         sampler=args.sampler,
         promotion=args.promotion,

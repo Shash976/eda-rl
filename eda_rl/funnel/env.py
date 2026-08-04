@@ -97,6 +97,7 @@ except ImportError:
 # ── Core imports (always available) ──────────────────────────────────────────
 from eda_rl.common.physical_runner import run_synth_sta, run_physical
 from eda_rl.common.physical_reward import compute_generic_reward
+from eda_rl.funnel.budget import Budget
 # Functional-model-specific behavior (F0/F1 model, composite reward) is provided
 # by the design's plugin (design.functional_model()); this core never names one.
 
@@ -487,10 +488,18 @@ class FunnelEnv:
         design: "str | Any | None" = None,
         max_tier: int = 1,
         active_space: dict | None = None,
+        budget: "Budget | None" = None,
     ) -> None:
         self._space_yaml = Path(space_yaml)
         self.platform = platform
-        self.budget_s = float(budget_s)
+        # Budget: `budget` (a Budget object) is the general form; the historical
+        # `budget_s` float is still accepted and wrapped as a tool-time budget so
+        # existing callers — benchmark_funnel, the in-module self-tests, saved
+        # agents — behave bit-identically.  See funnel/budget.py.
+        self._budget = budget if budget is not None else Budget(tool_s=float(budget_s))
+        # Kept as a plain attribute because the shaping term, the state slot and a
+        # few self-tests read it; it now means "the scale the shaping divides by".
+        self.budget_s = float(self._budget.shaping_normalizer_s())
         self._surrogate = surrogate
         self._table = table
         self._results_path = Path(results_path)
@@ -529,6 +538,13 @@ class FunnelEnv:
 
         # Cumulative budget tracking
         self._spent_s: float = 0.0
+        # Wall clock and F3 accounting, so the Budget can evaluate every limit
+        # from one place.  n_f3_ok counts only builds that produced a usable
+        # measurement — failures are free retries under --max-f3.
+        self._t0_wall: float = time.time()
+        self._n_f3_ok: int = 0
+        self._n_f3_attempts: int = 0
+        self._ema_f3_cost_s: float | None = None
         self._incumbent: dict | None = None  # {"config": ..., "reward": float}
         # Per-platform PPA reference anchors for generic (non-TinyVAD) designs.
         # Auto-anchored from the first successful F3 build when the design YAML
@@ -797,6 +813,20 @@ class FunnelEnv:
         reward = -self._lambda * cost_s / max(self.budget_s, 1.0)
 
         if fidelity == "F3":
+            # Budget accounting for --max-f3 (funnel/budget.py).  Every F3 entry is
+            # an attempt; only one that produced a usable measurement consumes the
+            # success quota, so a failing build is a free retry.  The cost EMA
+            # gives count mode a real seconds-scale for the shaping term instead of
+            # the nominal 420 s guess.
+            self._n_f3_attempts += 1
+            if status in ("ok", "mock", "mock-proxy"):
+                self._n_f3_ok += 1
+                self._ema_f3_cost_s = (cost_s if self._ema_f3_cost_s is None
+                                       else 0.7 * self._ema_f3_cost_s + 0.3 * cost_s)
+                if self._budget.is_count_mode:
+                    self.budget_s = float(
+                        self._budget.shaping_normalizer_s(self._ema_f3_cost_s))
+
             # Terminal payoff: final composite reward using the ladder-consistent scorer
             self._f3_status = status
             terminal_reward = self._terminal_reward(obs, status)
@@ -1038,6 +1068,15 @@ class FunnelEnv:
                 "tns_ns":      result.get("tns_ns"),
                 "fmax_mhz":    result.get("fmax_mhz"),
                 "power_mw":    result.get("power_mw"),
+                # audit F18: the power decomposition, kept so the reward can
+                # re-normalise dynamic power to a fixed reference frequency.
+                # power_mw alone is measured at the SAMPLED clock and therefore
+                # rewards asking for a slow clock (see _reward_obs_with_ref).
+                "power_internal_mw":  result.get("power_internal_mw"),
+                "power_switching_mw": result.get("power_switching_mw"),
+                "power_leakage_mw":   result.get("power_leakage_mw"),
+                # audit F19: post-route DRC violations.  None = not measured.
+                "drc_count":   result.get("drc_count"),
                 "timing_met":  result.get("timing_met"),
                 "setup_viol":  result.get("setup_viol"),
                 "period_min_ns": result.get("period_min_ns"),
@@ -1079,19 +1118,93 @@ class FunnelEnv:
 
     # ── Terminal reward computation ─────────────────────────────────────────────
 
-    def _reward_obs_with_ref(self, obs: dict) -> dict:
-        """Return obs with its timing metrics swapped for the fixed-ruler
-        reference-SDC values (audit F1).
+    def _power_ref_period_ns(self) -> float | None:
+        """The fixed reference clock period this design's power is normalised to.
 
-        The reference metrics (measured under io=0.2 fraction, no uncertainty, at
-        the same sampled clock) are immune to the sampled IO_DELAY/
-        CLOCK_UNCERTAINTY, so scoring on them removes the "relax my own
-        constraints → higher reward" gaming.  Area/power are physical and left
-        untouched.  When the reference STA didn't produce a speed number
-        (fmax_ref_mhz is None — e.g. it failed, or a legacy path), fall back to
-        the sampled-SDC obs with a one-time warning; a successful build is never
-        discarded.
+        Uses the design's declared ``default_clock_ns`` for the active platform —
+        a per-design constant that does NOT move with the sampled clock, which is
+        the whole point (audit F18).
         """
+        plats = getattr(self._design_spec, "platforms", None) or {}
+        info = plats.get(self.platform) or {}
+        ref = info.get("default_clock_ns")
+        if ref is None:
+            rng = info.get("clock_range_ns")
+            if rng and len(rng) == 2:
+                ref = (float(rng[0]) + float(rng[1])) / 2.0
+        try:
+            ref = float(ref)
+        except (TypeError, ValueError):
+            return None
+        return ref if ref > 0.0 else None
+
+    def _power_at_ref_freq(self, obs: dict) -> float | None:
+        """Power this build would draw at the design's reference frequency.
+
+        OpenROAD reports power AT THE SAMPLED CLOCK, so raw ``power_mw`` is not
+        comparable across builds that requested different clock periods: dynamic
+        power scales with frequency, so simply asking for a slower clock lowers
+        reported power and inflates the reward.  Measured on a real campaign
+        (sagar/sky130hd, n=178): corr(clk, power) = -0.69, but corr(clk,
+        power x period) = -0.04 — i.e. the entire effect was the frequency
+        confound, and reward correlated +0.76 with the clock knob.
+
+        Leakage does not scale with frequency; internal+switching does.  So::
+
+            P(f_ref) = leakage + (internal + switching) * (clk_ns / ref_period_ns)
+
+        Returns None when the split or the reference period is unavailable, in
+        which case the caller keeps the raw value and warns.
+        """
+        internal = obs.get("power_internal_mw")
+        switching = obs.get("power_switching_mw")
+        leakage = obs.get("power_leakage_mw")
+        clk_ns = obs.get("clk_ns")
+        ref_ns = self._power_ref_period_ns()
+        if None in (internal, switching, leakage, clk_ns, ref_ns):
+            return None
+        try:
+            clk_ns = float(clk_ns)
+        except (TypeError, ValueError):
+            return None
+        if clk_ns <= 0.0:
+            return None
+        dynamic = float(internal) + float(switching)
+        return float(leakage) + dynamic * (clk_ns / ref_ns)
+
+    def _reward_obs_with_ref(self, obs: dict) -> dict:
+        """Return obs with its timing and power metrics swapped for fixed-ruler
+        reference values (audit F1 for timing, audit F18 for power).
+
+        The reference timing metrics (measured under io=0.2 fraction, no
+        uncertainty, at the same sampled clock) are immune to the sampled
+        IO_DELAY/CLOCK_UNCERTAINTY, so scoring on them removes the "relax my own
+        constraints → higher reward" gaming.  Power is normalised to the design's
+        reference frequency for the same reason: reported power is a function of
+        the requested clock, so scoring it raw rewarded asking for a slow clock.
+        Area is genuinely frequency-independent and is left untouched (measured:
+        corr(clk, area) = -0.13).  When a reference value is unavailable, fall
+        back to the sampled obs with a one-time warning; a successful build is
+        never discarded.
+        """
+        # ── power ruler (audit F18) ────────────────────────────────────────────
+        # Substitute BEFORE the fmax branch below so both return paths carry it.
+        # The raw sampled value is preserved as power_sampled_mw for visibility;
+        # the logged obs itself is untouched (this is a scoring-only copy).
+        power_ref = self._power_at_ref_freq(obs)
+        if power_ref is not None:
+            obs = dict(obs)
+            obs["power_sampled_mw"] = obs.get("power_mw")
+            obs["power_ref_mw"] = power_ref
+            obs["power_mw"] = power_ref
+        elif obs.get("power_mw") is not None and self._table is None:
+            warnings.warn(
+                "F3 power could not be normalised to the reference frequency "
+                "(missing internal/switching/leakage split or default_clock_ns); "
+                "scoring raw power, which is gameable by the clock knob.",
+                stacklevel=2,
+            )
+
         fmax_ref = obs.get("fmax_ref_mhz")
         if fmax_ref is None:
             # Live build whose reference STA failed → warn (the reward is now
@@ -1212,7 +1325,60 @@ class FunnelEnv:
         self._episode_spent_s += cost_s
 
     def _budget_fraction(self) -> float:
-        return max(0.0, 1.0 - self._spent_s / max(self.budget_s, 1.0))
+        """State slot [17].  Delegates to the Budget so a count-bounded campaign
+        shows the policy how many builds are left rather than a meaningless time
+        fraction.  For a legacy tool-time budget this is bit-identical to the old
+        `1 - spent/budget` formula (asserted in budget.py's self-test)."""
+        return self._budget.remaining_fraction(
+            wall_elapsed_s=self.wall_elapsed_s,
+            tool_spent_s=self._spent_s,
+            n_f3_ok=self._n_f3_ok,
+            n_f3_attempts=self._n_f3_attempts,
+        )
+
+    @property
+    def wall_elapsed_s(self) -> float:
+        """Real seconds since this env was constructed.
+
+        Distinct from `spent_s`, which counts only stage time — candidate
+        generation, Optuna ask/tell and logging are never charged to it, so
+        `spent_s` systematically understates real elapsed time.
+        """
+        return time.time() - self._t0_wall
+
+    @property
+    def n_f3_ok(self) -> int:
+        """Successful F3 builds so far (the --max-f3 quota)."""
+        return self._n_f3_ok
+
+    @property
+    def n_f3_attempts(self) -> int:
+        """F3 entries so far, successful or not (the safety cap)."""
+        return self._n_f3_attempts
+
+    def budget_exhausted(self, episodes_since_f3: int = 0) -> bool:
+        """True when any active limit has been reached — the campaign stop test.
+
+        `episodes_since_f3` is owned by the driver (the env has no notion of an
+        episode) and feeds the no-progress guard: a count-bounded campaign whose
+        policy kills every candidate would otherwise spin until the wall cap.
+        """
+        return self._budget.exhausted(
+            wall_elapsed_s=self.wall_elapsed_s,
+            tool_spent_s=self._spent_s,
+            n_f3_ok=self._n_f3_ok,
+            n_f3_attempts=self._n_f3_attempts,
+            episodes_since_f3=episodes_since_f3,
+        )
+
+    def budget_stop_reason(self, episodes_since_f3: int = 0) -> str | None:
+        return self._budget.stop_reason(
+            wall_elapsed_s=self.wall_elapsed_s,
+            tool_spent_s=self._spent_s,
+            n_f3_ok=self._n_f3_ok,
+            n_f3_attempts=self._n_f3_attempts,
+            episodes_since_f3=episodes_since_f3,
+        )
 
     def _surrogate_mu(self) -> float:
         """Ask surrogate for expected reward; 0.0 if unavailable."""
