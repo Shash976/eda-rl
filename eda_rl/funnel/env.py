@@ -59,6 +59,7 @@ import json
 import math
 import os
 import re
+import threading
 import time
 import warnings
 from pathlib import Path
@@ -434,6 +435,66 @@ def _build_state(
 
 # ── Main class ─────────────────────────────────────────────────────────────────
 
+class CampaignState:
+    """Everything that belongs to the *campaign* rather than to one episode.
+
+    A serial campaign has one FunnelEnv and the distinction is invisible.  With
+    ``--jobs W`` there are W envs running episodes concurrently, and they must
+    still share one budget, one incumbent, one set of reward anchors and one log
+    file — otherwise each worker would score against its own anchors and spend
+    its own private budget.
+
+    Every mutator takes ``lock``.  The reads that feed the state vector are
+    deliberately unlocked: they are single word-sized loads whose exact value
+    only affects a shaping term, and taking the lock on every state update would
+    serialise the workers for no benefit.
+    """
+
+    def __init__(self, budget: Budget, results_path: Path) -> None:
+        self.budget = budget
+        self.results_path = Path(results_path)
+
+        self.spent_s: float = 0.0            # tool seconds, all workers
+        self.incumbent: dict | None = None   # best {"config", "reward"} so far
+        self.generic_refs: dict[str, dict] = {}   # per-platform PPA anchors
+        self.t0_wall: float = time.time()
+        self.n_f3_ok: int = 0
+        self.n_f3_attempts: int = 0
+        self.ema_f3_cost_s: float | None = None
+        # The seconds-scale the per-step cost shaping divides by.  Count mode
+        # refines it as real build costs are observed.
+        self.shaping_norm_s: float = float(budget.shaping_normalizer_s())
+
+        self.lock = threading.RLock()
+        # Separate lock for the JSONL append so a slow write never blocks budget
+        # accounting.  Both the per-fidelity log here and the driver's episode log
+        # need one: concurrent appends interleave and corrupt lines otherwise.
+        self.log_lock = threading.Lock()
+
+    def charge(self, cost_s: float) -> None:
+        with self.lock:
+            self.spent_s += cost_s
+
+    def note_f3(self, status: str, cost_s: float) -> None:
+        """Record an F3 attempt and, if it produced a usable measurement, a
+        success against the --max-f3 quota."""
+        with self.lock:
+            self.n_f3_attempts += 1
+            if status in ("ok", "mock", "mock-proxy"):
+                self.n_f3_ok += 1
+                self.ema_f3_cost_s = (
+                    cost_s if self.ema_f3_cost_s is None
+                    else 0.7 * self.ema_f3_cost_s + 0.3 * cost_s)
+                if self.budget.is_count_mode:
+                    self.shaping_norm_s = float(
+                        self.budget.shaping_normalizer_s(self.ema_f3_cost_s))
+
+    def offer_incumbent(self, config: dict, reward: float) -> None:
+        with self.lock:
+            if self.incumbent is None or reward > self.incumbent["reward"]:
+                self.incumbent = {"config": dict(config), "reward": reward}
+
+
 class FunnelEnv:
     """Gym-style multi-fidelity funnel environment for the design-space optimizer.
 
@@ -489,6 +550,7 @@ class FunnelEnv:
         max_tier: int = 1,
         active_space: dict | None = None,
         budget: "Budget | None" = None,
+        campaign_state: "CampaignState | None" = None,
     ) -> None:
         self._space_yaml = Path(space_yaml)
         self.platform = platform
@@ -497,12 +559,15 @@ class FunnelEnv:
         # existing callers — benchmark_funnel, the in-module self-tests, saved
         # agents — behave bit-identically.  See funnel/budget.py.
         self._budget = budget if budget is not None else Budget(tool_s=float(budget_s))
-        # Kept as a plain attribute because the shaping term, the state slot and a
-        # few self-tests read it; it now means "the scale the shaping divides by".
-        self.budget_s = float(self._budget.shaping_normalizer_s())
+        # Campaign-level state (budget spend, incumbent, reward anchors, log
+        # path).  Serial callers get a private one and notice nothing; with
+        # --jobs the driver passes ONE shared instance to every worker's env so
+        # they share a budget and an incumbent rather than each running its own
+        # private campaign.
+        self._cs = campaign_state if campaign_state is not None else CampaignState(
+            self._budget, results_path)
         self._surrogate = surrogate
         self._table = table
-        self._results_path = Path(results_path)
         self._seed = seed
         self._lambda = float(lambda_cost)
         self._max_tier = int(max_tier)
@@ -536,24 +601,53 @@ class FunnelEnv:
         self._done: bool = True        # must call reset() before step()
         self._episode_spent_s: float = 0.0   # cost accumulated in this episode
 
-        # Cumulative budget tracking
-        self._spent_s: float = 0.0
-        # Wall clock and F3 accounting, so the Budget can evaluate every limit
-        # from one place.  n_f3_ok counts only builds that produced a usable
-        # measurement — failures are free retries under --max-f3.
-        self._t0_wall: float = time.time()
-        self._n_f3_ok: int = 0
-        self._n_f3_attempts: int = 0
-        self._ema_f3_cost_s: float | None = None
-        self._incumbent: dict | None = None  # {"config": ..., "reward": float}
-        # Per-platform PPA reference anchors for generic (non-TinyVAD) designs.
-        # Auto-anchored from the first successful F3 build when the design YAML
-        # declares no reward block, so generic rewards need no magic constants
-        # (audit C1).  {platform: {area_ref_um2, power_ref_mw, fmax_ref_mhz}}.
-        self._generic_refs: dict[str, dict] = {}
-
         # _state_vec is always the most recently built 22-dim vector
         self._state_vec: np.ndarray = np.zeros(_STATE_DIM, dtype=np.float32)
+
+    # ── campaign-level state, shared across concurrent workers ────────────────
+    # These live on CampaignState (one instance per campaign, however many envs).
+    # They stay spelled as private env attributes so every existing read site is
+    # unchanged; only the storage moved.
+
+    @property
+    def _spent_s(self) -> float:
+        return self._cs.spent_s
+
+    @property
+    def _t0_wall(self) -> float:
+        return self._cs.t0_wall
+
+    @property
+    def _n_f3_ok(self) -> int:
+        return self._cs.n_f3_ok
+
+    @property
+    def _n_f3_attempts(self) -> int:
+        return self._cs.n_f3_attempts
+
+    @property
+    def _incumbent(self) -> dict | None:
+        return self._cs.incumbent
+
+    @property
+    def _generic_refs(self) -> dict:
+        """Per-platform PPA anchors for generic (non-TinyVAD) designs.
+
+        Auto-anchored from the campaign's first successful F3 build when the
+        design YAML declares none (audit C1).  Shared, so concurrent workers
+        score against the same anchors instead of each anchoring on its own
+        first build.  {platform: {area_ref_um2, power_ref_mw, fmax_ref_mhz}}
+        """
+        return self._cs.generic_refs
+
+    @property
+    def _results_path(self) -> Path:
+        return self._cs.results_path
+
+    @property
+    def budget_s(self) -> float:
+        """The seconds-scale the per-step cost shaping divides by."""
+        return self._cs.shaping_norm_s
 
     @property
     def _design_spec(self) -> Any:
@@ -818,14 +912,7 @@ class FunnelEnv:
             # success quota, so a failing build is a free retry.  The cost EMA
             # gives count mode a real seconds-scale for the shaping term instead of
             # the nominal 420 s guess.
-            self._n_f3_attempts += 1
-            if status in ("ok", "mock", "mock-proxy"):
-                self._n_f3_ok += 1
-                self._ema_f3_cost_s = (cost_s if self._ema_f3_cost_s is None
-                                       else 0.7 * self._ema_f3_cost_s + 0.3 * cost_s)
-                if self._budget.is_count_mode:
-                    self.budget_s = float(
-                        self._budget.shaping_normalizer_s(self._ema_f3_cost_s))
+            self._cs.note_f3(status, cost_s)
 
             # Terminal payoff: final composite reward using the ladder-consistent scorer
             self._f3_status = status
@@ -836,8 +923,7 @@ class FunnelEnv:
             # offline table has no F3 row) or a genuine failure must never become
             # the incumbent or define the optimum (audit RL-F4 / EXP-F6).
             if status in ("ok", "mock", "mock-proxy"):
-                if self._incumbent is None or terminal_reward > self._incumbent["reward"]:
-                    self._incumbent = {"config": dict(self._config), "reward": terminal_reward}
+                self._cs.offer_incumbent(self._config, terminal_reward)
             self._done = True
 
             # Surrogate Δ shaping: Δ(best) after vs before observation
@@ -1296,7 +1382,10 @@ class FunnelEnv:
         if obs.get("power_mw") is not None:
             refs.setdefault("power_ref_mw", float(obs["power_mw"]))
         # Persist the cache so later builds reuse the first build's anchors.
-        self._generic_refs[self.platform] = refs
+        # Locked: with concurrent workers two first-builds could otherwise race
+        # and leave half of each one's anchors, giving a mixed ruler.
+        with self._cs.lock:
+            self._cs.generic_refs[self.platform] = refs
         return refs, weights
 
     # ── Helpers ────────────────────────────────────────────────────────────────
@@ -1321,8 +1410,8 @@ class FunnelEnv:
         return None   # already at F3
 
     def _charge(self, cost_s: float) -> None:
-        self._spent_s += cost_s
-        self._episode_spent_s += cost_s
+        self._cs.charge(cost_s)             # campaign-wide, shared across workers
+        self._episode_spent_s += cost_s     # this episode only, per-env
 
     def _budget_fraction(self) -> float:
         """State slot [17].  Delegates to the Budget so a count-bounded campaign
@@ -1433,9 +1522,14 @@ class FunnelEnv:
             "platform": self.platform,
             "status":   status,
         }
+        # Serialised: concurrent appends from --jobs workers interleave and
+        # produce corrupt half-lines, which is unrecoverable in a JSONL corpus.
+        # (One committed log already has an unparseable row from a different
+        # cause; do not add a second way to produce them.)
         try:
-            with open(self._results_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(row) + "\n")
+            with self._cs.log_lock:
+                with open(self._results_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(row) + "\n")
         except OSError:
             pass   # non-fatal: logging failure should never crash the optimizer
 

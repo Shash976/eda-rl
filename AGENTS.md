@@ -337,6 +337,23 @@ design opts in via `functional_eval.kind`; `base.py` is the interface,
     LinUCB-collapse shape (7,884 consecutive kills in a real likith run). The
     threshold is sized from real logs: the longest legitimate streak on record
     is 1,202.
+- **`--jobs W` parallelises the tool runs and nothing else.** W envs share one
+  `CampaignState` (budget, incumbent, reward anchors, log file); `env.step` —
+  the ORFS build — runs outside every lock, while the Optuna study, the
+  promotion agent, the campaign counters and both JSONL appends are each
+  serialised. Optuna's in-memory study is not concurrency-safe and a bandit
+  updated from two threads corrupts its covariance matrix; both are microseconds
+  against minutes of build, so the locks are free. Threads (not processes) are
+  correct here because the cost is `subprocess.communicate`, which releases the
+  GIL. Consequences to state honestly, not paper over:
+  - **`--seed` is not reproducible at W>1** (interleaving varies).
+  - Both learners see **delayed, out-of-order feedback** — a promote-to-F3 is
+    scored minutes later. Ray does the same to AutoTuner's searchers.
+  - **`--max-f3` can overshoot by up to W−1** builds already in flight.
+  - `--openroad-threads` defaults to `cpu_count // jobs` so W×T fits the box;
+    `--memory-limit-gb` (ulimit -v) makes a greedy build fail cleanly instead of
+    OOM-killing its peers.
+  - `W=1` runs the serial code path verbatim — no threads, no scheduler.
 - **All tool subprocesses are process-group-killed on timeout/failure**
   (`_run_capture`/`_killpg` for the proxy/elaborate/reference-STA paths, the
   same pattern `run_physical` uses). No detached yosys/openroad survivors.

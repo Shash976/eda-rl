@@ -35,6 +35,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -51,7 +52,7 @@ except Exception:
 # ── imports (all defensive with clear error messages) ─────────────────────────
 
 try:
-    from eda_rl.funnel.env import FunnelEnv, load_table
+    from eda_rl.funnel.env import CampaignState, FunnelEnv, load_table
     _FUNNEL_OK = True
 except Exception as _e:
     _FUNNEL_OK = False
@@ -212,6 +213,7 @@ def run_campaign(
     results_path: str | Path,
     space_yaml: str | Path,
     verbose: bool = True,
+    jobs: int = 1,
 ) -> dict:
     """Run one funnel optimizer campaign.
 
@@ -269,19 +271,30 @@ def run_campaign(
         else:
             print(f"  [WARNING] Table not found at {tp}; running in live mode.")
 
-    # ── build FunnelEnv ────────────────────────────────────────────────────────
-    env = FunnelEnv(
-        space_yaml=space_yaml,
-        platform=platform,
-        budget=budget,
-        surrogate=surrogate,
-        table=table,
-        results_path=results_path.parent / f"funnel_{campaign_id}.jsonl",
-        seed=seed,
-        design=design,
-        max_tier=max_tier,
-        active_space=space,  # pass the KnobRegistry space so validation uses its bounds
-    )
+    # ── build FunnelEnv(s) ─────────────────────────────────────────────────────
+    # With --jobs W there are W envs running episodes concurrently, all sharing
+    # ONE CampaignState so they share a budget, an incumbent, the reward anchors
+    # and the log file.  W=1 is exactly the historical single-env setup.
+    jobs = max(1, int(jobs))
+    campaign_state = CampaignState(budget, results_path.parent / f"funnel_{campaign_id}.jsonl")
+
+    def _make_env() -> FunnelEnv:
+        return FunnelEnv(
+            space_yaml=space_yaml,
+            platform=platform,
+            budget=budget,
+            surrogate=surrogate,
+            table=table,
+            results_path=results_path.parent / f"funnel_{campaign_id}.jsonl",
+            seed=seed,
+            design=design,
+            max_tier=max_tier,
+            active_space=space,  # pass the KnobRegistry space so validation uses its bounds
+            campaign_state=campaign_state,
+        )
+
+    envs = [_make_env() for _ in range(jobs)]
+    env = envs[0]   # any env answers campaign-level questions; they share state
 
     # ── build agents ───────────────────────────────────────────────────────────
     # surrogate_ucb must rank candidates with the same reward formula
@@ -350,172 +363,235 @@ def run_campaign(
     # kills in a real likith campaign).
     episodes_since_f3 = 0
 
-    # The single stop test.  FunnelEnv owns every counter the Budget needs
-    # (wall clock, tool seconds, successful/attempted F3 builds), so both this
-    # loop and the mid-episode check below ask the same question.
-    while not env.budget_exhausted(episodes_since_f3):
-        # ── generate candidate ─────────────────────────────────────────────────
-        try:
-            config = gen.suggest()
-        except Exception as exc:   # noqa: BLE001
-            print(f"  [ERROR] CandidateGenerator.suggest() failed: {exc}")
-            break
+    # ── concurrency ────────────────────────────────────────────────────────────
+    # Only the *stages* run in parallel; the learners stay serialised.  Optuna's
+    # in-memory study is not concurrency-safe, and a bandit updated from two
+    # threads at once corrupts its covariance matrix.  Both are microseconds of
+    # work against minutes of build, so the lock costs nothing.
+    gen_lock = threading.Lock()     # CandidateGenerator ask/tell
+    promo_lock = threading.Lock()   # promotion agent act/update
+    drv_lock = threading.Lock()     # campaign counters + best-so-far
+    log_lock = threading.Lock()     # episode JSONL append
+    stop_flag = threading.Event()
 
-        # ── run episode ────────────────────────────────────────────────────────
-        try:
-            state = env.reset(config)
-        except (ValueError, KeyError) as exc:
-            # Invalid config (not in table, or constraint violation)
-            gen.update(config, reward=-100.0, fidelity="invalid")
-            consecutive_reset_failures += 1
-            if consecutive_reset_failures >= _MAX_CONSECUTIVE_RESET_FAILURES:
-                print(f"  [ABORT] {consecutive_reset_failures} consecutive "
-                      f"env.reset failures (last: {exc!r}) — the candidate space "
-                      f"likely mismatches the table/constraints; stopping campaign.")
-                break
-            continue
-        except Exception as exc:   # noqa: BLE001
-            gen.update(config, reward=-100.0, fidelity="invalid")
-            print(f"  [WARN] env.reset failed: {exc}")
-            consecutive_reset_failures += 1
-            if consecutive_reset_failures >= _MAX_CONSECUTIVE_RESET_FAILURES:
-                print(f"  [ABORT] {consecutive_reset_failures} consecutive "
-                      f"env.reset failures (last: {exc!r}) — stopping campaign.")
-                break
-            continue
-        consecutive_reset_failures = 0   # a good reset breaks any failure streak
+    def _worker(env: "FunnelEnv") -> None:
+        nonlocal best_reward, best_config, n_episodes, n_killed, n_f3
+        nonlocal consecutive_reset_failures, episodes_since_f3
 
-        episode_reward_acc = 0.0
-        episode_done = False
-        fidelity_reached = "F0"
-        episode_actions: list[str] = []
-        episode_step_rewards: list[float] = []
-        episode_terminal_reward: float | None = None   # pure F3 PPA reward (no shaping)
-        episode_table_miss = False
-        episode_t0 = time.time()
-
-        while not episode_done:
-            if env.budget_exhausted(episodes_since_f3):
-                # Over budget mid-episode.  env.spent_s already includes this
-                # episode's accumulated cost (FunnelEnv._charge adds every cost to
-                # both _spent_s and _episode_spent_s), so adding _episode_spent_s
-                # here double-counted the episode spend and stopped campaigns early
-                # (audit F15).  In count mode this also stops the moment the last
-                # required F3 build lands, rather than starting another episode.
-                break
-
-            action = promo.act(state)
-            episode_actions.append(action)
-
+        # The single stop test.  FunnelEnv owns every counter the Budget needs
+        # (wall clock, tool seconds, successful/attempted F3 builds), so both this
+        # loop and the mid-episode check below ask the same question.
+        while not stop_flag.is_set() and not env.budget_exhausted(episodes_since_f3):
+            # ── generate candidate ─────────────────────────────────────────────
             try:
-                next_state, reward, episode_done, info = env.step(action)
-                print(f"    └── [STEP] Gate: {fidelity_reached} -> Action Chosen: {action.upper()} -> Step Reward: {reward:+.3f}")
+                with gen_lock:
+                    config = gen.suggest()
             except Exception as exc:   # noqa: BLE001
-                print(f"  [WARN] env.step({action!r}) failed: {exc}")
-                episode_done = True
-                reward = 0.0
-                info = {"fidelity": fidelity_reached, "action": action}
+                print(f"  [ERROR] CandidateGenerator.suggest() failed: {exc}")
+                stop_flag.set()
+                return
 
-            promo.update(state, action, reward)
-            state = next_state
-            episode_reward_acc += reward
-            episode_step_rewards.append(reward)
+            # ── run episode ────────────────────────────────────────────────────
+            try:
+                state = env.reset(config)
+            except (ValueError, KeyError) as exc:
+                # Invalid config (not in table, or constraint violation)
+                with gen_lock:
+                    gen.update(config, reward=-100.0, fidelity="invalid")
+                with drv_lock:
+                    consecutive_reset_failures += 1
+                    too_many = consecutive_reset_failures >= _MAX_CONSECUTIVE_RESET_FAILURES
+                if too_many:
+                    print(f"  [ABORT] {consecutive_reset_failures} consecutive "
+                          f"env.reset failures (last: {exc!r}) — the candidate space "
+                          f"likely mismatches the table/constraints; stopping campaign.")
+                    stop_flag.set()
+                    return
+                continue
+            except Exception as exc:   # noqa: BLE001
+                with gen_lock:
+                    gen.update(config, reward=-100.0, fidelity="invalid")
+                print(f"  [WARN] env.reset failed: {exc}")
+                with drv_lock:
+                    consecutive_reset_failures += 1
+                    too_many = consecutive_reset_failures >= _MAX_CONSECUTIVE_RESET_FAILURES
+                if too_many:
+                    print(f"  [ABORT] {consecutive_reset_failures} consecutive "
+                          f"env.reset failures (last: {exc!r}) — stopping campaign.")
+                    stop_flag.set()
+                    return
+                continue
+            with drv_lock:
+                consecutive_reset_failures = 0   # a good reset breaks any failure streak
 
-            # Capture the pure terminal PPA reward (no shaping) when F3 completes
-            # so TPE / best / the log record the real physical score, not the
-            # shaped accumulator (audit H0).
-            if info.get("terminal_reward") is not None:
-                episode_terminal_reward = float(info["terminal_reward"])
-            if info.get("table_miss"):
-                episode_table_miss = True
+            episode_reward_acc = 0.0
+            episode_done = False
+            fidelity_reached = "F0"
+            episode_actions: list[str] = []
+            episode_step_rewards: list[float] = []
+            episode_terminal_reward: float | None = None   # pure F3 PPA reward (no shaping)
+            episode_table_miss = False
+            episode_t0 = time.time()
 
-            fid = info.get("fidelity", fidelity_reached)
-            if fid in _FIDELITY_ORDER:
-                if _FIDELITY_ORDER.index(fid) > _FIDELITY_ORDER.index(fidelity_reached):
-                    fidelity_reached = fid
+            while not episode_done:
+                if stop_flag.is_set() or env.budget_exhausted(episodes_since_f3):
+                    # Over budget mid-episode.  env.spent_s already includes this
+                    # episode's accumulated cost (FunnelEnv._charge adds every cost to
+                    # both _spent_s and _episode_spent_s), so adding _episode_spent_s
+                    # here double-counted the episode spend and stopped campaigns early
+                    # (audit F15).  In count mode this also stops the moment the last
+                    # required F3 build lands, rather than starting another episode.
+                    break
 
-            if episode_done:
-                act = info.get("action", action)
-                if act == "kill":
-                    n_killed += 1
+                with promo_lock:
+                    action = promo.act(state)
+                episode_actions.append(action)
 
-        # ── episode complete ───────────────────────────────────────────────────
-        n_episodes += 1
-        per_fidelity_counts[fidelity_reached] = (
-            per_fidelity_counts.get(fidelity_reached, 0) + 1
-        )
-        # Reset on any episode that actually entered F3, successful or not — the
-        # guard is about the policy refusing to promote, not about build quality.
-        episodes_since_f3 = 0 if fidelity_reached == "F3" else episodes_since_f3 + 1
+                try:
+                    # The expensive part, deliberately OUTSIDE every lock: this is
+                    # the ORFS build, and it is the only thing --jobs parallelises.
+                    next_state, reward, episode_done, info = env.step(action)
+                    if verbose:
+                        print(f"    └── [STEP] Gate: {fidelity_reached} -> Action Chosen: "
+                              f"{action.upper()} -> Step Reward: {reward:+.3f}")
+                except Exception as exc:   # noqa: BLE001
+                    print(f"  [WARN] env.step({action!r}) failed: {exc}")
+                    episode_done = True
+                    reward = 0.0
+                    next_state = state
+                    info = {"fidelity": fidelity_reached, "action": action}
 
-        # F3 terminal reward: use the PURE terminal PPA reward (no shaping), and
-        # only count a real F3 commit (status ok, not a table_miss) as an F3
-        # observation for TPE / the incumbent (audit H0).
-        is_real_f3 = (
-            episode_done and fidelity_reached == "F3"
-            and not episode_table_miss and episode_terminal_reward is not None
-        )
-        f3_reward: float | None = episode_terminal_reward if is_real_f3 else None
-        if f3_reward is not None:
-            gen.update(config, f3_reward, fidelity="F3")
-            n_f3 += 1
-            if f3_reward > best_reward:
-                best_reward = f3_reward
-                best_config = dict(config)
-        else:
-            # table_miss carries no real terminal data — route it through the
-            # kill-memo (not fidelity="F3", which CandidateGenerator.update()
-            # treats as a genuine observation and tells to the Optuna study).
-            not_f3_fidelity = "table_miss" if episode_table_miss else fidelity_reached
-            gen.update(config, episode_reward_acc, fidelity=not_f3_fidelity)
+                with promo_lock:
+                    promo.update(state, action, reward)
+                state = next_state
+                episode_reward_acc += reward
+                episode_step_rewards.append(reward)
 
-        # Update incumbent in env (for state slot [16])
-        # env tracks its own incumbent; we track ours separately for logging
+                # Capture the pure terminal PPA reward (no shaping) when F3 completes
+                # so TPE / best / the log record the real physical score, not the
+                # shaped accumulator (audit H0).
+                if info.get("terminal_reward") is not None:
+                    episode_terminal_reward = float(info["terminal_reward"])
+                if info.get("table_miss"):
+                    episode_table_miss = True
 
-        # ── logging ────────────────────────────────────────────────────────────
-        spent_h = env.spent_s / 3600.0
-        log_row = {
-            "ts":            time.time(),
-            "campaign_id":   campaign_id,
-            **campaign_meta,   # audit F15: design/platform/sampler/promotion/max_tier/seed
-            "episode":       n_episodes,
-            "config":        config,
-            "actions":       episode_actions,
-            "fidelity":      fidelity_reached,
-            "step_rewards":  episode_step_rewards,
-            "episode_reward": episode_reward_acc,
-            "shaped_episode_reward": episode_reward_acc,  # incl. per-step shaping
-            "f3_reward":     f3_reward,                    # pure terminal PPA reward
-            "best_reward":   best_reward if best_reward != float("-inf") else None,
-            # Terminal-fidelity observation: real physical metrics + the 6_final.gds
-            # path for F3 episodes, so reporting and `eda-rl collect` can locate the
-            # actual layouts without re-deriving variant names.
-            "obs":           env.terminal_obs,
-            "spent_s":       round(env.spent_s, 2),
-            "episode_s":     round(time.time() - episode_t0, 3),
-        }
-        log_rows.append(log_row)
+                fid = info.get("fidelity", fidelity_reached)
+                if fid in _FIDELITY_ORDER:
+                    if _FIDELITY_ORDER.index(fid) > _FIDELITY_ORDER.index(fidelity_reached):
+                        fidelity_reached = fid
 
+                if episode_done:
+                    act = info.get("action", action)
+                    if act == "kill":
+                        with drv_lock:
+                            n_killed += 1
+
+            # ── episode complete ───────────────────────────────────────────────
+            # F3 terminal reward: use the PURE terminal PPA reward (no shaping), and
+            # only count a real F3 commit (status ok, not a table_miss) as an F3
+            # observation for TPE / the incumbent (audit H0).
+            is_real_f3 = (
+                episode_done and fidelity_reached == "F3"
+                and not episode_table_miss and episode_terminal_reward is not None
+            )
+            f3_reward: float | None = episode_terminal_reward if is_real_f3 else None
+
+            with drv_lock:
+                n_episodes += 1
+                my_episode = n_episodes
+                per_fidelity_counts[fidelity_reached] = (
+                    per_fidelity_counts.get(fidelity_reached, 0) + 1
+                )
+                # Reset on any episode that actually entered F3, successful or not —
+                # the guard is about the policy refusing to promote, not about build
+                # quality.
+                episodes_since_f3 = (0 if fidelity_reached == "F3"
+                                     else episodes_since_f3 + 1)
+                if f3_reward is not None:
+                    n_f3 += 1
+                    if f3_reward > best_reward:
+                        best_reward = f3_reward
+                        best_config = dict(config)
+                best_snapshot = best_reward
+
+            if f3_reward is not None:
+                with gen_lock:
+                    gen.update(config, f3_reward, fidelity="F3")
+            else:
+                # table_miss carries no real terminal data — route it through the
+                # kill-memo (not fidelity="F3", which CandidateGenerator.update()
+                # treats as a genuine observation and tells to the Optuna study).
+                not_f3_fidelity = "table_miss" if episode_table_miss else fidelity_reached
+                with gen_lock:
+                    gen.update(config, episode_reward_acc, fidelity=not_f3_fidelity)
+
+            # ── logging ────────────────────────────────────────────────────────
+            spent_h = env.spent_s / 3600.0
+            log_row = {
+                "ts":            time.time(),
+                "campaign_id":   campaign_id,
+                **campaign_meta,   # audit F15: design/platform/sampler/promotion/max_tier/seed
+                "episode":       my_episode,
+                "config":        config,
+                "actions":       episode_actions,
+                "fidelity":      fidelity_reached,
+                "step_rewards":  episode_step_rewards,
+                "episode_reward": episode_reward_acc,
+                "shaped_episode_reward": episode_reward_acc,  # incl. per-step shaping
+                "f3_reward":     f3_reward,                    # pure terminal PPA reward
+                "best_reward":   best_snapshot if best_snapshot != float("-inf") else None,
+                # Terminal-fidelity observation: real physical metrics + the 6_final.gds
+                # path for F3 episodes, so reporting and `eda-rl collect` can locate the
+                # actual layouts without re-deriving variant names.
+                "obs":           env.terminal_obs,
+                "spent_s":       round(env.spent_s, 2),
+                "episode_s":     round(time.time() - episode_t0, 3),
+            }
+
+            # Serialised: concurrent appends interleave and corrupt JSONL lines.
+            with log_lock:
+                log_rows.append(log_row)
+                try:
+                    with open(results_path, "a", encoding="utf-8") as fout:
+                        fout.write(json.dumps(log_row) + "\n")
+                except OSError:
+                    pass
+
+            if verbose:
+                cfg_items = []
+                for axis_name in space.keys():
+                    val = config.get(axis_name, '?')
+                    # If it's a float, format it cleanly so it doesn't clutter the screen
+                    if isinstance(val, float):
+                        cfg_items.append(f"{axis_name}={val:.3f}")
+                    else:
+                        cfg_items.append(f"{axis_name}={val}")
+                cfg_str = " | ".join(cfg_items)
+                r_str = (f"{episode_reward_acc:+.3f}" if f3_reward is None
+                         else f"{f3_reward:+.3f}(F3)")
+                best_str = (f"{best_snapshot:+.3f}" if best_snapshot != float("-inf")
+                            else "     —")
+                print(f"  {my_episode:>8d} {fidelity_reached:>8} {r_str:>9} "
+                      f"{best_str:>9} {spent_h:>8.3f}h  {cfg_str}")
+
+    if jobs == 1:
+        # Identical control flow to the pre-concurrency driver: no threads, no
+        # scheduling nondeterminism, so a seeded campaign stays reproducible.
+        _worker(envs[0])
+    else:
+        threads = [threading.Thread(target=_worker, args=(e,), daemon=True,
+                                    name=f"funnel-w{i}")
+                   for i, e in enumerate(envs)]
+        for th in threads:
+            th.start()
         try:
-            with open(results_path, "a", encoding="utf-8") as fout:
-                fout.write(json.dumps(log_row) + "\n")
-        except OSError:
-            pass
-
-        if verbose:
-            cfg_items = []
-            for axis_name in space.keys():
-                val = config.get(axis_name, '?')
-                # If it's a float, format it cleanly so it doesn't clutter the screen
-                if isinstance(val, float):
-                    cfg_items.append(f"{axis_name}={val:.3f}")
-                else:
-                    cfg_items.append(f"{axis_name}={val}")
-            cfg_str = " | ".join(cfg_items)
-            r_str = f"{episode_reward_acc:+.3f}" if f3_reward is None else f"{f3_reward:+.3f}(F3)"
-            best_str = f"{best_reward:+.3f}" if best_reward != float("-inf") else "     —"
-            print(f"  {n_episodes:>8d} {fidelity_reached:>8} {r_str:>9} "
-                  f"{best_str:>9} {spent_h:>8.3f}h  {cfg_str}")
+            for th in threads:
+                th.join()
+        except KeyboardInterrupt:
+            stop_flag.set()
+            for th in threads:
+                th.join(timeout=30)
+            raise
 
     # ── summary ────────────────────────────────────────────────────────────────
     elapsed_s = time.time() - t0
@@ -638,6 +714,22 @@ def main() -> None:
                         "(default: campaigns/<design>/<platform>/results_funnel_campaigns.jsonl)")
     p.add_argument("--space-yaml", default=str(_DEFAULT_SPACE_YAML), dest="space_yaml",
                    help="Path to search_space_funnel.yaml")
+    p.add_argument("--jobs", type=int, default=1, dest="jobs",
+                   help="Concurrent episodes (parallel F3 builds). Only the tool "
+                        "runs overlap; the sampler and promotion policy stay "
+                        "serialised. NOTE: >1 is NOT bit-reproducible for a given "
+                        "--seed, both learners then see delayed feedback, and "
+                        "--max-f3 may overshoot by up to --jobs-1 builds already "
+                        "in flight when the quota is reached")
+    p.add_argument("--openroad-threads", type=int, default=None,
+                   dest="openroad_threads",
+                   help="Threads per ORFS build (NUM_CORES). Default: all cores "
+                        "divided by --jobs, so W builds x T threads fits the box")
+    p.add_argument("--memory-limit-gb", type=float, default=None,
+                   dest="memory_limit_gb",
+                   help="Per-build address-space cap (ulimit -v). Unset = no cap. "
+                        "Worth setting with --jobs so one greedy build fails "
+                        "cleanly instead of OOM-killing its peers")
     p.add_argument("--quiet", action="store_true",
                    help="Suppress per-episode output")
 
@@ -672,6 +764,24 @@ def main() -> None:
     if is_mock:
         print(f"  [MOCK MODE] PHYSICAL_MOCK=1 — using mock metrics")
 
+    # Resource split across concurrent builds.  Set via the environment because
+    # physical_runner reads its defaults at import time and run_physical is
+    # reached through several call paths (env, build_table, doctor).
+    jobs = max(1, int(args.jobs))
+    threads = args.openroad_threads
+    if threads is None:
+        threads = max(1, (os.cpu_count() or 1) // jobs)
+    os.environ["EDA_RL_NUM_CORES"] = str(int(threads))
+    if args.memory_limit_gb is not None:
+        os.environ["EDA_RL_MEMORY_LIMIT_GB"] = str(float(args.memory_limit_gb))
+    if jobs > 1:
+        print(f"  [PARALLEL] {jobs} concurrent builds x {threads} threads each"
+              + (f", {args.memory_limit_gb} GB cap per build"
+                 if args.memory_limit_gb else ""))
+        print(f"  [PARALLEL] --seed {args.seed} is NOT reproducible at --jobs>1: "
+              f"episode interleaving varies, and the sampler and bandit see "
+              f"delayed, out-of-order feedback.")
+
     run_campaign(
         design=args.design,
         platform=args.platform,
@@ -685,6 +795,7 @@ def main() -> None:
         results_path=out_path,
         space_yaml=Path(args.space_yaml),
         verbose=not args.quiet,
+        jobs=jobs,
     )
 
 
