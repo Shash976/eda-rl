@@ -199,6 +199,40 @@ def _warn_knob_once(msg: str) -> None:
             _knob_warn_atexit_registered = True
 
 
+# ── stage-failure escalation (audit A5) ───────────────────────────────────────
+# A tinymac/asap7 campaign ran 3,153 F2 evaluations that ALL failed with the same
+# message ("no proxy lib/lef for platform 'asap7'"), for 6.2 h, unnoticed — the
+# entire screening tier was a no-op and 33 configs were promoted to F3 through a
+# gate that never ran.  Nothing escalated because each failure was handled
+# locally and returned a status the caller treated as ordinary.
+#
+# A repeated IDENTICAL stage failure is categorically different from a flaky
+# build: it means the stage is misconfigured for this design/platform and every
+# further attempt will fail the same way.  Escalate on a geometric schedule so
+# the signal is impossible to miss without spamming the log.
+_stage_failure_counts: dict[str, int] = {}
+_STAGE_FAILURE_ESCALATIONS = (1, 10, 100, 1000)
+
+
+def _note_stage_failure(stage: str, reason: str) -> int:
+    """Record one stage failure; print at 1, 10, 100, 1000 identical occurrences.
+
+    Returns the running count so callers can surface it.
+    """
+    import sys as _sys
+    key = f"{stage}: {reason}"
+    n = _stage_failure_counts.get(key, 0) + 1
+    _stage_failure_counts[key] = n
+    if n in _STAGE_FAILURE_ESCALATIONS:
+        if n == 1:
+            print(f"[physical_runner] {stage} FAILED: {reason}", file=_sys.stderr)
+        else:
+            print(f"[physical_runner] {stage} has now failed {n}× with the SAME "
+                  f"error — this tier is not working for this design/platform, "
+                  f"so it is screening nothing: {reason}", file=_sys.stderr)
+    return n
+
+
 # ── Subprocess helpers (process-group-safe) ───────────────────────────────────
 
 def _killpg(proc: "subprocess.Popen") -> None:
@@ -1225,6 +1259,10 @@ def run_synth_sta(lanes: int, acc_w: int, clk_ns: float, platform: str = "nangat
         )
     lib_rels = _LIBERTY.get(platform)
     if not lib_rels or platform not in _LEF:
+        # This exact condition silently no-op'd the F2 tier for 3,153 consecutive
+        # evaluations in a real campaign (audit A5) — escalate so it cannot go
+        # unnoticed again, then still raise for the caller to classify.
+        _note_stage_failure("F2 proxy", f"no proxy lib/lef for platform '{platform}'")
         raise ValueError(f"no proxy lib/lef for platform '{platform}' "
                          f"(try nangate45 / sky130hd / asap7)")
     libs = [ORFS_DIR / "flow" / rel for rel in lib_rels]
@@ -1262,6 +1300,11 @@ def run_synth_sta(lanes: int, acc_w: int, clk_ns: float, platform: str = "nangat
     )
     (work / "synth.log").write_text((p1.stdout or "") + "\n--- stderr ---\n" + (p1.stderr or ""))
     if p1.returncode != 0 or not netlist.exists():
+        # Escalate on repeats: a synth step that keeps failing the same way means
+        # the F2 tier is screening nothing, not that one config was unlucky.
+        _last = (p1.stderr or p1.stdout or "").strip().splitlines()
+        _note_stage_failure("F2 synth",
+                            _last[-1][:200] if _last else f"yosys rc={p1.returncode}")
         return {**base, "status": "FAIL", "stage": "synth",
                 "area_um2": None, "fmax_mhz": None, "wns_ns": None, "tns_ns": None,
                 "timing_met": None, "power_mw": None}

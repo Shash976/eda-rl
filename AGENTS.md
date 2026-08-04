@@ -93,6 +93,7 @@ python -m eda_rl.common.knobs
 python -m eda_rl.funnel.budget
 python3 tests/test_parsers.py                  # golden-log parser tests (REAL tool output)
 python3 tests/test_reward.py                   # reward property tests (anti-gaming invariants)
+python3 tests/test_log_schema.py               # committed campaign logs stay valid + attributable
 PHYSICAL_MOCK=1 eda-rl doctor --design gcd --platform nangate45
 PHYSICAL_MOCK=1 python -m eda_rl.funnel.build_table --design tinymac_accel --subset strategic --limit 5  # --design required; auto-writes to a temp path under mock
 ```
