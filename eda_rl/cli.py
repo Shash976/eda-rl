@@ -3,10 +3,10 @@
 Dispatches subcommands to the existing module ``main()`` functions, each of which
 parses its own arguments with argparse.  Usage:
 
-    eda-rl optimize    --design <yaml> --platform <plat> --budget-hours N [...]
+    eda-rl optimize    --design <yaml> --platform <plat> [--budget-hours N | --max-f3 N] [...]
     eda-rl build-table --design <yaml> [...]
     eda-rl benchmark   [...]
-    eda-rl report      --design <name> --platform <plat> [--campaign all|latest|<id>] [...]
+    eda-rl report      [--design <name> --platform <plat> | --campaign all | --log <jsonl>] [...]
 
 Run ``eda-rl <subcommand> --help`` for per-command options.
 """

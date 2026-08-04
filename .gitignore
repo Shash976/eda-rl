@@ -21,6 +21,13 @@ eda_rl/reports/
 reports/
 *.optuna-journal
 
+# ─── Oversized checkdesigns campaign logs (185 MB; >100 MB is a hard GitHub
+# reject). Distilled copies are committed as campaign_records.jsonl — see
+# eda_rl/campaigns/README.md. Never `git add -f` these.
+eda_rl/campaigns/npuload/nangate45/results_funnel_campaigns.jsonl
+eda_rl/campaigns/tensordyne/nangate45/results_funnel_campaigns.jsonl
+eda_rl/campaigns/tpu/nangate45/results_funnel_campaigns.jsonl
+
 # ─── Raw per-run campaign logs dumped at root (curated copies live in campaigns/)
 funnel_campaign_*.jsonl
 *_run[0-9]*.jsonl

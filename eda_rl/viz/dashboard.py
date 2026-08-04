@@ -23,6 +23,7 @@ it live; deleting it forces a clean rebuild (or pass --rebuild).
 from __future__ import annotations
 
 import argparse
+import socket
 import subprocess
 import sys
 import time
@@ -31,6 +32,24 @@ from pathlib import Path
 # [eda_rl] bootstrap removed (installed package): sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from eda_rl.viz.campaign_data import build_study, load_campaign_rows, resolve_log_path  # noqa: E402
+
+
+def _free_port(host: str, port: int, tries: int = 100) -> int:
+    """Return the first bindable port at/after `port` on `host`.
+
+    Lets a second dashboard come up instead of dying on
+    'Address already in use' when another one already owns the port.
+    """
+    for candidate in range(port, port + tries):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind((host, candidate))
+                return candidate
+            except OSError:
+                continue
+    raise SystemExit(
+        f"no free port in [{port}, {port + tries}) on {host}")
 
 
 def _make_storage(path: Path):
@@ -95,11 +114,16 @@ def main() -> None:
     if args.no_serve:
         return
 
-    # Launch optuna-dashboard against the journal storage.
+    # Launch optuna-dashboard against the journal storage. If the requested
+    # port is taken (e.g. another dashboard is already running), roll forward
+    # to the next free one instead of crashing.
+    port = _free_port(args.host, args.port)
+    if port != args.port:
+        print(f"port {args.port} busy → using {port}")
     cmd = ["optuna-dashboard", str(storage_path),
-           "--host", args.host, "--port", str(args.port)]
+           "--host", args.host, "--port", str(port)]
     print(f"Launching: {' '.join(cmd)}")
-    print(f"  → open http://{args.host}:{args.port}/  (study: {study_name})")
+    print(f"  → open http://{args.host}:{port}/  (study: {study_name})")
     proc = subprocess.Popen(cmd)
 
     try:
