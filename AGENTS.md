@@ -224,6 +224,30 @@ design opts in via `functional_eval.kind`; `base.py` is the interface,
   slowest clock allowed". The tell: corr(clk, power) = −0.69 but
   corr(clk, power×period) = −0.04, i.e. the whole effect was the frequency
   confound. This is the audit-F1 hole reopening in the one term F1 left raw.)
+
+  **Verified on real tools** by a controlled sweep — sagar/sky130hd, 8 clocks
+  across [5.5, 8.0], every other knob fixed, all 8 builds timing-clean. The
+  chip is *identical* at every point (area 492.0 µm² and fmax_ref ≈505 MHz
+  constant), so nothing but the clock request differs:
+
+  | | raw power | power @ ref freq | corr(clk, reward) | best clock |
+  |---|---|---|---|---|
+  | v1 | spread **46.0 %**, ρ(clk)=−1.000 | — | **+1.000** | **8.000 = the range ceiling** |
+  | v2 | — | spread **1.4 %**, ρ(clk)=+0.071 | **+0.143** | 7.286 |
+
+  Reward spread shrinks 93 % (0.126 → 0.0084); the +0.143 residual is the
+  1.4 % measurement jitter. Reproduce with the sweep in the audit notes; do not
+  re-validate this on a logged corpus — a corpus TPE selected under v1 is
+  biased by the very effect being tested (see the `fmax_ref` note below).
+- **A logged corpus cannot validate a reward change.** The sagar corpus also
+  showed corr(fmax_ref, clk) = +0.47, which looked like a second ruler leak. It
+  is not: `comb_delay_ns` is `(arrival − input_ext)` from one report so the
+  clock cancels exactly, and `comb_delay` is set by `abc_recipe` (orfs_area
+  1.83 ns vs orfs_speed 1.98 ns), flat *within* a recipe. TPE simply sampled
+  orfs_area more at high clock because v1's power term paid it to. The
+  controlled sweep settles it: on real builds corr(clk, fmax_ref) is
+  **−1.000** on gcd (a faster request genuinely yields a faster netlist) —
+  the *opposite* sign to the corpus.
 - **DRC violations gate the reward** (audit F19). `drc_count` is parsed from
   OpenROAD's own METRICS2.1 key `detailedroute__route__drc_errors` (stage
   JSON; the `5_route_drc.rpt` text is a fallback) and penalised via `w_drc`,
