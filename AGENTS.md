@@ -67,6 +67,8 @@ eda-rl collect   --design gcd --platform nangate45 --campaign latest --render # 
 eda-rl dashboard --design gcd --platform nangate45 --campaign latest --port 8080  # live Optuna view
 eda-rl build-table --design gcd --max-tier 2   # offline F0–F2 table (resumable)
 eda-rl benchmark --seeds 20                    # promotion-policy table benchmark
+eda-rl import-autotuner --config <autotuner.json> --platform asap7 --diff likith
+                                               # ORFS AutoTuner config -> eda-rl YAML (handles ps-vs-ns)
 eda-rl fit-surrogate                           # mine campaign logs, fit + CV the surrogate
 # report/collect/dashboard all accept --design/--platform (resolves the log for you,
 # no path/glob knowledge needed) or an explicit --log <jsonl> if you have one off to
