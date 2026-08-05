@@ -30,7 +30,6 @@ from eda_rl.viz.campaign_data import (  # noqa: E402
     CampaignData,
     build_study,
     episode_value,
-    obs_objective,
     resolve_log_path,
 )
 

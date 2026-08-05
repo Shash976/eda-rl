@@ -47,6 +47,7 @@ import sys
 import time
 from itertools import product
 from pathlib import Path
+from typing import Any
 
 
 # ── path setup ────────────────────────────────────────────────────────────────
@@ -308,7 +309,6 @@ def _eval_f1(config: dict, design: "Any | None" = None) -> tuple[dict, str]:
         return {"note": "F1 skipped: design has no functional evaluator"}, "skipped"
 
     lanes = int(config.get("mac_lanes") or config.get("lanes") or 0)
-    acc_w = int(config.get("accumulator_width") or config.get("acc_w") or 0)
 
     if lanes not in _F1_CACHE:
         mock = bool(os.environ.get("PHYSICAL_MOCK"))

@@ -1,0 +1,74 @@
+name: Nightly real-tools build
+
+on:
+  schedule:
+    - cron: "0 7 * * *" # 07:00 UTC daily
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  f2-f3-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build eda-rl + ORFS image
+        run: docker build -t eda-rl-nightly .
+
+      - name: Prepare output dir
+        run: mkdir -p nightly-out
+
+      - name: Run one real F3 build (gcd/nangate45)
+        run: |
+          docker run --rm -v "$PWD/nightly-out:/out" eda-rl-nightly \
+            eda-rl optimize --design gcd --platform nangate45 \
+              --max-f3 1 --budget-hours 1 --max-tier 3 \
+              --sampler random --promotion fixed \
+              --out /out/campaign.jsonl
+
+      - name: Render report
+        if: always()
+        run: |
+          if [ -s nightly-out/campaign.jsonl ]; then
+            docker run --rm -v "$PWD/nightly-out:/out" eda-rl-nightly \
+              eda-rl report --log /out/campaign.jsonl --out /out/report.html
+          fi
+
+      - name: Assert a real F3 build actually ran
+        run: |
+          if [ ! -s nightly-out/campaign.jsonl ]; then
+            echo "campaign.jsonl missing or empty — no build output at all"
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json, sys
+
+          ok = False
+          with open("nightly-out/campaign.jsonl") as f:
+              for line in f:
+                  line = line.strip()
+                  if not line:
+                      continue
+                  row = json.loads(line)
+                  if row.get("fidelity") == "F3" and row.get("status") not in (
+                      "FAIL", "TIMEOUT", "PARSE_FAIL", "config_abort",
+                  ):
+                      ok = True
+                      break
+
+          if not ok:
+              print("no successful F3 row found in campaign.jsonl — "
+                    "nightly did not do real work")
+              sys.exit(1)
+          PY
+
+      - name: Upload nightly output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-f2-f3-output
+          path: nightly-out/
+          retention-days: 14

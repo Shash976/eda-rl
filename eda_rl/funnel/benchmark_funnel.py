@@ -482,7 +482,7 @@ def _make_agent(name: str, seed: int) -> Any | None:
         return PromotionAgent(dim=STATE_DIM, alpha=1.0, seed=seed, actions=ACTIONS)
     elif name == "ppo":
         try:
-            from stable_baselines3 import PPO  # type: ignore[import]
+            from stable_baselines3 import PPO  # type: ignore[import]  # noqa: F401
             # PPO hook: wrap in a thin adapter that satisfies our act/update interface
             # (not trained here — serves as a wiring test stub)
             class _PPOAdapter:
@@ -728,8 +728,6 @@ def _print_results(
         r_med = rand_r["median_ttt_h"]
         f_med = fixed_r["median_ttt_h"]
         l_med = linucb_r["median_ttt_h"]
-        best_name = min([("random", r_med), ("fixed", f_med), ("linucb", l_med)],
-                        key=lambda x: x[1])[0]
 
         if linucb_r["median_ttt_h"] < rand_r["median_ttt_h"] * 0.95:
             lines.append(
