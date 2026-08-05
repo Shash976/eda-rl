@@ -293,7 +293,6 @@ def _delta_span(v, base, lower_is_better: bool) -> str:
 
 
 def _card(r: dict, img_b64: str | None, baseline: dict | None = None) -> str:
-    o = _obs(r)
     cfg = r.get("config") or {}
     is_base = r["_badge"] == "BASELINE"
     best = r["_badge"] in ("BEST OVERALL", "TOP-1")

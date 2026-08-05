@@ -23,6 +23,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dashboard = ["optuna-dashboard"]
+dev = ["pytest", "coverage", "ruff"]
 
 [project.scripts]
 eda-rl = "eda_rl.cli:main"
@@ -32,3 +33,28 @@ include = ["eda_rl", "eda_rl.*"]
 
 [tool.setuptools.package-data]
 eda_rl = ["**/*.yaml", "**/*.yml"]
+
+[tool.coverage.run]
+source = ["eda_rl"]
+
+[tool.ruff]
+line-length = 100
+exclude = ["legacy", "eda_rl_runs"]
+
+[tool.ruff.lint]
+# Pinned explicitly (not left to ruff's version-dependent default) to
+# pyflakes + pycodestyle error-level checks: real correctness signal
+# (undefined names, unused imports, syntax) without pulling in ruff's
+# broader default rule surface, which flags ~200 pre-existing style-only
+# findings (semicolon-joined statements, ambiguous `l` names, f-strings
+# without placeholders, import ordering) across files this PR doesn't
+# otherwise touch. Widening this select is a deliberate future PR, not a
+# side effect of turning CI on.
+select = ["E4", "E7", "E9", "F"]
+ignore = [
+  "E401", # multiple imports on one line — pre-existing style in a few files
+  "E402", # module-level import not at top — deliberate sys.path shims in scripts/tests
+  "E702", # semicolon-joined statements — dense pre-existing style in promotion_agent.py
+  "E741", # ambiguous variable name (`l`) — pre-existing, unrelated to this change
+  "F541", # f-string without placeholders — harmless, pre-existing
+]
