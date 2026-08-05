@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """report.py — static self-contained HTML report for a funnel-optimizer campaign.
 
-    eda-rl report                       # latest campaign
+    eda-rl report                                    # latest campaign
     eda-rl report --campaign all
     eda-rl report --design gcd --platform nangate45 --open
-    eda-rl report --out /tmp/run.html
+    eda-rl report --log some_campaign.jsonl --out /tmp/run.html
 
 Produces one HTML file (Plotly CDN, no server) with:
   - optimization history: per-episode reward + best-so-far, vs episode and vs
@@ -829,9 +829,10 @@ def main() -> None:
     args = ap.parse_args()
     args.log = str(resolve_log_path(args.log, args.design, args.platform))
 
-    data = CampaignData.load(args.log, args.campaign)
+    log_path = resolve_log_path(args.log, args.design, args.platform)
+    data = CampaignData.load(log_path, args.campaign)
     if not data.rows:
-        print(f"No episodes found in {args.log} for campaign={args.campaign!r}")
+        print(f"No episodes found in {log_path} for campaign={args.campaign!r}")
         sys.exit(1)
 
     f3_count = sum(1 for r in data.rows if r.get("fidelity") == "F3" and _f3_status_ok(r))
@@ -839,7 +840,6 @@ def main() -> None:
           f"{len(data.specs)} params, {f3_count} F3 results)")
 
     # ── infer design / platform from the log path for a human-readable title ──
-    log_path = Path(args.log)
     platform = log_path.parent.name
     design   = log_path.parent.parent.name
     # Backfill the design onto rows that predate the self-describing-rows

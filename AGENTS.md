@@ -56,14 +56,30 @@ export ORFS_DIR=/opt/OpenROAD-flow-scripts      # real runs; or PHYSICAL_MOCK=1
 eda-rl doctor --design likith --platform asap7            # seconds
 eda-rl doctor --design likith --platform asap7 --probe-f3 # + real build, finds the PDN util floor
 
+# Bound a campaign by TIME or by BUILD COUNT (or both — first limit wins):
 eda-rl optimize --design gcd --platform nangate45 --budget-hours 4 \
        --sampler tpe|surrogate_ucb|random --promotion fixed|linucb|random \
        --max-tier N       # N must cover the design's declared knobs — doctor prints the minimum
+eda-rl optimize --design gcd --platform nangate45 --max-f3 50   # 50 SUCCESSFUL full builds
+eda-rl optimize --design gcd --platform nangate45 --max-f3 50 --budget-hours 8  # …but stop at 8h
+eda-rl optimize --design gcd --platform nangate45 --max-f3 50 --jobs 2  # 2 builds at once
 eda-rl report    --design gcd --platform nangate45 --campaign latest --open  # static HTML (Pareto, funnel, importances…)
-eda-rl collect   --design gcd --platform nangate45 --campaign latest --render # best GDS + before/after page
+eda-rl collect   --design gcd --platform nangate45 --campaign latest --render # best GDS + comparison page.
+                                               # Also builds a stock-default
+                                               # BASELINE (all knobs at default,
+                                               # a real F3 build; needs ORFS or
+                                               # PHYSICAL_MOCK=1) and shows each
+                                               # best config's %-delta vs it.
+                                               # Deltas are auto-suppressed (with
+                                               # a warning) when baseline and
+                                               # campaign are on different rulers
+                                               # (real vs mock). --no-baseline
+                                               # skips the baseline build.
 eda-rl dashboard --design gcd --platform nangate45 --campaign latest --port 8080  # live Optuna view
 eda-rl build-table --design gcd --max-tier 2   # offline F0–F2 table (resumable)
 eda-rl benchmark --seeds 20                    # promotion-policy table benchmark
+eda-rl import-autotuner --config <autotuner.json> --platform asap7 --diff likith
+                                               # ORFS AutoTuner config -> eda-rl YAML (handles ps-vs-ns)
 eda-rl fit-surrogate                           # mine campaign logs, fit + CV the surrogate
 # report/collect/dashboard all accept --design/--platform (resolves the log for you,
 # no path/glob knowledge needed) or an explicit --log <jsonl> if you have one off to
@@ -87,7 +103,10 @@ python -m eda_rl.funnel.promotion_agent
 python -m eda_rl.funnel.candidates
 python -m eda_rl.funnel.benchmark_funnel --selftest
 python -m eda_rl.common.knobs
+python -m eda_rl.funnel.budget
 python3 tests/test_parsers.py                  # golden-log parser tests (REAL tool output)
+python3 tests/test_reward.py                   # reward property tests (anti-gaming invariants)
+python3 tests/test_log_schema.py               # committed campaign logs stay valid + attributable
 PHYSICAL_MOCK=1 eda-rl doctor --design gcd --platform nangate45
 PHYSICAL_MOCK=1 python -m eda_rl.funnel.build_table --design tinymac_accel --subset strategic --limit 5  # --design required; auto-writes to a temp path under mock
 ```
@@ -128,7 +147,7 @@ legacy/             # frozen history, outside the package: gen1/, dead modules,
 | `run_funnel_optimizer.py` | Live campaign driver (`eda-rl optimize`). Probes any auto-loaded surrogate against the campaign design's space; drops it loudly on schema mismatch. |
 | `build_table.py` | Resumable offline F0–F2 table builder. |
 | `benchmark_funnel.py` | Table-simulator benchmark: random vs fixed vs LinUCB. Scores the **pure terminal reward** (`info["terminal_reward"]`), never the shaped accumulator. |
-| `collect_best.py` | `eda-rl collect` — harvest best F3 builds. |
+| `collect_best.py` | `eda-rl collect` — harvest best F3 builds; also builds a stock-default BASELINE (all knobs at default, real F3) and renders each best config's %-delta vs it, suppressing deltas on a real-vs-mock ruler mismatch. |
 | `fit_surrogate.py` | `eda-rl fit-surrogate` — mine campaign logs, fit + CV-validate the surrogate. |
 | `doctor.py` | `eda-rl doctor` — per-design preflight (parsers, knob-range coherence, PDN util floor). |
 
@@ -192,6 +211,55 @@ design opts in via `functional_eval.kind`; `base.py` is the interface,
   reward; sampled-SDC metrics stay in the obs for flow visibility only.
   (Without this, the optimizer's best reward came from loosening its own
   timing budget: corr(reward, IO_DELAY) = −0.83 in a real campaign.)
+- **Power is scored at a fixed reference frequency, never the sampled clock**
+  (audit F18). OpenROAD reports power *at the requested clock*, so dynamic
+  power falls simply by asking for a slower one. `_parse_metrics` keeps the
+  `report_power` decomposition (`power_internal_mw` / `power_switching_mw` /
+  `power_leakage_mw`) and `FunnelEnv._power_at_ref_freq` re-normalises
+  `leakage + dynamic·(clk_ns / default_clock_ns)`. **Area is left raw** — it
+  is genuinely frequency-independent (measured corr(clk, area) = −0.13).
+  (Without this: corr(reward, clock_period_ns) = **+0.76** on a real 178-build
+  sagar campaign, whose best config sat at 7.995 ns against a range ceiling of
+  8.0 — the optimizer's answer to "design a good chip" was "ask for the
+  slowest clock allowed". The tell: corr(clk, power) = −0.69 but
+  corr(clk, power×period) = −0.04, i.e. the whole effect was the frequency
+  confound. This is the audit-F1 hole reopening in the one term F1 left raw.)
+
+  **Verified on real tools** by a controlled sweep — sagar/sky130hd, 8 clocks
+  across [5.5, 8.0], every other knob fixed, all 8 builds timing-clean. The
+  chip is *identical* at every point (area 492.0 µm² and fmax_ref ≈505 MHz
+  constant), so nothing but the clock request differs:
+
+  | | raw power | power @ ref freq | corr(clk, reward) | best clock |
+  |---|---|---|---|---|
+  | v1 | spread **46.0 %**, ρ(clk)=−1.000 | — | **+1.000** | **8.000 = the range ceiling** |
+  | v2 | — | spread **1.4 %**, ρ(clk)=+0.071 | **+0.143** | 7.286 |
+
+  Reward spread shrinks 93 % (0.126 → 0.0084); the +0.143 residual is the
+  1.4 % measurement jitter. Reproduce with the sweep in the audit notes; do not
+  re-validate this on a logged corpus — a corpus TPE selected under v1 is
+  biased by the very effect being tested (see the `fmax_ref` note below).
+- **A logged corpus cannot validate a reward change.** The sagar corpus also
+  showed corr(fmax_ref, clk) = +0.47, which looked like a second ruler leak. It
+  is not: `comb_delay_ns` is `(arrival − input_ext)` from one report so the
+  clock cancels exactly, and `comb_delay` is set by `abc_recipe` (orfs_area
+  1.83 ns vs orfs_speed 1.98 ns), flat *within* a recipe. TPE simply sampled
+  orfs_area more at high clock because v1's power term paid it to. The
+  controlled sweep settles it: on real builds corr(clk, fmax_ref) is
+  **−1.000** on gcd (a faster request genuinely yields a faster netlist) —
+  the *opposite* sign to the corpus.
+- **DRC violations gate the reward** (audit F19). `drc_count` is parsed from
+  OpenROAD's own METRICS2.1 key `detailedroute__route__drc_errors` (stage
+  JSON; the `5_route_drc.rpt` text is a fallback) and penalised via `w_drc`,
+  so a dirty build can never outscore a clean one and `collect_best` never
+  ships an unmanufacturable GDS as BEST OVERALL. **`drc_count is None` means
+  "not measured" and must never be treated as zero** — that would certify an
+  unrouted build as clean.
+- **Reward semantics are versioned.** `physical_reward.REWARD_VERSION` is
+  stamped on every episode row and campaign summary; a row without the key is
+  v1. v1 corpora (raw sampled-clock power, no DRC gate) are **not comparable**
+  with v2 — `fit-surrogate` refuses to fit across a mixed corpus rather than
+  averaging two rulers.
 - **Combinational F2 fmax is `None` + a `combinational` marker, never a
   1000/clk echo.** An inferred (slack-fallback) fmax carries
   `fmax_inferred=True`. The honest combinational speed number is the
@@ -286,6 +354,62 @@ design opts in via `functional_eval.kind`; `base.py` is the interface,
   author-controlled YAML); revisit if that changes.
 
 ### Operational
+- **`funnel/budget.py` owns what bounds a campaign.** One `budget_s` float used
+  to serve three unrelated roles — stop condition, shaping normaliser
+  (`-λ·cost/budget_s`), and state slot [17] — which is why a build-count budget
+  was inexpressible. `Budget` separates them. Rules:
+  - `--max-f3 N` counts **successful** F3 builds only; a FAIL/TIMEOUT/
+    PARSE_FAIL/config_abort is a free retry, so N really means N data points.
+    A `max_f3_attempts` cap (default 3·N) stops a design that fails everything.
+  - `--budget-hours` alone keeps its historical **tool-time** meaning, so old
+    invocations and saved agents are bit-identical (`budget.py`'s self-test
+    asserts `remaining_fraction`/`shaping_normalizer_s` against the old
+    formulas — do not break those assertions). With `--max-f3` it becomes a
+    **wall-clock** safety cap, defaulting to 24 h.
+  - Note `spent_s` is tool time and always understates wall clock (nothing
+    charges candidate generation, Optuna, or logging); `env.wall_elapsed_s` is
+    the real thing, and both are in the summary row.
+  - **No-progress guard**: 2000 consecutive episodes with no F3 attempt aborts
+    with a diagnostic. Without it, a count-bounded campaign whose policy kills
+    everything spins to the wall cap producing nothing — the exact observed
+    LinUCB-collapse shape (7,884 consecutive kills in a real likith run). The
+    threshold is sized from real logs: the longest legitimate streak on record
+    is 1,202.
+- **`--jobs W` parallelises the tool runs and nothing else.** W envs share one
+  `CampaignState` (budget, incumbent, reward anchors, log file); `env.step` —
+  the ORFS build — runs outside every lock, while the Optuna study, the
+  promotion agent, the campaign counters and both JSONL appends are each
+  serialised. Optuna's in-memory study is not concurrency-safe and a bandit
+  updated from two threads corrupts its covariance matrix; both are microseconds
+  against minutes of build, so the locks are free. Threads (not processes) are
+  correct here because the cost is `subprocess.communicate`, which releases the
+  GIL. Consequences to state honestly, not paper over:
+  - **`--seed` is not reproducible at W>1** (interleaving varies).
+  - Both learners see **delayed, out-of-order feedback** — a promote-to-F3 is
+    scored minutes later. Ray does the same to AutoTuner's searchers.
+  - **`--max-f3` can overshoot by up to W−1** builds already in flight.
+  - `--openroad-threads` defaults to `cpu_count // jobs` so W×T fits the box;
+    `--memory-limit-gb` (ulimit -v) makes a greedy build fail cleanly instead of
+    OOM-killing its peers.
+  - `W=1` runs the serial code path verbatim — no threads, no scheduler.
+  - **Measured, and it is not a free win.** On this 4-core box (sagar/sky130hd,
+    `--max-f3 4`, isolated `EDA_RL_WORK` per run so nothing is cache-shared):
+
+    | | builds | Σ build time | wall | overlap |
+    |---|---|---|---|---|
+    | `--jobs 1` | 5 | 143.1 s | 143.1 s | 1.00× |
+    | `--jobs 2` | 6 | 244.6 s | 137.0 s | **1.79×** |
+
+    The scheduler works — 1.79× of a theoretical 2× overlap. But wall clock
+    improved only 4 %, because `--openroad-threads` defaults to
+    `cpu_count // jobs`, so each build drops from 4 threads to 2 and slows from
+    ~33 s to ~63 s. This flow scales near-linearly with cores, so on a saturated
+    4-core box 1 build × 4 threads ≈ 2 builds × 2 threads. **`--jobs` pays off
+    when you have cores a single build cannot saturate** (AutoTuner's Ray-cluster
+    regime), not on a small box. Benchmark it on your hardware before assuming a
+    speedup — and never benchmark two runs that share a work dir, since
+    `run_physical` reuses an existing `6_final.gds` and cache hits (~0.9 s) will
+    fake a 3× win.
 - **All tool subprocesses are process-group-killed on timeout/failure**
   (`_run_capture`/`_killpg` for the proxy/elaborate/reference-STA paths, the
   same pattern `run_physical` uses). No detached yosys/openroad survivors.
@@ -394,9 +518,19 @@ seconds).
 
 - **Branch before committing on `main`.** Commit messages end with a
   `Done by an AI agent` line instead of a co-author trailer.
-- **Don't commit run artifacts.** Per-fidelity traces (`funnel_*.jsonl`) are
-  gitignored; only small example campaign logs under `campaigns/` are
-  committed. `eda_rl/results/funnel/*.joblib` is gitignored.
+- **Don't commit run artifacts.** Per-fidelity traces are gitignored under
+  `campaigns/**` in all three naming schemes the repo has used — `funnel_*.jsonl`
+  (current), `campaign_<ts>.jsonl` and `run<N>.jsonl` (older). This rule was
+  stated here long before it was enforced: 8.5 MB of traces were tracked anyway,
+  including a 5.2 MB and a 3.0 MB file, and are now untracked. Only the
+  per-episode `results_funnel_campaigns.jsonl` belongs in git.
+  `eda_rl/results/funnel/*.joblib` is gitignored.
+- **Self-tests never write to tracked corpora.** `FunnelEnv`'s default
+  `results_path` is the tracked `results/funnel/results_funnel.jsonl`, so any
+  self-test constructing an env without an explicit path silently appends mock
+  rows to it (this happened; caught only because the file showed up dirty in
+  `git status`). Pass a `tempfile.TemporaryDirectory()` path, as
+  `build_table` already does under `PHYSICAL_MOCK`.
 - A non-TinyMAC design needs RTL resolvable on the machine (gcd/likith/sagar
   RTL is vendored; aes/tinymac RTL is not).
 - Keep this file true. Every audit round found stale claims here being

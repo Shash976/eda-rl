@@ -88,6 +88,34 @@ ORFS_DIR     = Path(os.environ.get("ORFS_DIR", "/opt/OpenROAD-flow-scripts"))
 ORFS_TIMEOUT = int(os.environ.get("ORFS_TIMEOUT", "2400"))   # seconds; P&R is slow
 PROXY_TIMEOUT = int(os.environ.get("PROXY_TIMEOUT", "300"))  # synth+STA is fast
 
+
+def _default_num_cores() -> int:
+    """Threads to hand ORFS for one build.
+
+    Until this existed the make line carried no NUM_CORES at all, so every build
+    ran at whatever OpenROAD defaults to rather than at the size of the machine —
+    a straight throughput loss on every campaign ever run.  AutoTuner has always
+    passed the equivalent (`--openroad_threads`, utils.py:368).
+
+    Default: all cores.  With concurrent builds the caller divides
+    (see the campaign driver's --jobs / --openroad-threads).
+    """
+    try:
+        return max(1, int(os.environ.get("EDA_RL_NUM_CORES") or (os.cpu_count() or 1)))
+    except (TypeError, ValueError):
+        return 1
+
+
+NUM_CORES = _default_num_cores()
+
+# Per-build address-space cap in GB (ulimit -v), mirroring AutoTuner's
+# --memory_limit.  Unset = no cap.  Matters once builds run concurrently: an
+# OOM-killed peer is far worse than a build that fails cleanly.
+try:
+    MEMORY_LIMIT_GB: float | None = float(os.environ["EDA_RL_MEMORY_LIMIT_GB"])
+except (KeyError, ValueError):
+    MEMORY_LIMIT_GB = None
+
 # Std-cell liberty file(s) per platform, for the fast synth+STA proxy.
 # nangate45/sky130hd each ship one merged .lib; asap7 has no merged liberty —
 # its cells are split across per-cell-type NLDM libs (4 gzipped + the plain
@@ -169,6 +197,40 @@ def _warn_knob_once(msg: str) -> None:
             import atexit
             atexit.register(_flush_knob_warning_counts)
             _knob_warn_atexit_registered = True
+
+
+# ── stage-failure escalation (audit A5) ───────────────────────────────────────
+# A tinymac/asap7 campaign ran 3,153 F2 evaluations that ALL failed with the same
+# message ("no proxy lib/lef for platform 'asap7'"), for 6.2 h, unnoticed — the
+# entire screening tier was a no-op and 33 configs were promoted to F3 through a
+# gate that never ran.  Nothing escalated because each failure was handled
+# locally and returned a status the caller treated as ordinary.
+#
+# A repeated IDENTICAL stage failure is categorically different from a flaky
+# build: it means the stage is misconfigured for this design/platform and every
+# further attempt will fail the same way.  Escalate on a geometric schedule so
+# the signal is impossible to miss without spamming the log.
+_stage_failure_counts: dict[str, int] = {}
+_STAGE_FAILURE_ESCALATIONS = (1, 10, 100, 1000)
+
+
+def _note_stage_failure(stage: str, reason: str) -> int:
+    """Record one stage failure; print at 1, 10, 100, 1000 identical occurrences.
+
+    Returns the running count so callers can surface it.
+    """
+    import sys as _sys
+    key = f"{stage}: {reason}"
+    n = _stage_failure_counts.get(key, 0) + 1
+    _stage_failure_counts[key] = n
+    if n in _STAGE_FAILURE_ESCALATIONS:
+        if n == 1:
+            print(f"[physical_runner] {stage} FAILED: {reason}", file=_sys.stderr)
+        else:
+            print(f"[physical_runner] {stage} has now failed {n}× with the SAME "
+                  f"error — this tier is not working for this design/platform, "
+                  f"so it is screening nothing: {reason}", file=_sys.stderr)
+    return n
 
 
 # ── Subprocess helpers (process-group-safe) ───────────────────────────────────
@@ -382,6 +444,16 @@ def _parse_metrics(work: Path, platform: str, variant: str, clk_ns: float,
         "setup_viol": None, "power_mw": None, "fmax_mhz": None,
         "period_min_ns": None, "timing_met": None,
         "cell_count": None, "ff_count": None,
+        # Power decomposition (audit F18).  power_mw alone is measured AT THE
+        # SAMPLED CLOCK, so it is not comparable across builds that requested
+        # different clock periods — dynamic power scales with frequency.  Keeping
+        # the split lets the reward re-normalise to a fixed reference frequency
+        # (see FunnelEnv._reward_obs_with_ref).
+        "power_internal_mw": None, "power_switching_mw": None,
+        "power_leakage_mw": None,
+        # Post-route DRC violation count.  None means "not measured" (e.g. the
+        # flow stopped before detailed route) and must NEVER be conflated with 0.
+        "drc_count": None,
         "gds": str(gds) if gds.exists() else None,
         "report": str(rpt) if rpt.exists() else None,
     }
@@ -433,13 +505,45 @@ def _parse_metrics(work: Path, platform: str, variant: str, clk_ns: float,
     if m:
         out["setup_viol"] = int(m.group(1))
 
-    # total power (report_power "Total" row, 5th column = Total Watts)
+    # Power, from the report_power "Total" row:
+    #   Total   1.13e-02  3.16e-03  5.42e-05  1.45e-02  100.0%
+    #           internal  switching leakage   total     %
+    # We keep the full decomposition, not just the total (audit F18): internal +
+    # switching is the frequency-dependent (dynamic) part, leakage is not, and
+    # the reward needs to separate them to normalise power to a fixed frequency.
     for line in rpt_txt.splitlines():
         if line.strip().startswith("Total"):
             nums = re.findall(r"\d+\.?\d*(?:[eE][-+]?\d+)?", line)
             if len(nums) >= 4:                      # internal, switching, leakage, total[, %]
-                out["power_mw"] = float(nums[3]) * 1000.0
+                out["power_internal_mw"]  = float(nums[0]) * 1000.0
+                out["power_switching_mw"] = float(nums[1]) * 1000.0
+                out["power_leakage_mw"]   = float(nums[2]) * 1000.0
+                out["power_mw"]           = float(nums[3]) * 1000.0
             break
+
+    # Post-route DRC violations.  Primary source is OpenROAD's own METRICS2.1
+    # emission: detail_route.tcl sets the stage prefix "detailedroute__" and
+    # FlexDR logs metric "route__drc_errors", so the merged key in the stage JSON
+    # is "detailedroute__route__drc_errors".  That is authoritative and integral;
+    # the text .rpt is only a fallback for trees where the JSON is absent.
+    for jf in sorted((work / "logs" / platform / design_name / variant).glob("5_*.json")):
+        try:
+            import json as _json
+            jd = _json.loads(jf.read_text())
+        except (OSError, ValueError):
+            continue
+        v = jd.get("detailedroute__route__drc_errors", jd.get("route__drc_errors"))
+        if v is not None:
+            try:
+                out["drc_count"] = int(v)
+            except (TypeError, ValueError):
+                pass
+    if out["drc_count"] is None:
+        drc_rpt = work / "reports" / platform / design_name / variant / "5_route_drc.rpt"
+        if drc_rpt.exists():
+            # TritonRoute's -output_drc report: one "violation type:" per marker.
+            # An existing but empty report legitimately means zero violations.
+            out["drc_count"] = len(re.findall(r"violation type:", _read(drc_rpt)))
 
     # timing met: prefer the explicit violation count, else sign of WNS
     if out["setup_viol"] is not None:
@@ -732,7 +836,9 @@ def run_physical(lanes: int, acc_w: int, clk_ns: float, platform: str = "nangate
                  util: int = 40, density: float = 0.60,
                  abc: str | None = None, abc_recipe: str | None = None,
                  design: "Any | None" = None,
-                 knob_values: "dict | None" = None) -> dict:
+                 knob_values: "dict | None" = None,
+                 num_cores: int | None = None,
+                 memory_limit_gb: float | None = None) -> dict:
     """Run the full RTL→GDS flow for one config and return parsed metrics.
 
     Deterministic for a fixed RTL + PDK + flow params, so cached in an explicit
@@ -823,11 +929,23 @@ def run_physical(lanes: int, acc_w: int, clk_ns: float, platform: str = "nangate
                     "fmax_mhz": None, "period_min_ns": None,
                     "timing_met": None, "gds": None, "report": str(log_path)}
 
+        # NUM_CORES tells OpenROAD how many threads it may use for this build.
+        # Until this was added the make line carried none, so every build ran at
+        # OpenROAD's default rather than the size of the machine.  With
+        # concurrent builds the caller passes a divided count so W builds x T
+        # threads does not oversubscribe the box.
+        threads = int(num_cores) if num_cores else NUM_CORES
+        mem_gb = MEMORY_LIMIT_GB if memory_limit_gb is None else memory_limit_gb
+        # ulimit -v caps the build's address space (AutoTuner's --memory_limit).
+        # A build that dies on its own limit fails cleanly; one that trips the
+        # kernel OOM killer can take a concurrent peer down with it.
+        ulimit_prefix = f"ulimit -v {int(mem_gb * 1_000_000)}; " if mem_gb else ""
         make_cmd = (
-            f"source '{env_sh}' && "
+            f"source '{env_sh}' && {ulimit_prefix}"
             f"make --file='{ORFS_DIR}/flow/Makefile' "
             f"FLOW_HOME='{ORFS_DIR}/flow' WORK_HOME='{RUN_DIR}' "
-            f"DESIGN_CONFIG='{gen_cfg}' FLOW_VARIANT='{var}'"
+            f"DESIGN_CONFIG='{gen_cfg}' FLOW_VARIANT='{var}' "
+            f"NUM_CORES={threads}"
         )
         # F13: hold an exclusive per-variant lock across the make invocation so
         # two identical configs (e.g. two seeds sharing this EDA_RL_WORK) don't
@@ -1141,6 +1259,10 @@ def run_synth_sta(lanes: int, acc_w: int, clk_ns: float, platform: str = "nangat
         )
     lib_rels = _LIBERTY.get(platform)
     if not lib_rels or platform not in _LEF:
+        # This exact condition silently no-op'd the F2 tier for 3,153 consecutive
+        # evaluations in a real campaign (audit A5) — escalate so it cannot go
+        # unnoticed again, then still raise for the caller to classify.
+        _note_stage_failure("F2 proxy", f"no proxy lib/lef for platform '{platform}'")
         raise ValueError(f"no proxy lib/lef for platform '{platform}' "
                          f"(try nangate45 / sky130hd / asap7)")
     libs = [ORFS_DIR / "flow" / rel for rel in lib_rels]
@@ -1178,6 +1300,11 @@ def run_synth_sta(lanes: int, acc_w: int, clk_ns: float, platform: str = "nangat
     )
     (work / "synth.log").write_text((p1.stdout or "") + "\n--- stderr ---\n" + (p1.stderr or ""))
     if p1.returncode != 0 or not netlist.exists():
+        # Escalate on repeats: a synth step that keeps failing the same way means
+        # the F2 tier is screening nothing, not that one config was unlucky.
+        _last = (p1.stderr or p1.stdout or "").strip().splitlines()
+        _note_stage_failure("F2 synth",
+                            _last[-1][:200] if _last else f"yosys rc={p1.returncode}")
         return {**base, "status": "FAIL", "stage": "synth",
                 "area_um2": None, "fmax_mhz": None, "wns_ns": None, "tns_ns": None,
                 "timing_met": None, "power_mw": None}
@@ -1352,7 +1479,16 @@ def _mock_metrics(lanes: int, acc_w: int, clk_ns: float) -> dict:
     period_min = round(1000.0 / fmax, 2)
     met = clk_ns >= period_min
     wns = round(clk_ns - 3.82, 3)                           # crit path ≈ 3.82 ns
-    power = round(900.0 + 30.0 * lanes, 1)                  # rough lane scaling, mW
+    # Power: dynamic scales with frequency (1/clk), leakage does not — the same
+    # physics the reward's frequency ruler assumes, so mock exercises that path
+    # instead of falling back and warning.  Anchored so total ≈ the historical
+    # flat value at the nominal 5 ns clock.
+    leakage = round(0.05 * (900.0 + 30.0 * lanes), 3)
+    dyn_at_5ns = (900.0 + 30.0 * lanes) - leakage
+    dynamic = dyn_at_5ns * (5.0 / max(clk_ns, 1e-9))
+    internal = round(dynamic * 0.6, 3)
+    switching = round(dynamic * 0.4, 3)
+    power = round(internal + switching + leakage, 1)
     cell_count = round(cell_area / 1.4)                     # ~µm²/cell at nangate45
     ff_count = round(cell_count * 0.15)                     # plausible sequential share
     return {
@@ -1360,6 +1496,13 @@ def _mock_metrics(lanes: int, acc_w: int, clk_ns: float) -> dict:
         "wns_ns": wns, "tns_ns": round(min(wns, 0.0) * 15, 2),
         "setup_viol": 0 if met else 40,
         "power_mw": power, "fmax_mhz": fmax, "period_min_ns": period_min,
+        # audit F18: the decomposition the reward needs to normalise power to a
+        # fixed frequency.  Fabricated here for the same reason the reference
+        # timing metrics below are: so mock runs take the real reward path.
+        "power_internal_mw": internal, "power_switching_mw": switching,
+        "power_leakage_mw": leakage,
+        # audit F19: mock builds are clean by construction.
+        "drc_count": 0,
         "timing_met": met,
         # audit F1: fabricate the fixed-ruler reference metrics so mock-mode
         # self-tests exercise the same reward path as real runs.  Mock metrics are

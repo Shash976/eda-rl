@@ -53,3 +53,36 @@ has_macros: false
 # check to build an F1 plugin against. F0 is legality/validate_config only.
 functional_eval:
   kind: none
+
+# CORE_UTILIZATION + CORE_ASPECT_RATIO overrides: napier_chip is TINY (F2 cell
+# area ~400-500 um^2), so ORFS's default power-grid runs into PDN-0185
+# ("Insufficient width to add straps on layer metal4") the moment the
+# floorplan gets small or non-square. `eda-rl doctor --probe-f3` PASSES here
+# because it only bisects CORE_UTILIZATION at the default square aspect (1.0) —
+# it never exercises CORE_ASPECT_RATIO, which the live campaign samples over
+# [0.5,2.0] and which is the actual failure axis. Verified via real F3 ORFS
+# builds on nangate45 (clk 1.5 ns, orfs_speed):
+#   util=40 aspect=1.0 -> OK   (area 453, fmax 1088 MHz)
+#   util=40 aspect=1.5 -> PDN-0185 (avail 25.65 um < 28.5 um strap width)
+#   util=40 aspect=2.0 -> PDN-0185
+#   util=30 aspect=1.5 -> PDN-0185     (util=30 does NOT rescue a non-square die)
+#   util=30 aspect=2.0 -> PDN-0185
+#   util=20 aspect=0.5 -> OK   (area 453)
+#   util=20 aspect=1.0 -> OK   (area 458)
+#   util=20 aspect=2.0 -> OK   (area 465, fmax 1053 MHz)
+# i.e. at util=20 the ENTIRE aspect range [0.5,2.0] builds cleanly, while any
+# aspect != 1.0 fails PDN-0185 at util>=30. This also explains the two live-
+# campaign failures: util=37/aspect=1.47 and util=47/aspect=1.51 both hit
+# PDN-0185. So we cap utilization near the confirmed-clean 20 and keep the
+# aspect ratio near-square (belt-and-suspenders: the [0.8,1.2] window is
+# bracketed by the tested util=20 aspect=0.5 and 2.0 clean builds). The top of
+# each range (util 25, aspect 1.2) is a plausible-but-untested edge — an
+# occasional PDN-0185 there is a failed episode, not a crash.
+knobs:
+  override:
+    CORE_UTILIZATION:
+      range: [15.0, 25.0]
+      default: 20.0
+    CORE_ASPECT_RATIO:
+      range: [0.8, 1.2]
+      default: 1.0

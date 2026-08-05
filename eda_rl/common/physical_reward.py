@@ -17,6 +17,20 @@ from __future__ import annotations
 
 import warnings
 
+# Reward semantics version, stamped onto every campaign log row and summary.
+#
+#   1 — original.  Timing on the fixed reference SDC (audit F1), but power scored
+#       RAW at the sampled clock and DRC ignored entirely.  Corpora produced under
+#       v1 are contaminated by the clock-period confound (measured corr(reward,
+#       clock_period_ns) = +0.76) and are NOT comparable with v2.
+#   2 — power normalised to the design's reference frequency (audit F18) and a
+#       DRC gate added (audit F19).
+#
+# Rows without a `reward_version` key are version 1 by definition.  Anything that
+# aggregates across campaigns (fit_surrogate, benchmarks, cross-campaign plots)
+# must refuse to mix versions rather than average them.
+REWARD_VERSION = 2
+
 
 def compute_generic_reward(
     metrics: dict,
@@ -45,6 +59,12 @@ def compute_generic_reward(
     w_area = w.get("w_area", -1.0)
     w_pwr  = w.get("w_power", -0.4)
     w_tv   = w.get("w_timing_violation", -3.0)
+    # audit F19: a build with routing DRC violations is not manufacturable, so it
+    # must not outscore a clean one.  Weighted like the timing gate: any non-zero
+    # count is a hard mark, with a small per-violation term so "nearly clean"
+    # ranks above "hopeless".  drc_count is None when DRC was never measured —
+    # that is NOT the same as zero and must not earn the clean-build score.
+    w_drc  = w.get("w_drc", -3.0)
 
     status = metrics.get("status", "ok")
     if status not in ("ok", "mock", "mock-proxy"):
@@ -87,11 +107,32 @@ def compute_generic_reward(
         norm_power = power_mw / max(float(power_ref), 1e-9)
         power_term = w_pwr * norm_power
         reward += power_term
+
+    # DRC gate (audit F19).  A dirty build is penalised as a flat mark plus a
+    # saturating per-violation term, so 3 violations ranks above 3000 but both
+    # rank below any clean build.  drc_count None => not measured => no term
+    # (scoring it as clean would let an unrouted build win).
+    drc_count = metrics.get("drc_count")
+    drc_viol = None
+    if drc_count is not None:
+        try:
+            drc_count = int(drc_count)
+        except (TypeError, ValueError):
+            drc_count = None
+    if drc_count is not None:
+        drc_viol = drc_count > 0
+        if drc_viol:
+            # 1.0 at the first violation, asymptotically 2.0 for many.
+            severity = 1.0 + drc_count / (drc_count + 50.0)
+            reward += w_drc * severity
+
     return {
         "reward":           round(reward, 4),
         "norm_fmax":        round(norm_fmax, 4),
         "norm_area":        round(norm_area, 4),
         "norm_power":       round(norm_power, 4) if norm_power is not None else None,
         "timing_violation": bool(t_viol),
+        "drc_count":        drc_count,
+        "drc_violation":    drc_viol,
         "infeasible":       False,
     }

@@ -3,10 +3,10 @@
 Dispatches subcommands to the existing module ``main()`` functions, each of which
 parses its own arguments with argparse.  Usage:
 
-    eda-rl optimize    --design <yaml> --platform <plat> --budget-hours N [...]
+    eda-rl optimize    --design <yaml> --platform <plat> [--budget-hours N | --max-f3 N] [...]
     eda-rl build-table --design <yaml> [...]
     eda-rl benchmark   [...]
-    eda-rl report      --design <name> --platform <plat> [--campaign all|latest|<id>] [...]
+    eda-rl report      [--design <name> --platform <plat> | --campaign all | --log <jsonl>] [...]
 
 Run ``eda-rl <subcommand> --help`` for per-command options.
 """
@@ -26,6 +26,7 @@ _COMMANDS: dict[str, str] = {
     "benchmark":   "eda_rl.funnel.benchmark_funnel:main",
     "doctor":      "eda_rl.funnel.doctor:main",
     "fit-surrogate": "eda_rl.funnel.fit_surrogate:main",
+    "import-autotuner": "eda_rl.funnel.import_autotuner:main",
 }
 
 
@@ -42,6 +43,7 @@ def _usage() -> str:
         "benchmark":   "compare promotion/candidate strategies on the table simulator",
         "doctor":      "physics-sanity preflight for a design (parsers, knob ranges, util floor)",
         "fit-surrogate": "mine campaign logs and fit + CV-validate the quantile-GBT surrogate",
+        "import-autotuner": "convert an ORFS AutoTuner autotuner.json into eda-rl design YAML",
     }
     for c in _COMMANDS:
         lines.append(f"  {c.ljust(width)}  {blurbs.get(c, '')}")

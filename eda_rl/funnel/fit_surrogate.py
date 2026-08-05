@@ -320,6 +320,10 @@ def _mine_campaign_rows(design: str | None = None,
             tr["design"] = d
             tr.setdefault("platform", p)
             tr["variant"] = f"{d}/{jf.stem}"
+            # audit F18/F19: carry the reward semantics version so the caller can
+            # refuse to fit across incompatible rulers.  A row with no key was
+            # written before versioning existed and is v1 by definition.
+            tr["reward_version"] = row.get("reward_version", 1)
             rows.append(tr)
     return rows
 
@@ -483,6 +487,21 @@ def main():
     if len({d for d, _ in prov} ) > 1:
         print("    NOTE: corpus spans multiple designs — the surrogate conflates them")
         print("    via rtl_hash/platform context only. Use --design for a clean fit.")
+
+    # audit F18/F19: refuse to fit across reward-semantics versions.  v1 rows were
+    # scored with raw sampled-clock power and no DRC gate, so their rewards are
+    # contaminated by the clock-period confound (corr = +0.76 on the real sagar
+    # corpus).  Averaging them with v2 rows produces a model of neither ruler.
+    ver_counts = Counter(r.get("reward_version", 1) for r in rows)
+    if len(ver_counts) > 1:
+        print("    ERROR: corpus mixes reward-semantics versions "
+              f"{dict(sorted(ver_counts.items()))}.")
+        print("    v1 rows were scored on raw sampled-clock power with no DRC gate")
+        print("    and are NOT comparable with v2. Re-run the affected campaigns, or")
+        print("    restrict the corpus with --design/--platform to a single version.")
+        sys.exit(1)
+    print(f"    Reward semantics: v{next(iter(ver_counts))} "
+          f"({sum(ver_counts.values())} rows)")
 
     # Print a quick summary of what we mined
     lanes_seen = sorted({r["lanes"] for r in rows})
