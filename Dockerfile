@@ -11,12 +11,15 @@ FROM openroad/orfs:26Q1-578-g0a7c9ffc8
 WORKDIR /eda-rl
 COPY . .
 
-# PEP 668: the base image's system Python is externally managed, so a bare
-# `pip install` refuses to touch it. Editable install is deliberate, not
-# incidental: pyproject.toml's package-data only globs **/*.yaml/**/*.yml,
-# so a non-editable `pip install .` would silently drop vendored RTL
-# (eda_rl/designs/gcd/gcd.v etc.) from the installed package.
-RUN python3 -m pip install --no-cache-dir --break-system-packages -e .
+# Editable install is deliberate, not incidental: pyproject.toml's
+# package-data only globs **/*.yaml/**/*.yml, so a non-editable
+# `pip install .` would silently drop vendored RTL (eda_rl/designs/gcd/gcd.v
+# etc.) from the installed package. Try a plain install first, then fall
+# back to --break-system-packages: the pinned base image's pip predates PEP
+# 668 (doesn't even recognize the flag), but a future base-image bump could
+# land a newer pip that enforces it.
+RUN python3 -m pip install --no-cache-dir -e . || \
+    python3 -m pip install --no-cache-dir --break-system-packages -e .
 
 ENV ORFS_DIR=/OpenROAD-flow-scripts
 ENV EDA_RL_WORK=/work
