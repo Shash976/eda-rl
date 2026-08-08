@@ -322,6 +322,7 @@ EDA_RL_DESIGN_ROOT=/path/to/voiceAI \
 | `eda-rl report` | render the graphical HTML analysis dashboard from a campaign |
 | `eda-rl collect` | harvest the best configs: copy their GDS + reports + a comparison page |
 | `eda-rl dashboard` | launch the live/interactive Optuna dashboard (`[dashboard]` extra) |
+| `eda-rl serve` | REST API + web dashboard over committed campaigns (`[api]` extra); see `frontend/README.md` |
 | `eda-rl build-table` | pre-build an offline F0–F2 evaluation table (resumable) |
 | `eda-rl benchmark` | compare promotion / candidate strategies on the table simulator |
 

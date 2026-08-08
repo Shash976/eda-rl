@@ -42,7 +42,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
           cache-dependency-path: pyproject.toml
-      - run: pip install -e ".[dev]"
+      - run: pip install -e ".[dev,api]"
 
       # AGENTS.md "Self-tests" — cheap fidelity gates only (F0/F1), no ORFS.
       # Each is wrapped in `coverage run -a` so one combined report covers
@@ -69,6 +69,9 @@ jobs:
         run: coverage run -a -m eda_rl.cli doctor --design gcd --platform nangate45
       - name: build_table (mock)
         run: coverage run -a -m eda_rl.funnel.build_table --design tinymac_accel --subset strategic --limit 5
+      # Includes tests/test_api.py (FastAPI TestClient against the real
+      # committed gcd/nangate45 log) — no separate API job needed, this
+      # already runs it across the full Python version matrix.
       - name: pytest tests/
         run: coverage run -a -m pytest tests/
 
@@ -85,14 +88,53 @@ jobs:
             htmlcov/
           retention-days: 14
 
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[api]"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - working-directory: frontend
+        run: npm ci
+      # Fails if the committed schema.d.ts drifted from eda_rl/api/'s actual
+      # OpenAPI schema — the FastAPI/TypeScript contract has one source of
+      # truth, and this is what keeps it honest.
+      - working-directory: frontend
+        run: npm run gen:api -- --check
+      - working-directory: frontend
+        run: npm run lint
+      - working-directory: frontend
+        run: npm run build
+      - working-directory: frontend
+        run: npm test
+
+  infra-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # ubuntu-latest ships the Azure CLI; `az bicep` is a self-contained
+      # subcommand — no Azure login needed for a pure local compile.
+      - run: az bicep install
+      - run: az bicep build --file infra/main.bicep --stdout > /dev/null
+
   ci-ok:
-    needs: [lint, test]
+    needs: [lint, test, frontend, infra-lint]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Check required jobs
         run: |
-          if [ "${{ needs.lint.result }}" != "success" ] || [ "${{ needs.test.result }}" != "success" ]; then
-            echo "lint=${{ needs.lint.result }} test=${{ needs.test.result }}"
+          if [ "${{ needs.lint.result }}" != "success" ] || \
+             [ "${{ needs.test.result }}" != "success" ] || \
+             [ "${{ needs.frontend.result }}" != "success" ] || \
+             [ "${{ needs.infra-lint.result }}" != "success" ]; then
+            echo "lint=${{ needs.lint.result }} test=${{ needs.test.result }} frontend=${{ needs.frontend.result }} infra-lint=${{ needs.infra-lint.result }}"
             exit 1
           fi
