@@ -24,7 +24,7 @@ dependencies = [
 [project.optional-dependencies]
 dashboard = ["optuna-dashboard"]
 api = ["fastapi>=0.110", "uvicorn[standard]>=0.27"]
-dev = ["pytest", "coverage", "ruff"]
+dev = ["pytest", "coverage", "ruff", "httpx"]
 
 [project.scripts]
 eda-rl = "eda_rl.cli:main"
