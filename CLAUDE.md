@@ -36,6 +36,10 @@ re-break. Read it first.
   parsers, ps-vs-ns range mistakes, the PDN utilization floor, and the minimum
   `--max-tier`).
 - After touching funnel/common, run the self-tests listed in AGENTS.md.
+- **`eda-rl serve`** (`eda_rl/api/`, needs the `[api]` extra) is a read-only
+  REST API + React/TS dashboard (`frontend/`) over already-committed campaign
+  logs — never triggers a build. Deploys manually to Azure Container Apps via
+  `infra/main.bicep`; see AGENTS.md "api/" and `infra/README.md`.
 - Learning-signal bookkeeping: score/tell only `info["terminal_reward"]` outside
   the bandit, and the surrogate-Δ prior is captured pre-stage — see
   `docs/rl_system.md` §5 before touching reward code.

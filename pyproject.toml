@@ -23,6 +23,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dashboard = ["optuna-dashboard"]
+api = ["fastapi>=0.110", "uvicorn[standard]>=0.27"]
 dev = ["pytest", "coverage", "ruff"]
 
 [project.scripts]

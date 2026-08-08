@@ -1,0 +1,40 @@
+# eda-rl dashboard API + frontend, as one container/one process.
+#
+# Deliberately NOT layered on the root Dockerfile's openroad/orfs base image:
+# this container only reads already-committed campaign JSONL (eda_rl/campaigns/)
+# and design YAMLs — it never shells out to ORFS/yosys/OpenSTA — so it doesn't
+# need the multi-GB toolchain image. Build with BuildKit so the sibling
+# Dockerfile.api.dockerignore override applies (see that file for why):
+#
+#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.api -t eda-rl-api .
+#   docker run --rm -p 8000:8000 eda-rl-api
+
+FROM node:22-slim AS frontend-build
+WORKDIR /frontend
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+COPY frontend/ .
+RUN npm run build
+
+FROM python:3.12-slim AS api
+WORKDIR /eda-rl
+
+# Editable install, same reason as the root Dockerfile: package-data only
+# globs **/*.yaml/**/*.yml, so a non-editable `pip install .` silently drops
+# every other vendored file under eda_rl/ — confirmed the hard way here, since
+# that includes the *.jsonl campaign logs this API exists to serve (not just
+# the RTL .v files the root Dockerfile's comment warns about). Editable keeps
+# campaign_data.py's `Path(__file__).resolve().parents[1] / "campaigns"`
+# pointing at the real source tree copied in above.
+COPY pyproject.toml README.md LICENSE ./
+COPY eda_rl/ eda_rl/
+RUN pip install --no-cache-dir -e ".[api]"
+
+COPY --from=frontend-build /frontend/dist ./frontend_dist
+ENV EDA_RL_FRONTEND_DIST=/eda-rl/frontend_dist
+
+RUN useradd -m appuser && chown -R appuser /eda-rl
+USER appuser
+
+EXPOSE 8000
+CMD ["eda-rl", "serve", "--host", "0.0.0.0", "--port", "8000"]

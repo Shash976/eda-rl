@@ -1,0 +1,40 @@
+# Per-Dockerfile override of the root .dockerignore, for `docker build -f
+# Dockerfile.api` (BuildKit-only feature — the legacy builder ignores this
+# file and silently falls back to the root .dockerignore, which excludes
+# eda_rl/campaigns/: the exact data this image serves. Build with
+# DOCKER_BUILDKIT=1 or `docker buildx build`.)
+#
+# Same as the root .dockerignore EXCEPT eda_rl/campaigns/ is kept (that's the
+# committed data the dashboard API serves), and the frontend's own build
+# artifacts are excluded (rebuilt in-stage by Dockerfile.api, never copied
+# from the host).
+
+.git
+.github
+
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+eda_rl_runs/
+runs/
+*.joblib
+eda_rl/reports/
+reports/
+*.optuna-journal
+best_configs/
+
+legacy/
+
+.pytest_cache/
+htmlcov/
+coverage.xml
+.coverage
+
+node_modules/
+frontend/dist/

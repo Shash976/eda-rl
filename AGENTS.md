@@ -81,6 +81,11 @@ eda-rl benchmark --seeds 20                    # promotion-policy table benchmar
 eda-rl import-autotuner --config <autotuner.json> --platform asap7 --diff likith
                                                # ORFS AutoTuner config -> eda-rl YAML (handles ps-vs-ns)
 eda-rl fit-surrogate                           # mine campaign logs, fit + CV the surrogate
+eda-rl serve     --port 8000                   # REST API + web dashboard over committed campaigns
+                                               # (needs the [api] extra: pip install -e ".[api]".
+                                               # React/TS frontend lives in frontend/ — see its
+                                               # README for the dev-server + build workflow, and
+                                               # infra/README.md for the Azure Container Apps deploy.)
 # report/collect/dashboard all accept --design/--platform (resolves the log for you,
 # no path/glob knowledge needed) or an explicit --log <jsonl> if you have one off to
 # the side; with neither, they fall back to the most-recently-written log anywhere
@@ -107,6 +112,7 @@ python -m eda_rl.funnel.budget
 python3 tests/test_parsers.py                  # golden-log parser tests (REAL tool output)
 python3 tests/test_reward.py                   # reward property tests (anti-gaming invariants)
 python3 tests/test_log_schema.py               # committed campaign logs stay valid + attributable
+pytest tests/test_api.py                       # REST API tests (real gcd/nangate45 log, no mocking)
 PHYSICAL_MOCK=1 eda-rl doctor --design gcd --platform nangate45
 PHYSICAL_MOCK=1 python -m eda_rl.funnel.build_table --design tinymac_accel --subset strategic --limit 5  # --design required; auto-writes to a temp path under mock
 ```
@@ -126,6 +132,7 @@ eda_rl/
   funnel/           # THE FUNNEL (active system) — see below
   common/           # shared plumbing (runner, rewards, designs, knobs, sim, constants)
   viz/              # report.py (static HTML), dashboard.py (live Optuna), campaign_data.py
+  api/              # `eda-rl serve` — read-only REST API over committed campaigns (see below)
   designs/          # per-design DesignSpec YAMLs + vendored RTL (gcd/, likith/, sagar/)
   campaigns/        # committed example campaign logs
   results/          # offline tables (jsonl)
@@ -133,6 +140,9 @@ tests/              # golden-log parser tests + real-output fixtures
 docs/rl_system.md   # THE doc: how the RL works + role of every file
 legacy/             # frozen history, outside the package: gen1/, dead modules,
                     # superseded docs 04/07/08, audits/ (third-audit records)
+frontend/           # React/TS dashboard UI — consumes eda_rl/api/'s REST API (own README)
+infra/main.bicep    # Azure Container Apps IaC for the dashboard — manual deploy, see infra/README.md
+Dockerfile.api      # dashboard container (API + built frontend) — NOT the ORFS toolchain image
 ```
 
 ### funnel/ — the active system
@@ -170,6 +180,28 @@ design opts in via `functional_eval.kind`; `base.py` is the interface,
 `tinyvad*.py` the TinyVAD plugin owning its cycle model / SW baseline /
 `acc_overflows` / composite reward / behavioral Verilator sim / report extras),
 `recipe.py` (ABC recipe axis).
+
+### api/ — the dashboard REST API
+
+`eda-rl serve` (needs the `[api]` extra). Purely **read-only** over
+already-committed campaign logs — nothing here triggers a new build, an F3
+run, or an `eda-rl collect` baseline build; those are real ORFS/mock tool
+invocations, far too heavy for a request/response API. `routes.py` wraps
+`campaign_data.py`'s loaders (`list_design_platform_pairs`, `CampaignData`,
+`pareto_points`/`pareto_front`, `earliest_f3`, `report_extension_for`,
+`running_max`) and `collect_best.select_best` directly — no logic is forked
+between the static HTML report and this API; both import the same functions.
+`cache.py` is an mtime-keyed cache over `CampaignData.load` (a multi-MB
+campaign log shouldn't reparse on every request). `server.py`'s `create_app()`
+mounts the built React frontend (`frontend/`, via `EDA_RL_FRONTEND_DIST`) as
+static files alongside `/api`, so the API and UI ship as one process/one
+container (`Dockerfile.api`) — see `frontend/README.md` for the dev workflow
+and `infra/README.md` for the Azure Container Apps deploy (manual, not
+wired into CI — see "Conventions"). `design`/`platform` path segments are
+regex-validated (`^[A-Za-z0-9_-]+$`) before touching the filesystem — they
+double as path components in `resolve_log_path`, so an unvalidated `..`
+would be a path-traversal hole on what is, once deployed, a public-facing
+endpoint.
 
 ## How a new design gets optimized (the part people get wrong)
 
@@ -533,6 +565,14 @@ seconds).
   `build_table` already does under `PHYSICAL_MOCK`.
 - A non-TinyMAC design needs RTL resolvable on the machine (gcd/likith/sagar
   RTL is vendored; aes/tinymac RTL is not).
+- **Dashboard deploys are manual, not CI-driven.** There is no GitHub Actions
+  workflow that deploys `eda_rl/api/`/`frontend/` to Azure on push — `az acr
+  build` + `az containerapp update`, run by a human, per `infra/README.md`.
+  CI only validates: `pytest tests/test_api.py` (folded into the existing
+  `test` job), the frontend job (`gen:api --check`/lint/build/test), and
+  `infra-lint` (`az bicep build`, no Azure login). If this ever changes to
+  auto-deploy, it needs its own OIDC federated-credential setup documented
+  here, not silently assumed.
 - Keep this file true. Every audit round found stale claims here being
   re-trusted by the next reader — when you land a behavior change, update
   the invariant in the same commit.

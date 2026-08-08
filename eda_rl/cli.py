@@ -27,6 +27,7 @@ _COMMANDS: dict[str, str] = {
     "doctor":      "eda_rl.funnel.doctor:main",
     "fit-surrogate": "eda_rl.funnel.fit_surrogate:main",
     "import-autotuner": "eda_rl.funnel.import_autotuner:main",
+    "serve":         "eda_rl.api.server:main",
 }
 
 
@@ -44,6 +45,7 @@ def _usage() -> str:
         "doctor":      "physics-sanity preflight for a design (parsers, knob ranges, util floor)",
         "fit-surrogate": "mine campaign logs and fit + CV-validate the quantile-GBT surrogate",
         "import-autotuner": "convert an ORFS AutoTuner autotuner.json into eda-rl design YAML",
+        "serve":         "launch the REST API + web dashboard (needs the [api] extra)",
     }
     for c in _COMMANDS:
         lines.append(f"  {c.ljust(width)}  {blurbs.get(c, '')}")

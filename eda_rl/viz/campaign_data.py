@@ -66,6 +66,11 @@ def list_campaign_logs() -> list[Path]:
     return sorted(root.rglob("results_funnel_campaigns.jsonl"))
 
 
+def list_design_platform_pairs() -> list[tuple[str, str]]:
+    """Every (design, platform) pair with a campaign log on disk, sorted."""
+    return sorted({(p.parent.parent.name, p.parent.name) for p in list_campaign_logs()})
+
+
 def resolve_log_path(
     log: str | Path | None,
     design: str | None = None,
@@ -89,7 +94,7 @@ def resolve_log_path(
         candidate = _campaigns_root() / design / platform / "results_funnel_campaigns.jsonl"
         if candidate.exists():
             return candidate
-        pairs = sorted({(p.parent.parent.name, p.parent.name) for p in list_campaign_logs()})
+        pairs = list_design_platform_pairs()
         avail = ", ".join(f"{d}/{plat}" for d, plat in pairs) or "(none found)"
         raise SystemExit(
             f"no campaign log for design={design!r} platform={platform!r} "
@@ -335,6 +340,84 @@ def build_study(
         added += 1
 
     return study, added, specs
+
+
+# ── report-shared helpers ─────────────────────────────────────────────────────
+# Pure-data helpers used by both the static HTML report (report.py) and the
+# REST API (eda_rl/api/) — one implementation, not a fork.
+
+def running_max(xs: Iterable[float | None]) -> list[float | None]:
+    best = float("-inf")
+    out: list[float | None] = []
+    for x in xs:
+        if x is not None and x > best:
+            best = x
+        out.append(best if best != float("-inf") else None)
+    return out
+
+
+def f3_status_ok(r: dict) -> bool:
+    """True for a successful F3 build. The status lives top-level on older logs
+    and inside ``obs`` on the live-driver format — accept either."""
+    st = r.get("status") or (r.get("obs") or {}).get("status")
+    return st in ("ok", "mock")
+
+
+def f3_ok_rows(rows: list[dict]) -> list[dict]:
+    """Return rows with fidelity=F3 and status=ok that have obs metrics."""
+    return [
+        r for r in rows
+        if r.get("fidelity") == "F3" and f3_status_ok(r)
+        and r.get("obs", {}).get("area_um2") is not None
+        and r.get("obs", {}).get("fmax_mhz") is not None
+    ]
+
+
+def pareto_points(rows: list[dict]) -> list[tuple[float, float, dict]]:
+    """(area_um2, fmax_mhz, row) tuples for successful F3 builds."""
+    f3 = f3_ok_rows(rows)
+    return [(r["obs"]["area_um2"], r["obs"]["fmax_mhz"], r) for r in f3]
+
+
+def pareto_front(pts: list[tuple]) -> list[tuple]:
+    """Non-dominated set over (area, fmax): minimize area, maximize fmax."""
+    front = []
+    for a, f, r in pts:
+        dominated = any(
+            a2 <= a and f2 >= f and (a2 < a or f2 > f)
+            for a2, f2, _ in pts
+        )
+        if not dominated:
+            front.append((a, f, r))
+    # Sort by (area, fmax) only — never fall through to comparing the row dict
+    # in the 3rd slot, which raises TypeError when two builds tie on area+fmax.
+    return sorted(front, key=lambda t: (t[0], t[1]))  # ascending area
+
+
+def report_extension_for(rows: list[dict]):
+    """Resolve the campaign design's report extension, or None (generic report).
+
+    Design-driven (rows carry ``design``): loads the DesignSpec and asks its
+    functional model for a report extension — the hand-picked baseline, SW-speedup
+    KPI, and speedup figure live there, not in this core.  Returns None for generic
+    designs, which get the default (design-agnostic) rendering everywhere.
+    """
+    design_name = next((r.get("design") for r in rows if r.get("design")), None)
+    if not design_name:
+        return None
+    try:
+        from eda_rl.common.designs import DesignSpec
+        model = DesignSpec.load(design_name).functional_model()
+        return model.report_extension() if model is not None else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def earliest_f3(rows: list[dict]) -> dict | None:
+    """Earliest (by ts) successful F3 build — the generic 'before optimization'
+    reference point when there's no hand-picked baseline for this design."""
+    f3 = f3_ok_rows(rows)
+    return min(f3, key=lambda r: r.get("ts", 0)) if f3 else None
 
 
 # ── high-level container ──────────────────────────────────────────────────────

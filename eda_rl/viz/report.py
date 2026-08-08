@@ -32,6 +32,15 @@ from eda_rl.viz.campaign_data import (  # noqa: E402
     episode_value,
     resolve_log_path,
 )
+from eda_rl.viz.campaign_data import earliest_f3 as _earliest_f3  # noqa: E402
+from eda_rl.viz.campaign_data import f3_ok_rows as _f3_ok_rows  # noqa: E402
+from eda_rl.viz.campaign_data import f3_status_ok as _f3_status_ok  # noqa: E402
+from eda_rl.viz.campaign_data import pareto_front as _pareto_front  # noqa: E402
+from eda_rl.viz.campaign_data import pareto_points  # noqa: E402
+from eda_rl.viz.campaign_data import (  # noqa: E402
+    report_extension_for as _report_ext,
+)
+from eda_rl.viz.campaign_data import running_max as _running_max  # noqa: E402
 
 _FIDELITY_COLORS = {
     "F0": "#d62728",   # red — died at proxy gate 0
@@ -40,15 +49,6 @@ _FIDELITY_COLORS = {
     "F3": "#2ca02c",   # green — reached full flow
     None: "#7f7f7f",
 }
-
-def _running_max(xs):
-    best = float("-inf")
-    out = []
-    for x in xs:
-        if x is not None and x > best:
-            best = x
-        out.append(best if best != float("-inf") else None)
-    return out
 
 
 def build_figures(data: CampaignData):
@@ -182,64 +182,6 @@ def build_optuna_figures(rows):
     return figs
 
 
-def _f3_status_ok(r: dict) -> bool:
-    """True for a successful F3 build. The status lives top-level on older logs
-    and inside ``obs`` on the live-driver format — accept either."""
-    st = r.get("status") or (r.get("obs") or {}).get("status")
-    return st in ("ok", "mock")
-
-
-def _f3_ok_rows(rows: list[dict]) -> list[dict]:
-    """Return rows with fidelity=F3 and status=ok that have obs metrics."""
-    return [
-        r for r in rows
-        if r.get("fidelity") == "F3" and _f3_status_ok(r)
-        and r.get("obs", {}).get("area_um2") is not None
-        and r.get("obs", {}).get("fmax_mhz") is not None
-    ]
-
-
-def _pareto_front(pts: list[tuple]) -> list[tuple]:
-    """Non-dominated set over (area, fmax): minimize area, maximize fmax."""
-    front = []
-    for a, f, r in pts:
-        dominated = any(
-            a2 <= a and f2 >= f and (a2 < a or f2 > f)
-            for a2, f2, _ in pts
-        )
-        if not dominated:
-            front.append((a, f, r))
-    # Sort by (area, fmax) only — never fall through to comparing the row dict
-    # in the 3rd slot, which raises TypeError when two builds tie on area+fmax.
-    return sorted(front, key=lambda t: (t[0], t[1]))  # ascending area
-
-
-def _report_ext(rows: list[dict]):
-    """Resolve the campaign design's report extension, or None (generic report).
-
-    Design-driven (rows carry ``design``): loads the DesignSpec and asks its
-    functional model for a report extension — the hand-picked baseline, SW-speedup
-    KPI, and speedup figure live there, not in this core.  Returns None for generic
-    designs, which get the default (design-agnostic) rendering everywhere.
-    """
-    design_name = next((r.get("design") for r in rows if r.get("design")), None)
-    if not design_name:
-        return None
-    try:
-        from eda_rl.common.designs import DesignSpec
-        model = DesignSpec.load(design_name).functional_model()
-        return model.report_extension() if model is not None else None
-    except Exception:  # noqa: BLE001
-        return None
-
-
-def _earliest_f3(rows: list[dict]) -> dict | None:
-    """Earliest (by ts) successful F3 build — the generic 'before optimization'
-    reference point when there's no hand-picked baseline for this design."""
-    f3 = _f3_ok_rows(rows)
-    return min(f3, key=lambda r: r.get("ts", 0)) if f3 else None
-
-
 def _cfg_label(cfg: dict) -> str:
     """Short human label for a config: an L/A form when it has mac_lanes, else clock-based."""
     if "mac_lanes" in cfg:
@@ -263,7 +205,7 @@ def build_pareto_figure(rows: list[dict]) -> tuple[str, object]:
         fig.update_layout(title="Pareto Frontier: Area vs Fmax")
         return ("pareto", fig)
 
-    pts = [(r["obs"]["area_um2"], r["obs"]["fmax_mhz"], r) for r in f3]
+    pts = pareto_points(rows)
     ext = _report_ext(rows)
 
     def _trace(subset, name, color=None):
@@ -446,8 +388,7 @@ def build_comparison_table(rows: list[dict]) -> tuple[str, object]:
     """Before/after table: baseline vs Pareto-optimal configs found by optimizer."""
     import plotly.graph_objects as go
 
-    f3 = _f3_ok_rows(rows)
-    pts = [(r["obs"]["area_um2"], r["obs"]["fmax_mhz"], r) for r in f3] if f3 else []
+    pts = pareto_points(rows)
     pareto = _pareto_front(pts)  # sorted by ascending area
 
     ext = _report_ext(rows)
