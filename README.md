@@ -2,6 +2,10 @@
 
 **A multi-fidelity RL/DSE optimizer for RTL→GDS chip design-space exploration.**
 
+eda-rl automates one of the slowest parts of chip design: picking the settings that turn a circuit description into a physical chip layout. Every full test build takes a long time, so trying every combination isn't realistic. Instead, eda-rl uses reinforcement learning to decide which settings are worth testing. Each candidate goes through a series of quick, cheap checks first, and only the strongest ones get a full build. The goal is a chip that's smaller, faster and uses less power while still doing exactly what it was designed to do.
+
+I built it solo during my internship at ParaScalr. It works with any design through a short config file and runs on open-source chip tools (OpenROAD, Yosys). At the end you get a visual report and the best finished layouts, ready to hand off.
+
 Drop in a design (RTL + a ~10-line YAML), point it at an [OpenROAD-flow-scripts][orfs]
 (ORFS) install, and `eda-rl` searches the flow for configurations that trade off **area /
 Fmax / power** — promoting promising candidates through cheap proxies up to the full
